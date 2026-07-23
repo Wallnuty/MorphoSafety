@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mjx-safety-gym"
+version = "0.1.6"
+description = "MJX Safety Gym Environments"
+readme = "README.md"
+requires-python = ">=3.11"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Max van der Hart", email = "your.email@example.com" }
+]
+dependencies = [
+  "absl-py>=2.2.2,<3.0.0",
+  "etils==1.13.0",
+  "flax==0.10.6",
+  "jax==0.6.0",
+  "ml_collections==1.1.0",
+  "mujoco==3.3.2",
+  "mujoco_mjx==3.3.2",
+  "numpy==2.3.2",
+  "pynput==1.8.1",
+  "setuptools>=68.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mvdhart/mjx-safety-gym"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"mjx_safety_gym.envs" = ["xmls/*.xml"]
