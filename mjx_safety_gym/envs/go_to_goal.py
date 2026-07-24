@@ -21,7 +21,45 @@ from mjx_safety_gym.world import (
     draw_until_valid,
 )
 
-_XML_PATH = files("mjx_safety_gym.envs.xmls") / "point.xml"
+_XML_DIR = files("mjx_safety_gym.envs.xmls")
+_ROBOT_XMLS = {
+    "point": "point.xml",
+    "ant": "ant.xml",
+}
+
+# Per-robot morphology description. `collision_geoms` are the robot geoms checked
+# against obstacles for the cost function. Placement is driven by either a set of
+# `slide_joints` (2-DOF planar robot) or a single `free_joint` (6-DOF, 7 qpos).
+_ROBOT_CONFIGS = {
+    "point": {
+        "collision_geoms": ["robot", "pointarrow"],
+        "slide_joints": ["x", "y"],
+        "free_joint": None,
+        "spawn_height": None,
+        # Proprioceptive sensors appended to the observation (beyond BASE_SENSORS).
+        "extra_sensors": [],
+    },
+    "ant": {
+        "collision_geoms": [
+            "torso_geom",
+            "aux_1_geom", "left_leg_geom", "left_ankle_geom",
+            "aux_2_geom", "right_leg_geom", "right_ankle_geom",
+            "aux_3_geom", "back_leg_geom", "third_ankle_geom",
+            "aux_4_geom", "rightback_leg_geom", "fourth_ankle_geom",
+        ],
+        "slide_joints": None,
+        "free_joint": "root",
+        # Torso height at which the ant spawns upright (matches the body pos in ant.xml).
+        "spawn_height": 0.18,
+        # Joint angles + joint velocities so the policy can perceive its own legs.
+        "extra_sensors": [
+            "hip_1", "ankle_1", "hip_2", "ankle_2",
+            "hip_3", "ankle_3", "hip_4", "ankle_4",
+            "hip_1_vel", "ankle_1_vel", "hip_2_vel", "ankle_2_vel",
+            "hip_3_vel", "ankle_3_vel", "hip_4_vel", "ankle_4_vel",
+        ],
+    },
+}
 
 Observation = Union[jax.Array, Mapping[str, jax.Array]]
 BASE_SENSORS = ["accelerometer", "velocimeter", "gyro", "magnetometer"]
@@ -57,7 +95,14 @@ def _rgba_to_grayscale(rgba: jax.Array) -> jax.Array:
   return gray
 
 class GoToGoal:
-    def __init__(self, vision: bool=False, vision_config=default_vision_config()):
+    def __init__(self, robot: str="point", vision: bool=False, vision_config=default_vision_config()):
+        if robot not in _ROBOT_XMLS:
+            raise ValueError(
+                f"Unknown robot {robot!r}. Available: {sorted(_ROBOT_XMLS)}"
+            )
+        self._robot = robot
+        self._xml_path = _XML_DIR / _ROBOT_XMLS[robot]
+
         self.spec = {
             "robot": ObjectSpec(0.4, 1),
             "goal": ObjectSpec(0.305, 1),
@@ -65,7 +110,7 @@ class GoToGoal:
             "vases": ObjectSpec(0.15, 10),
         }
 
-        mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(_XML_PATH), assets={})
+        mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
         build_arena(mjSpec, objects=self.spec, visualize=True)
         self._mj_model = mjSpec.compile()
 
@@ -110,8 +155,11 @@ class GoToGoal:
         self._goal_body_id = self._mj_model.body("goal").id
 
         # For cost function
-        self._robot_geom_id = self._mj_model.geom("robot").id
-        self._pointarrow_geom_id = self._mj_model.geom("pointarrow").id
+        robot_config = _ROBOT_CONFIGS[self._robot]
+        self._robot_collision_geom_ids = [
+            self._mj_model.geom(name).id
+            for name in robot_config["collision_geoms"]
+        ]
         # Geoms, not bodies
         self._collision_obstacle_geoms_ids = [
             self._mj_model.geom(f"vase_{i}_geom").id
@@ -132,13 +180,28 @@ class GoToGoal:
         self._obstacle_body_ids = self._vase_body_ids + self._hazard_body_ids
         self._object_body_ids = []
 
-        # For position updates
-        self._robot_x_id = self._mj_model.joint("x").id
-        self._robot_y_id = self._mj_model.joint("y").id
-        self._robot_joint_qposadr = [
-            self._mj_model.jnt_qposadr[joint_id]
-            for joint_id in [self._robot_x_id, self._robot_y_id]
-        ]
+        # For observations: base IMU sensors plus any robot-specific proprioceptive
+        # sensors (e.g. the ant's joint angles/velocities). Total dim is cached so
+        # observation_size reflects the actual sensor layout of the chosen robot.
+        self._obs_sensor_names = BASE_SENSORS + robot_config["extra_sensors"]
+        self._obs_sensor_dim = int(
+            sum(self._mj_model.sensor(name).dim for name in self._obs_sensor_names)
+        )
+
+        # For position updates: either two planar slide joints (point) or a single
+        # free joint (ant). `_robot_free_qposadr`, when set, is the start index of
+        # the free joint's 7 qpos entries (3 translation + 4 quaternion).
+        if robot_config["slide_joints"] is not None:
+            self._robot_slide_qposadr = [
+                self._mj_model.jnt_qposadr[self._mj_model.joint(name).id]
+                for name in robot_config["slide_joints"]
+            ]
+            self._robot_free_qposadr = None
+        else:
+            free_joint_id = self._mj_model.joint(robot_config["free_joint"]).id
+            self._robot_free_qposadr = int(self._mj_model.jnt_qposadr[free_joint_id])
+            self._robot_spawn_height = float(robot_config["spawn_height"])
+            self._robot_slide_qposadr = None
         self._goal_mocap_id = self._mj_model.body("goal").mocapid[0]
         self._hazard_mocap_id = [
             self._mj_model.body(f"hazard_{i}").mocapid[0]
@@ -195,26 +258,17 @@ class GoToGoal:
         return data, rng
 
     def get_cost(self, data: mjx.Data) -> jax.Array:
-        # Check if robot or pointarrow geom collide with any vase or pillar
+        # Check if any robot geom collides with any vase or pillar
         colliding_obstacles = jp.array(
             [
-                jp.logical_or(
-                    geoms_colliding(data, geom, self._robot_geom_id),
-                    geoms_colliding(data, geom, self._pointarrow_geom_id),
+                jp.any(
+                    jp.array([
+                        geoms_colliding(data, geom, robot_geom)
+                        for robot_geom in self._robot_collision_geom_ids
+                    ])
                 )
                 for geom in self._collision_obstacle_geoms_ids
             ]
-        )
-
-        # FOR DEBUG PURPOSES, UNCOMMENT THIS
-        colliding_obstacles = jax.lax.cond(
-            jp.any(colliding_obstacles),  # If there's any collision
-            lambda x: jax.debug.print(
-                "Collision detected with obstacles: {collisions}", collisions=x
-            )
-            or x,  # Print and return the collisions
-            lambda x: x,  # Otherwise, return the input unchanged
-            colliding_obstacles,  # The value to pass into the lambda
         )
 
         # Hazard distance calculation (vectorized for all hazards)
@@ -256,7 +310,7 @@ class GoToGoal:
 
     def sensor_observations(self, data: mjx.Data) -> jax.Array:
         vals = []
-        for sensor in BASE_SENSORS:
+        for sensor in self._obs_sensor_names:
             vals.append(get_sensor_data(self.mj_model, data, sensor))
         return jp.hstack(vals)
 
@@ -274,10 +328,17 @@ class GoToGoal:
         mocap_pos = data.mocap_pos
         qpos = data.qpos
 
-        # Set robot position
-        qpos = data.qpos.at[jp.array(self._robot_joint_qposadr)].set(
-            layout["robot"][0][1]
-        )
+        # Set robot position. Planar robots use two slide joints (xy only); free-joint
+        # robots (e.g. ant) need all 7 qpos: xy + spawn height + an identity quaternion.
+        robot_xy = layout["robot"][0][1]
+        if self._robot_free_qposadr is not None:
+            adr = self._robot_free_qposadr
+            identity_quat = jp.array([1.0, 0.0, 0.0, 0.0])
+            qpos = qpos.at[adr : adr + 7].set(
+                jp.hstack([robot_xy, self._robot_spawn_height, identity_quat])
+            )
+        else:
+            qpos = qpos.at[jp.array(self._robot_slide_qposadr)].set(robot_xy)
 
         # N.B. could not figure out how to do it with get_qpos_ids, it seems to repeat some indices and hence does not set stuff correctly
         for i, (_, xy) in enumerate(layout["vases"]):
@@ -398,7 +459,7 @@ class GoToGoal:
 
     @property
     def xml_path(self) -> str:
-        return _XML_PATH
+        return self._xml_path
 
     @property
     def action_size(self) -> int:
@@ -414,7 +475,7 @@ class GoToGoal:
 
     @property
     def observation_size(self) -> int:
-        return 3 * lidar.NUM_LIDAR_BINS + len(BASE_SENSORS) * 3
+        return 3 * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
 
 
 def get_sensor_data(model: mj.MjModel, data: mjx.Data, sensor_name: str) -> jax.Array:

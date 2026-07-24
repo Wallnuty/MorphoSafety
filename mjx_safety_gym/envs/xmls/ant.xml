@@ -29,8 +29,8 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   </default>
   <worldbody>
     <geom name="floor" size="5 5 0.1" type="plane" condim="6" conaffinity="3"/>
-    <body name="agent" pos="0 0 0.18">
-      <site name="agent" rgba="1 0 0 .1" pos="0 0 -0.02"/>
+    <body name="robot" pos="0 0 0.18">
+      <site name="robot" rgba="1 0 0 .1" pos="0 0 -0.02"/>
       <camera name="vision" pos="0 0.05 0.05" euler="1.57 0 0" fovy="100"/>
       <geom name="torso_geom" pos="0 0 0" size="0.0625" type="sphere" rgba="0.8 0.6 0.4 1"/>
       <joint armature="0" damping="0" limited="false" margin="0.01" name="root" pos="0 0 0" type="free"/>
@@ -82,17 +82,17 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   </worldbody>
   <sensor>
     <!-- Used for observation -->
-    <accelerometer site="agent" name="accelerometer"/>
-    <velocimeter site="agent" name="velocimeter"/>
-    <gyro site="agent" name="gyro"/>
-    <magnetometer site="agent" name="magnetometer"/>
+    <accelerometer site="robot" name="accelerometer"/>
+    <velocimeter site="robot" name="velocimeter"/>
+    <gyro site="robot" name="gyro"/>
+    <magnetometer site="robot" name="magnetometer"/>
 
     <!-- Used for intrinsic constraints -->
-    <subtreecom body="agent" name="subtreecom"/>
-    <subtreelinvel body="agent" name="subtreelinvel"/>
-    <subtreeangmom body="agent" name="subtreeangmom"/>
+    <subtreecom body="robot" name="subtreecom"/>
+    <subtreelinvel body="robot" name="subtreelinvel"/>
+    <subtreeangmom body="robot" name="subtreeangmom"/>
 
-    <framepos objtype="site" objname="agent" name="agent_pos"/>
+    <framepos objtype="site" objname="robot" name="robot_pos"/>
 
     <jointpos joint="hip_1" name="hip_1"/>
     <jointpos joint="ankle_1" name="ankle_1"/>
@@ -103,7 +103,7 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
     <jointpos joint="hip_4" name="hip_4"/>
     <jointpos joint="ankle_4" name="ankle_4"/>
 
-    <frameangvel objtype="site" objname="agent" name="agent_qvel"/>
+    <frameangvel objtype="site" objname="robot" name="robot_qvel"/>
 
     <jointvel joint="hip_1" name="hip_1_vel"/>
     <jointvel joint="ankle_1" name="ankle_1_vel"/>

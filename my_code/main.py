@@ -11,15 +11,19 @@ import mjx_safety_gym.lidar as lidar
 
 DURATION_SECONDS = 10.0
 ACTION_HOLD = 10  # resample a random action every N steps for smoother motion
+ROBOT = "ant"  # "point" or "ant"
 
 # Create environment
-env = GoToGoal()
+env = GoToGoal(robot=ROBOT)
 rng = jax.random.PRNGKey(0)
 
 # Reset environment
 rng, rng_reset = jax.random.split(rng)
 state = env.reset(rng_reset)
+print(f"Robot: {ROBOT}")
 print("Initial observation shape:", state.obs.shape)
+print("Reported observation_size:", env.observation_size)
+print("Action size:", env.action_size)
 
 m = env.mj_model
 d = mjx.get_data(m, state.data)
@@ -45,6 +49,7 @@ sim_dt = m.opt.timestep * 2  # env.step() runs 2 physics substeps internally
 num_steps = int(DURATION_SECONDS / sim_dt)
 print(f"Running {num_steps} steps (~{DURATION_SECONDS}s)")
 
+total_cost = 0.0
 with mujoco.viewer.launch_passive(m, d) as viewer:
     for i in range(num_steps):
         if not viewer.is_running():
@@ -54,6 +59,12 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         if i % ACTION_HOLD == 0:
             action, rng = sample_fn(rng)
         state = step_fn(state, action)
+
+        # Safety cost readout: confirms hazard/collision costs actually register.
+        step_cost = float(state.info["cost"])
+        total_cost += step_cost
+        if step_cost > 0:
+            print(f"step {i}: cost={step_cost:.1f} (cumulative {total_cost:.1f})")
 
         # Keep the lidar rings + mocap bodies (goal, hazards) visually in sync.
         # Pull the lidar slice to host once (single transfer) so update_lidar_rings
@@ -71,3 +82,4 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             time.sleep(sim_dt - elapsed)
 
 print("Final reward:", state.reward)
+print("Total accumulated cost:", total_cost)
