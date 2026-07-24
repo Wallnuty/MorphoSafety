@@ -27,8 +27,17 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
     <geom condim="6" density="5.0"/>
     <site size="0.032" type="sphere"/>
   </default>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.527 0.582 0.906" rgb2="0.1 0.1 0.35"
+      width="800" height="800" markrgb="1 1 1" mark="random" random="0.001"/>
+    <texture name="texplane" builtin="checker" height="100" width="100"
+      rgb1="0.7 0.7 0.7" rgb2="0.8 0.8 0.8" type="2d"/>
+    <material name="MatPlane" reflectance="0.1" shininess="0.1" specular="0.1"
+      texrepeat="10 10" texture="texplane"/>
+  </asset>
   <worldbody>
-    <geom name="floor" size="5 5 0.1" type="plane" condim="6" conaffinity="3"/>
+    <light cutoff="100" diffuse="1 1 1" dir="0 0 -1" directional="true" exponent="1" pos="0 0 0.5" specular="0 0 0" castshadow="false"/>
+    <geom name="floor" size="5 5 0.1" type="plane" condim="6" conaffinity="3" material="MatPlane"/>
     <body name="robot" pos="0 0 0.18">
       <site name="robot" rgba="1 0 0 .1" pos="0 0 -0.02"/>
       <camera name="vision" pos="0 0.05 0.05" euler="1.57 0 0" fovy="100"/>

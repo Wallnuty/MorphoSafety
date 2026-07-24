@@ -13,6 +13,11 @@ DURATION_SECONDS = 10.0
 ACTION_HOLD = 10  # resample a random action every N steps for smoother motion
 ROBOT = "ant"  # "point" or "ant"
 
+# Compile once, and every later run loads the cached kernel from disk
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+
 # Create environment
 env = GoToGoal(robot=ROBOT)
 rng = jax.random.PRNGKey(0)
