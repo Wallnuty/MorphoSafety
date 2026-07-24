@@ -9,9 +9,9 @@ import mujoco.viewer
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
 import mjx_safety_gym.lidar as lidar
 
-DURATION_SECONDS = 10.0
+DURATION_SECONDS = 20.0
 ACTION_HOLD = 10  # resample a random action every N steps for smoother motion
-ROBOT = "ant"  # "point" or "ant"
+ROBOT = "ant"  # "point0" or "ant"
 
 # Compile once, and every later run loads the cached kernel from disk
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
