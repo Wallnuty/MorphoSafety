@@ -1,4 +1,5 @@
 from collections import defaultdict
+from functools import partial
 from typing import NamedTuple
 import jax
 import jax.numpy as jp
@@ -121,13 +122,21 @@ def _sample_layout(
             layout[name].append((flat_idx, xy))
             flat_idx += 1
 
-            jax.lax.cond(
-                iter_ >= 1000,
-                lambda _: jax.debug.print(f"Failed to find a valid sample for {name}"),
-                lambda _: None,
-                operand=None,
+            # Warn via a callback rather than lax.cond: under vmap (which is how
+            # resets run during training) a batched cond lowers to a select that
+            # executes *both* branches, so a debug.print in the failure branch
+            # fires on every reset regardless of `iter_`. debug.callback is
+            # mapped per batch element with concrete values, so it only warns
+            # when sampling genuinely gave up.
+            jax.debug.callback(
+                partial(_warn_invalid_sample, name=name), iter_ >= 1000
             )
     return layout
+
+
+def _warn_invalid_sample(failed, *, name: str) -> None:
+    if failed:
+        print(f"Failed to find a valid sample for {name}")
 
 
 def constrain_placement(placement: tuple, keepout: float) -> tuple:
