@@ -16,13 +16,20 @@ dependencies = [
   "absl-py>=2.2.2,<3.0.0",
   "etils==1.13.0",
   "flax==0.10.6",
-  "jax==0.6.0",
+  "jax==0.10.2",
   "ml_collections==1.1.0",
   "mujoco==3.3.2",
   "mujoco_mjx==3.3.2",
   "numpy==2.3.2",
   "pynput==1.8.1",
   "setuptools>=68.0.0",
+  # NOTE: keep the CUDA plugin in lockstep with this pin, e.g.
+  #   pip install "jax[cuda12]==0.10.2"
+  # A mismatched jax-cuda12-plugin fails hard at import with a PJRT
+  # version error. jax 0.6.0 was measured ~2.4x slower at MJX stepping.
+  "optax>=0.2.4",
+  "brax @ git+https://github.com/Andrew-Luo1/brax.git@bc_checkpointing",
+  "playground @ git+https://github.com/Andrew-Luo1/mujoco_playground_new.git",
 ]
 
 [project.urls]
@@ -30,6 +37,9 @@ Homepage = "https://github.com/mvdhart/mjx-safety-gym"
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["mjx_safety_gym*"]
 
 [tool.setuptools.package-data]
 "mjx_safety_gym.envs" = ["xmls/*.xml"]

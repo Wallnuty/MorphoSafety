@@ -9,6 +9,7 @@ from importlib.resources import files
 import numpy as np
 
 from ml_collections import config_dict
+from mujoco_playground._src import mjx_env as playground_mjx_env
 
 from mjx_safety_gym.collision import geoms_colliding
 from mjx_safety_gym.mjx_env import State, step
@@ -70,7 +71,7 @@ def domain_randomization(sys, rng, cfg):
     def randomize(rng):
         return
 
-    in_axes = jax.tree_map(lambda x: None, sys)
+    in_axes = jax.tree_util.tree_map(lambda x: None, sys)
     return sys, in_axes, jp.zeros(())
 
 def default_vision_config() -> config_dict.ConfigDict:
@@ -94,7 +95,14 @@ def _rgba_to_grayscale(rgba: jax.Array) -> jax.Array:
   gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
   return gray
 
-class GoToGoal:
+class GoToGoal(playground_mjx_env.MjxEnv):
+    """GoToGoal safety task.
+
+    Subclasses mujoco_playground's MjxEnv (without calling its __init__, matching
+    the ss2r reference implementation) so it can be wrapped by
+    mujoco_playground's brax-compatible training wrappers.
+    """
+
     def __init__(self, robot: str="point", vision: bool=False, vision_config=default_vision_config()):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -433,7 +441,12 @@ class GoToGoal:
         done = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
         done = done.astype(jp.float32)
 
-        info = {"rng": rng, "cost": cost, "last_goal_dist": goal_dist}
+        # Update in place (rather than replacing) so that keys injected by
+        # training wrappers (e.g. "steps", "truncation") survive the step.
+        state.info["rng"] = rng
+        state.info["cost"] = cost
+        state.info["last_goal_dist"] = goal_dist
+        info = state.info
 
         if self._vision:
             _, rgb, _ = self.renderer.render(state.info["render_token"], data)
