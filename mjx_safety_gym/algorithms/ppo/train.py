@@ -128,7 +128,21 @@ def train(
         penalizer_params = None
     original_safety_budget = safety_budget
     if normalize_budget:
-        safety_budget = (safety_budget / episode_length) / (1.0 - safety_discounting)
+        # Rescale an episode-total cost budget onto the cost critic's scale.
+        #
+        # DIVERGENCE FROM ss2r: upstream divides by `episode_length`, but the
+        # cost critic predicts a discounted return over *decision* steps, and
+        # CostEpisodeWrapper sums cost across the action_repeat scan -- so each
+        # decision step carries action_repeat steps' worth of cost. Dividing by
+        # episode_length therefore makes the threshold action_repeat times too
+        # strict (with action_repeat=4 the agent trained toward an effective
+        # budget of 25/4, while eval still judged it against 25). Dividing by
+        # the decision-step count makes `safety_budget` mean what it says.
+        # Identical to upstream when action_repeat == 1.
+        num_decision_steps = episode_length // action_repeat
+        safety_budget = (safety_budget / num_decision_steps) / (
+            1.0 - safety_discounting
+        )
     xt = time.time()
     process_count = jax.process_count()
     process_id = jax.process_index()
