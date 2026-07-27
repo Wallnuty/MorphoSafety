@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license-files = ["LICENSE"]
 authors = [
-  { name = "Max van der Hart", email = "your.email@example.com" }
+  { name = "Sam Snyman", email = "your.email@example.com" }
 ]
 dependencies = [
   "absl-py>=2.2.2,<3.0.0",
@@ -23,17 +23,30 @@ dependencies = [
   "numpy==2.3.2",
   "pynput==1.8.1",
   "setuptools>=68.0.0",
-  # NOTE: keep the CUDA plugin in lockstep with this pin, e.g.
-  #   pip install "jax[cuda12]==0.10.2"
-  # A mismatched jax-cuda12-plugin fails hard at import with a PJRT
-  # version error. jax 0.6.0 was measured ~2.4x slower at MJX stepping.
+  # NOTE: the CUDA plugin must stay in lockstep with the jax pin above --
+  # a mismatched jax-cuda12-plugin fails hard at import with a PJRT version
+  # error. Install it via the [cuda] extra rather than by hand; on a headless
+  # cluster node a missing plugin does NOT fail, it silently falls back to CPU.
+  # jax 0.6.0 was measured ~2.4x slower at MJX stepping, hence the exact pin.
   "optax>=0.2.4",
-  "brax @ git+https://github.com/Andrew-Luo1/brax.git@bc_checkpointing",
-  "playground @ git+https://github.com/Andrew-Luo1/mujoco_playground_new.git",
+  # Pinned to commit, not branch: both of these track moving branches upstream
+  # (and `playground` had no ref at all, so it followed the default branch),
+  # which quietly breaks reproducibility the moment the fork advances. These
+  # SHAs are what the working environment was built from.
+  "brax @ git+https://github.com/Andrew-Luo1/brax.git@aeda2a4269fa05fe17d3e678f15f11e7d01323a7",
+  "playground @ git+https://github.com/Andrew-Luo1/mujoco_playground_new.git@179d98010a8320b42048be53bddac6b678e842b8",
 ]
 
+[project.optional-dependencies]
+# `pip install .[cuda]` on a GPU node. Kept as an extra so CPU-only installs
+# (laptop debugging, CI) don't drag in ~3 GB of NVIDIA wheels. The plugin
+# bundles its own CUDA 12 runtime via nvidia-*-cu12 wheels, so it does not
+# depend on which `module load cuda-*` is active -- only on the host driver.
+cuda = ["jax[cuda12]==0.10.2"]
+
 [project.urls]
-Homepage = "https://github.com/mvdhart/mjx-safety-gym"
+Homepage = "https://github.com/Wallnuty/MorphoSafety"
+Upstream = "https://github.com/mvdhart/mjx-safety-gym"
 
 [tool.setuptools]
 include-package-data = true
