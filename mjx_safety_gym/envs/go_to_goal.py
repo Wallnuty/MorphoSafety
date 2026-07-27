@@ -232,8 +232,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         reward = last_goal_dist - goal_distance
         return reward, goal_distance
 
-    def _reset_goal(self, data: mjx.Data, rng: jax.Array) -> tuple[mjx.Data, jax.Array]:
-        # Initial state
+    def _reset_goal(
+        self, data: mjx.Data, rng: jax.Array
+    ) -> tuple[mjx.Data, jax.Array, jax.Array]:
+        # Returns the distance to the *new* goal alongside the updated data, so
+        # the caller can refresh `last_goal_dist`. Without that, the next step's
+        # progress reward (last_goal_dist - goal_distance) subtracts a distance
+        # measured against the old goal from one measured against the new one,
+        # producing a large negative spike exactly when the goal is reached.
 
         # new_rng, goal_key = jax.random.split(rng)
         # new_xy = jax.random.uniform(goal_key, (2,), minval=-2.0, maxval=2.0)
@@ -262,8 +268,12 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         data = data.replace(
             mocap_pos=data.mocap_pos.at[self._goal_mocap_id, :2].set(xy)
         )
+        # Measured from `xy` rather than data.xpos[self._goal_body_id]: replacing
+        # mocap_pos does not re-run forward kinematics, so xpos still holds the
+        # old goal until the next step() integrates.
+        new_goal_dist = jp.linalg.norm(xy - data.site_xpos[self._robot_site_id][0:2])
         # jax.debug.print("New goal position: {pos}", pos=xy)
-        return data, rng
+        return data, rng, new_goal_dist
 
     def get_cost(self, data: mjx.Data) -> jax.Array:
         # Check if any robot geom collides with any vase or pillar
@@ -402,7 +412,15 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             data.mocap_pos[self._goal_mocap_id][:2]
             - data.site_xpos[self._robot_site_id][0:2]
         )
-        info = {"rng": rng, "last_goal_dist": initial_goal_dist, "cost": jp.zeros(())}
+        # "goal_reached" must exist here as well as in step(): the auto-reset
+        # wrapper tree_maps between reset and stepped states, so a key present
+        # in only one of them is a pytree structure mismatch.
+        info = {
+            "rng": rng,
+            "last_goal_dist": initial_goal_dist,
+            "cost": jp.zeros(()),
+            "goal_reached": jp.zeros(()),
+        }
 
         obs = self.get_obs(data)
 
@@ -430,9 +448,17 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
         # Reset goal if robot inside goal
         condition = goal_dist < 0.3
-        data, rng = jax.lax.cond(
-            condition, self._reset_goal, lambda d, r: (d, r), data, state.info["rng"]
+        data, rng, goal_dist = jax.lax.cond(
+            condition,
+            self._reset_goal,
+            lambda d, r: (d, r, goal_dist),
+            data,
+            state.info["rng"],
         )
+        # Explicit bonus for reaching the goal. The shaped term alone telescopes
+        # to (initial_dist - final_dist) over an episode, so without this there
+        # is no standing incentive to reach goals at all.
+        reward = jp.where(condition, reward + 1.0, reward)
 
         cost = self.get_cost(data)
 
@@ -446,6 +472,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         state.info["rng"] = rng
         state.info["cost"] = cost
         state.info["last_goal_dist"] = goal_dist
+        state.info["goal_reached"] = condition.astype(jp.float32)
         info = state.info
 
         if self._vision:
