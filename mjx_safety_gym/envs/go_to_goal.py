@@ -85,6 +85,27 @@ def default_vision_config() -> config_dict.ConfigDict:
       history=3,
   )
 
+def _segment_point_distance_2d(
+    points: jax.Array, seg_a: jax.Array, seg_b: jax.Array
+) -> jax.Array:
+    """Distance in the xy-plane from each point to each line segment.
+
+    `points` is (P, 2); `seg_a`/`seg_b` are (S, 2) segment endpoints. Returns
+    (P, S). Degenerate segments (a == b, i.e. spheres) collapse to point-point
+    distance, so a single code path covers both spheres and capsules.
+    """
+    ab = seg_b - seg_a  # (S, 2)
+    ap = points[:, None, :] - seg_a[None, :, :]  # (P, S, 2)
+    denom = jp.sum(ab * ab, axis=-1)  # (S,)
+    # Guard the divide twice: once for the value, once so the *unselected*
+    # branch is still finite (a NaN there would poison reverse-mode grads).
+    safe_denom = jp.where(denom > 0.0, denom, 1.0)
+    t = jp.where(denom > 0.0, jp.sum(ap * ab[None], axis=-1) / safe_denom, 0.0)
+    t = jp.clip(t, 0.0, 1.0)  # (P, S)
+    closest = seg_a[None] + t[..., None] * ab[None]  # (P, S, 2)
+    return jp.linalg.norm(points[:, None, :] - closest, axis=-1)
+
+
 def _rgba_to_grayscale(rgba: jax.Array) -> jax.Array:
   """
   Intensity-weigh the colors.
@@ -178,6 +199,38 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             self._mj_model.body(f"hazard_{i}").id
             for i in range(self.spec["hazards"].num_objects)
         ]  # Bodies, not geoms
+
+        # Hazard proximity is measured against the robot's *whole body*, not just
+        # the torso site: every collision geom is reduced to a swept sphere
+        # (segment + radius), which is exact for the spheres and capsules the
+        # robots are built from. Using the torso site alone let limbs reach well
+        # inside a hazard for free -- the ant's feet extend ~0.30 from the site
+        # while the hazard radius is only 0.20, so a foot could sit dead centre
+        # in a hazard at zero cost. Deriving the extent from the geoms keeps this
+        # honest as morphologies change: a longer leg cannot buy a blind spot.
+        geom_ids = np.array(self._robot_collision_geom_ids, dtype=int)
+        geom_types = self._mj_model.geom_type[geom_ids]
+        geom_sizes = self._mj_model.geom_size[geom_ids]
+        is_capsule = geom_types == mj.mjtGeom.mjGEOM_CAPSULE
+        # Capsule size is (radius, half_length); a sphere is the half_length == 0
+        # case. Anything else (e.g. the point robot's box arrow) has no exact
+        # swept-sphere form, so fall back to its bounding sphere -- conservative,
+        # never a blind spot.
+        self._robot_geom_half_len = jp.array(
+            np.where(is_capsule, geom_sizes[:, 1], 0.0), dtype=jp.float32
+        )
+        self._robot_geom_radius = jp.array(
+            np.where(
+                is_capsule | (geom_types == mj.mjtGeom.mjGEOM_SPHERE),
+                geom_sizes[:, 0],
+                self._mj_model.geom_rbound[geom_ids],
+            ),
+            dtype=jp.float32,
+        )
+        self._robot_collision_geom_ids_arr = jp.array(geom_ids)
+        # Read the hazard radius off the model rather than hardcoding it, so the
+        # threshold cannot silently drift from the geometry drawn in the arena.
+        self._hazard_radius = float(self._mj_model.geom("hazard_0_geom").size[0])
 
         # For lidar
         self._robot_body_id = self._mj_model.body("robot").id
@@ -289,15 +342,32 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             ]
         )
 
-        # Hazard distance calculation (vectorized for all hazards)
-        robot_pos = data.site_xpos[self._robot_site_id][:2]
-        hazard_distances = jp.linalg.norm(
-            data.xpos[jp.array(self._hazard_body_ids)][:, :2] - robot_pos, axis=1
-        )
+        # Hazard distance, measured from the robot's surface rather than a single
+        # torso point (see _post_init) so that limbs entering a hazard are caught.
+        # Each collision geom is a segment (capsule axis, zero-length for spheres)
+        # inflated by its radius; hazards are flat discs, so this is all done in
+        # the xy-plane -- a raised foot above a hazard still counts, matching the
+        # existing 2D treatment.
+        geom_pos = data.geom_xpos[self._robot_collision_geom_ids_arr]  # (G, 3)
+        geom_axis = data.geom_xmat[self._robot_collision_geom_ids_arr].reshape(
+            -1, 3, 3
+        )[:, :, 2]  # capsule axis is local z
+        offset = geom_axis[:, :2] * self._robot_geom_half_len[:, None]
+        seg_a = geom_pos[:, :2] + offset
+        seg_b = geom_pos[:, :2] - offset
+
+        hazard_pos = data.xpos[jp.array(self._hazard_body_ids)][:, :2]  # (H, 2)
+        # Distance from each hazard centre to the robot's surface, then take the
+        # nearest geom: (H, G) -> (H,)
+        surface_distances = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
+        surface_distances -= self._robot_geom_radius[None, :]
+        hazard_distances = jp.min(surface_distances, axis=1)
         # jax.debug.print("Hazard distances: {dist}", dist=hazard_distances)
 
         # Compute cost: Add cost for collisions and proximity to hazards
-        cost = jp.sum(colliding_obstacles) + jp.sum(hazard_distances <= 0.2)
+        cost = jp.sum(colliding_obstacles) + jp.sum(
+            hazard_distances <= self._hazard_radius
+        )
 
         return cost.astype(jp.float32)
 
