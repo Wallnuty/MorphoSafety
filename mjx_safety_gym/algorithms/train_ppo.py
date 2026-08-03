@@ -99,7 +99,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--deterministic_eval",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
+        help="Evaluate the mean action instead of sampling. Defaults to False "
+        "so that the reported cost and the constrained cost describe the SAME "
+        "policy: the cost critic is fit to stochastic on-policy rollouts, so "
+        "`safety_budget` only binds on the stochastic policy. Evaluating "
+        "deterministically measures something the constraint never targeted -- "
+        "measured 2026-08-02, constraint-implied cost matched stochastic eval "
+        "to 0.8% at the feasibility crossing but was off by 36% against "
+        "deterministic eval at the same point, and by ~2.5x early in "
+        "training (an untrained policy has mean action ~0, so the "
+        "deterministic policy barely moves and looks spuriously safe). Also "
+        "matches ppo.train's own default, which the CLI previously overrode.",
     )
     parser.add_argument("--seed", type=int, default=0)
     return parser
