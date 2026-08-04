@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from absl import logging
 from brax import envs
 from brax.training import pmap, types
@@ -41,6 +42,30 @@ from mjx_safety_gym.algorithms.ppo import training_step as ppo_training_step
 from mjx_safety_gym.algorithms.ppo.wrappers import TrackOnlineCosts
 from mjx_safety_gym.algorithms.rl.evaluation import ConstraintsEvaluator
 from mjx_safety_gym.algorithms.rl.utils import restore_state
+
+
+def _load_checkpoint(path: str):
+    """Read a checkpoint written by the save block below.
+
+    Deliberately does NOT use `brax.training.checkpoint.load`: that helper
+    builds restore_args by tree_map-ing over orbax metadata assuming every leaf
+    is an array, and dies on our optimizer-state subtree with "different types
+    at key path ... list vs RestoreArgs". brax's own checkpoints only hold
+    (normalizer, network params); ours also carry penalizer and optimizer state.
+
+    orbax returns each saved dataclass as a plain dict, whose pytree leaves are
+    ordered ALPHABETICALLY. `restore_state` re-flattens positionally, so the
+    typed containers must be rebuilt by keyword here or the leaves land in the
+    wrong fields -- silently, and destructively: SafePPONetworkParams is
+    (policy, value, cost_value) while the dict sorts to (cost_value, policy,
+    value), which would load the cost critic's weights into the policy.
+    """
+    loaded = list(ocp.PyTreeCheckpointer().restore(str(path)))
+    if isinstance(loaded[0], dict):
+        loaded[0] = running_statistics.RunningStatisticsState(**loaded[0])
+    if len(loaded) >= 2 and isinstance(loaded[1], dict):
+        loaded[1] = ppo_losses.SafePPONetworkParams(**loaded[1])
+    return loaded
 
 
 def _unpmap(v):
@@ -324,7 +349,7 @@ def train(
     )  # type: ignore
 
     if restore_checkpoint_path is not None:
-        loaded_params = checkpoint.load(restore_checkpoint_path)
+        loaded_params = _load_checkpoint(restore_checkpoint_path)
         restored_normalizer = restore_state(
             loaded_params[0], training_state.normalizer_params
         )

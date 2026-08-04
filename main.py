@@ -1,3 +1,4 @@
+import argparse
 import time
 import jax
 from jax import numpy as jp
@@ -6,13 +7,36 @@ import mujoco
 from mujoco import mjx
 import mujoco.viewer
 
+import orbax.checkpoint as ocp
+from brax.training.acme import running_statistics
+
 from mjx_safety_gym import jax_cache
+from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
+from mjx_safety_gym.algorithms.train_ppo import latest_checkpoint
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
 import mjx_safety_gym.lidar as lidar
 
-DURATION_SECONDS = 20.0
+_parser = argparse.ArgumentParser(
+    description="Replay the newest trained policy for a robot in the viewer, "
+    "or drive it with random actions if nothing has been trained yet."
+)
+_parser.add_argument("--robot", choices=["point", "ant"], default="point")
+_parser.add_argument(
+    "--deterministic",
+    action="store_true",
+    help="Replay the mean action instead of sampling. Off by default: the cost "
+    "critic is fit to sampled on-policy rollouts, so `safety_budget` only ever "
+    "constrained the stochastic policy -- the deterministic one is behaviour "
+    "the safety machinery never governed. Useful for inspection, misleading "
+    "as a safety measurement.",
+)
+_parser.add_argument("--duration", type=float, default=20.0, help="Seconds to run.")
+_args = _parser.parse_args()
+
+DURATION_SECONDS = _args.duration
 ACTION_HOLD = 10  # resample a random action every N steps for smoother motion
-ROBOT = "ant"  # "point0" or "ant"
+ROBOT = _args.robot
+DETERMINISTIC = _args.deterministic
 
 # Compile once, and every later run loads the cached kernel from disk
 jax_cache.configure()
@@ -41,6 +65,47 @@ def sample_action(rng):
     )
     return action, rng
 
+
+def load_policy(robot: str, obs, action_size: int):
+    """Build an action fn from the newest checkpoint, or None if untrained.
+
+    Rebuilds the network from the env's own shapes rather than from a saved
+    config: the training code writes an empty ConfigDict, so brax's
+    `checkpoint.load_policy` helper cannot reconstruct the network, and its
+    vanilla PPONetworks has no cost-value head anyway.
+    """
+    ckpt = latest_checkpoint(robot)
+    if ckpt is None:
+        return None, None
+    # Restore through orbax directly, NOT brax's checkpoint.load: that helper
+    # builds restore_args with a blanket tree_map over the metadata, which
+    # blows up on the optimizer-state subtree we also save
+    # ("different types at key path ... list vs RestoreArgs").
+    loaded = ocp.PyTreeCheckpointer().restore(str(ckpt))
+    # Saved layout is (normalizer, SafePPONetworkParams, penalizer, optimizer);
+    # orbax hands each dataclass back as a plain dict of its fields.
+    normalizer = running_statistics.RunningStatisticsState(**loaded[0])
+    policy_params, value_params = loaded[1]["policy"], loaded[1]["value"]
+    # normalize_observations defaults to False in ppo.train, so the
+    # preprocessor is the identity -- must match training or the obs scale
+    # the policy sees is wrong.
+    network = ppo_networks.make_ppo_networks(
+        obs.shape,
+        action_size,
+        preprocess_observations_fn=lambda x, _: x,
+    )
+    policy = ppo_networks.make_inference_fn(network)(
+        (normalizer, policy_params, value_params), deterministic=DETERMINISTIC
+    )
+    return jax.jit(lambda o, k: policy(o, k)[0]), ckpt
+
+policy_fn, ckpt_path = load_policy(ROBOT, state.obs, env.action_size)
+if policy_fn is None:
+    print(f"No checkpoint for '{ROBOT}' -- driving with random actions.")
+else:
+    mode = "deterministic" if DETERMINISTIC else "stochastic"
+    print(f"Loaded {mode} policy from {ckpt_path}")
+
 print("Compiling reset/step...")
 start = time.time()
 reset_fn = jax.jit(env.reset).lower(rng_reset).compile()
@@ -60,7 +125,12 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             break
         step_start = time.time()
 
-        if i % ACTION_HOLD == 0:
+        if policy_fn is not None:
+            # A trained policy is queried every step; ACTION_HOLD only exists
+            # to keep *random* actions from looking like jitter.
+            rng, rng_action = jax.random.split(rng)
+            action = policy_fn(state.obs, rng_action)
+        elif i % ACTION_HOLD == 0:
             action, rng = sample_fn(rng)
         state = step_fn(state, action)
 

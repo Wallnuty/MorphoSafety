@@ -15,6 +15,8 @@ Usage:
 """
 
 import argparse
+from pathlib import Path
+from typing import Optional
 
 import jax
 from brax.envs.wrappers import training as brax_training
@@ -25,6 +27,31 @@ from mjx_safety_gym.algorithms.penalizers import get_penalizer
 from mjx_safety_gym.algorithms.ppo import train as ppo_train
 from mjx_safety_gym.algorithms.wrappers import CostEpisodeWrapper
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
+
+
+# Checkpoints live outside the package so they are not swept up by a package
+# install or by `setuptools.packages.find`. Both this module and main.py resolve
+# the same convention, so a trained policy is picked up for replay without
+# anyone having to pass a path around.
+CHECKPOINT_ROOT = Path(__file__).resolve().parents[2] / "checkpoints"
+
+
+def default_checkpoint_dir(robot: str) -> Path:
+    """Where runs for `robot` write checkpoints unless told otherwise."""
+    return CHECKPOINT_ROOT / robot
+
+
+def latest_checkpoint(robot: str) -> Optional[Path]:
+    """Newest checkpoint for `robot`, or None if nothing has been trained.
+
+    `brax.training.checkpoint.save` writes one zero-padded step directory per
+    eval, so the lexicographic max is also the newest.
+    """
+    root = default_checkpoint_dir(robot)
+    if not root.is_dir():
+        return None
+    steps = sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit())
+    return steps[-1] if steps else None
 
 
 def wrap_for_brax_training(env, episode_length: int, action_repeat: int = 1):
@@ -113,6 +140,26 @@ def build_argparser() -> argparse.ArgumentParser:
         "matches ppo.train's own default, which the CLI previously overrode.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint_logdir",
+        type=str,
+        default=None,
+        help="Directory for checkpoints, one subdirectory per eval. Defaults "
+        "to <repo>/checkpoints/<robot>, which is where main.py looks. Pass an "
+        "explicit path when sweeping hyperparameters, otherwise the runs "
+        "overwrite each other's steps.",
+    )
+    parser.add_argument(
+        "--no_checkpoint",
+        action="store_true",
+        help="Disable checkpointing entirely (throwaway/debug runs).",
+    )
+    parser.add_argument(
+        "--restore_checkpoint_path",
+        type=str,
+        default=None,
+        help="Resume from a specific checkpoint step directory.",
+    )
     return parser
 
 
@@ -135,6 +182,16 @@ def validate(args: argparse.Namespace) -> None:
 
 
 def train(args: argparse.Namespace):
+    if args.no_checkpoint:
+        checkpoint_logdir = None
+    else:
+        checkpoint_logdir = str(
+            Path(args.checkpoint_logdir)
+            if args.checkpoint_logdir
+            else default_checkpoint_dir(args.robot)
+        )
+        print(f"Checkpoints: {checkpoint_logdir}")
+
     env = GoToGoal(robot=args.robot)
     eval_env = GoToGoal(robot=args.robot)
     train_env = wrap_for_brax_training(
@@ -185,6 +242,8 @@ def train(args: argparse.Namespace):
         penalizer_params=penalizer_params,
         safe=penalizer is not None,
         progress_fn=progress_fn,
+        checkpoint_logdir=checkpoint_logdir,
+        restore_checkpoint_path=args.restore_checkpoint_path,
     )
     return make_policy, params, metrics
 
