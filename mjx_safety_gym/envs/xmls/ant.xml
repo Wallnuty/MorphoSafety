@@ -19,7 +19,27 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
   <option integrator="RK4" timestep="0.01"/>
   <statistic meansize="0.23" extent="3.96"/>
+  <!-- max_geom_pairs: MJX pre-allocates a fixed contact buffer per
+       collision-function group, so every step pays for every *possible* pair.
+       Uncapped the ant needs 539 slots vs the point's 95; capping each group at
+       the 16 nearest pairs (cheap bounding-sphere broad phase, then exact
+       collision on those) cuts that to 191.
+       Why 16 and not lower: the plane-vs-capsule group has exactly 12 pairs
+       (floor vs the 12 limb capsules) and governs whether the ant stands at
+       all, so the cap must exceed 12. The headroom above that covers
+       limb-vs-vase contacts, the group that produces cost -- the ant would
+       have to be within reach of 16 separate limb/vase pairs at once to lose
+       one. Verified: torso height matches uncapped to within 1e-7 over 300
+       steps. NOTE that check only exercised standing on the floor;
+       limb-vs-vase truncation is untested.
+       !! max_geom_pairs MUST stay the FIRST <numeric> in this file. MJX's
+       _numeric() (collision_driver.py) indexes numeric_data by the numeric's
+       *id* instead of its *adr*, so if init_qpos comes first this reads
+       init_qpos's second element (0.0), the cap becomes 0, every collision
+       group empties and model construction dies with "Need at least one array
+       to concatenate". Upstream bug; the ordering is the workaround. -->
   <custom>
+    <numeric data="16" name="max_geom_pairs"/>
     <numeric data="0.0 0.0 0.55 1.0 0.0 0.0 0.0 0.0 1.0 0.0 -1.0 0.0 -1.0 0.0 1.0" name="init_qpos"/>
   </custom>
   <default>

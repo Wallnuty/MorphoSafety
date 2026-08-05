@@ -1,5 +1,6 @@
 import argparse
 import time
+from pathlib import Path
 import jax
 from jax import numpy as jp
 import numpy as np
@@ -31,6 +32,24 @@ _parser.add_argument(
     "as a safety measurement.",
 )
 _parser.add_argument("--duration", type=float, default=20.0, help="Seconds to run.")
+_parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="Seed for the arena layout and action sampling. Per-episode outcomes "
+    "vary enormously -- across 64 layouts the unconstrained point policy "
+    "averaged 2.8 goals but scored ZERO in 19%% of them, and episode cost "
+    "ranged 0 to 961. Vary this before judging a policy by eye; one episode "
+    "says almost nothing.",
+)
+_parser.add_argument(
+    "--checkpoint",
+    default=None,
+    help="Checkpoint to replay, overriding the default checkpoints/<robot>. "
+    "Accepts either a run directory (newest step inside is used) or a single "
+    "step directory. Note the ENV is still built from --robot, so this must be "
+    "a checkpoint trained on the same robot.",
+)
 _args = _parser.parse_args()
 
 DURATION_SECONDS = _args.duration
@@ -43,7 +62,7 @@ jax_cache.configure()
 
 # Create environment
 env = GoToGoal(robot=ROBOT)
-rng = jax.random.PRNGKey(0)
+rng = jax.random.PRNGKey(_args.seed)
 
 # Reset environment
 rng, rng_reset = jax.random.split(rng)
@@ -74,7 +93,17 @@ def load_policy(robot: str, obs, action_size: int):
     `checkpoint.load_policy` helper cannot reconstruct the network, and its
     vanilla PPONetworks has no cost-value head anyway.
     """
-    ckpt = latest_checkpoint(robot)
+    if _args.checkpoint is None:
+        ckpt = latest_checkpoint(robot)
+    else:
+        # Must be absolute: orbax rejects relative paths ("Checkpoint path
+        # should be absolute"). latest_checkpoint() already returns absolute.
+        ckpt = Path(_args.checkpoint).resolve()
+        if not ckpt.is_dir():
+            raise SystemExit(f"--checkpoint path does not exist: {ckpt}")
+        # Accept a run directory as well as a leaf step directory.
+        steps = sorted(p for p in ckpt.iterdir() if p.is_dir() and p.name.isdigit())
+        ckpt = steps[-1] if steps else ckpt
     if ckpt is None:
         return None, None
     # Restore through orbax directly, NOT brax's checkpoint.load: that helper
