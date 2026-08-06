@@ -14,6 +14,7 @@ from mujoco_playground._src import mjx_env as playground_mjx_env
 from mjx_safety_gym.collision import geoms_colliding
 from mjx_safety_gym.mjx_env import State, step
 import mjx_safety_gym.lidar as lidar
+from mjx_safety_gym.morphology import NUM_GENES
 from mjx_safety_gym.world import (
     _EXTENTS,
     ObjectSpec,
@@ -66,14 +67,6 @@ Observation = Union[jax.Array, Mapping[str, jax.Array]]
 BASE_SENSORS = ["accelerometer", "velocimeter", "gyro", "magnetometer"]
 
 
-def domain_randomization(sys, rng, cfg):
-    @jax.vmap
-    def randomize(rng):
-        return
-
-    in_axes = jax.tree_util.tree_map(lambda x: None, sys)
-    return sys, in_axes, jp.zeros(())
-
 def default_vision_config() -> config_dict.ConfigDict:
   return config_dict.create(
       gpu_id=0,
@@ -124,7 +117,13 @@ class GoToGoal(playground_mjx_env.MjxEnv):
     mujoco_playground's brax-compatible training wrappers.
     """
 
-    def __init__(self, robot: str="point", vision: bool=False, vision_config=default_vision_config()):
+    def __init__(
+        self,
+        robot: str = "point",
+        vision: bool = False,
+        vision_config=default_vision_config(),
+        morphology_conditioning: bool = False,
+    ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
                 f"Unknown robot {robot!r}. Available: {sorted(_ROBOT_XMLS)}"
@@ -147,8 +146,23 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
         self._mjx_model = mjx.put_model(self._mj_model)
 
-        
-    
+        # Set (not derived from _mjx_model -- see morphology.py's
+        # randomization_fn docstring for why genes can't be recovered from a
+        # compiled model) once here and, under morphology randomization,
+        # overwritten per training-env lane by
+        # mjx_safety_gym.algorithms.wrappers.MorphologyDomainRandomizationWrapper,
+        # the same way that wrapper overwrites `_mjx_model`. Appended in
+        # get_obs unconditionally when morphology_conditioning is set, so obs
+        # width is stable from the very first reset() -- this MUST happen
+        # inside the env itself, not in an outer wrapper applied after
+        # CostEpisodeWrapper: that wrapper's own action_repeat scan carries
+        # `state` through repeated internal env.step() calls, so obs width
+        # must already be final before it, or the scan's carry-vs-output
+        # types mismatch on the very first step (this crashed a real training
+        # run before being caught -- see the project plan).
+        self._morphology_conditioning = morphology_conditioning
+        self._morphology_genes = jp.full((NUM_GENES,), 0.5)
+
         self._post_init()
 
         self._vision = vision
@@ -208,25 +222,26 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # while the hazard radius is only 0.20, so a foot could sit dead centre
         # in a hazard at zero cost. Deriving the extent from the geoms keeps this
         # honest as morphologies change: a longer leg cannot buy a blind spot.
+        #
+        # Only the geom *type* (capsule/sphere/other) is cached here. It is
+        # structural and identical across every morphology this project
+        # generates (verified: ngeom/geom_type never change when limbs are
+        # rescaled -- only geom_size does). Caching *sizes* here would be wrong
+        # under morphology randomization: DomainRandomizationVmapWrapper swaps
+        # self._mjx_model out from under this env before each reset/step (see
+        # the `sys` property), so a radius baked in once at __init__ would
+        # silently describe the *nominal* body for every non-nominal one --
+        # corrupting exactly the hazard-cost signal this comment is about.
+        # get_cost re-reads sizes from the live model every call instead, via
+        # _robot_geom_extent().
         geom_ids = np.array(self._robot_collision_geom_ids, dtype=int)
         geom_types = self._mj_model.geom_type[geom_ids]
-        geom_sizes = self._mj_model.geom_size[geom_ids]
-        is_capsule = geom_types == mj.mjtGeom.mjGEOM_CAPSULE
         # Capsule size is (radius, half_length); a sphere is the half_length == 0
         # case. Anything else (e.g. the point robot's box arrow) has no exact
         # swept-sphere form, so fall back to its bounding sphere -- conservative,
         # never a blind spot.
-        self._robot_geom_half_len = jp.array(
-            np.where(is_capsule, geom_sizes[:, 1], 0.0), dtype=jp.float32
-        )
-        self._robot_geom_radius = jp.array(
-            np.where(
-                is_capsule | (geom_types == mj.mjtGeom.mjGEOM_SPHERE),
-                geom_sizes[:, 0],
-                self._mj_model.geom_rbound[geom_ids],
-            ),
-            dtype=jp.float32,
-        )
+        self._robot_geom_is_capsule = jp.array(geom_types == mj.mjtGeom.mjGEOM_CAPSULE)
+        self._robot_geom_is_sphere = jp.array(geom_types == mj.mjtGeom.mjGEOM_SPHERE)
         self._robot_collision_geom_ids_arr = jp.array(geom_ids)
         # Read the hazard radius off the model rather than hardcoding it, so the
         # threshold cannot silently drift from the geometry drawn in the arena.
@@ -328,6 +343,26 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # jax.debug.print("New goal position: {pos}", pos=xy)
         return data, rng, new_goal_dist
 
+    def _robot_geom_extent(self) -> tuple[jax.Array, jax.Array]:
+        """Robot collision-geom (radius, half_length), read from the *live*
+        model.
+
+        Must be recomputed here rather than cached once in _post_init: see the
+        comment there. Reads from self._mjx_model (not self._mj_model, the
+        host-side nominal model) so this reflects whatever body
+        DomainRandomizationVmapWrapper has currently swapped in via the `sys`
+        property, if any -- and is simply the nominal ant's own geometry
+        otherwise.
+        """
+        sizes = self._mjx_model.geom_size[self._robot_collision_geom_ids_arr]
+        half_len = jp.where(self._robot_geom_is_capsule, sizes[:, 1], 0.0)
+        radius = jp.where(
+            self._robot_geom_is_capsule | self._robot_geom_is_sphere,
+            sizes[:, 0],
+            self._mjx_model.geom_rbound[self._robot_collision_geom_ids_arr],
+        )
+        return radius.astype(jp.float32), half_len.astype(jp.float32)
+
     def get_cost(self, data: mjx.Data) -> jax.Array:
         # Check if any robot geom collides with any vase or pillar
         colliding_obstacles = jp.array(
@@ -348,11 +383,12 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # inflated by its radius; hazards are flat discs, so this is all done in
         # the xy-plane -- a raised foot above a hazard still counts, matching the
         # existing 2D treatment.
+        robot_geom_radius, robot_geom_half_len = self._robot_geom_extent()
         geom_pos = data.geom_xpos[self._robot_collision_geom_ids_arr]  # (G, 3)
         geom_axis = data.geom_xmat[self._robot_collision_geom_ids_arr].reshape(
             -1, 3, 3
         )[:, :, 2]  # capsule axis is local z
-        offset = geom_axis[:, :2] * self._robot_geom_half_len[:, None]
+        offset = geom_axis[:, :2] * robot_geom_half_len[:, None]
         seg_a = geom_pos[:, :2] + offset
         seg_b = geom_pos[:, :2] - offset
 
@@ -360,7 +396,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # Distance from each hazard centre to the robot's surface, then take the
         # nearest geom: (H, G) -> (H,)
         surface_distances = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
-        surface_distances -= self._robot_geom_radius[None, :]
+        surface_distances -= robot_geom_radius[None, :]
         hazard_distances = jp.min(surface_distances, axis=1)
         # jax.debug.print("Hazard distances: {dist}", dist=hazard_distances)
 
@@ -405,7 +441,10 @@ class GoToGoal(playground_mjx_env.MjxEnv):
     def get_obs(self, data: mjx.Data) -> jax.Array:
         lidar = self.lidar_observations(data)
         other_sensors = self.sensor_observations(data)
-        return jp.hstack([lidar.flatten(), other_sensors])
+        obs = jp.hstack([lidar.flatten(), other_sensors])
+        if self._morphology_conditioning:
+            obs = jp.hstack([obs, self._morphology_genes])
+        return obs
 
     def update_positions(
         self,
@@ -585,7 +624,10 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
     @property
     def observation_size(self) -> int:
-        return 3 * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
+        size = 3 * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
+        if self._morphology_conditioning:
+            size += NUM_GENES
+        return size
 
 
 def get_sensor_data(model: mj.MjModel, data: mjx.Data, sensor_name: str) -> jax.Array:
