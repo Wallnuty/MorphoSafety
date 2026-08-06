@@ -27,11 +27,24 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
        Why 16 and not lower: the plane-vs-capsule group has exactly 12 pairs
        (floor vs the 12 limb capsules) and governs whether the ant stands at
        all, so the cap must exceed 12. The headroom above that covers
-       limb-vs-vase contacts, the group that produces cost -- the ant would
-       have to be within reach of 16 separate limb/vase pairs at once to lose
-       one. Verified: torso height matches uncapped to within 1e-7 over 300
-       steps. NOTE that check only exercised standing on the floor;
-       limb-vs-vase truncation is untested.
+       limb-vs-vase contacts, the group that produces cost.
+       Verified two ways: (1) torso height matches uncapped to within 1e-7
+       over 300 steps, standing on the floor. (2) limb-vs-vase truncation,
+       flagged as untested here for a while, is now covered by
+       scripts/verify_contact_capping.py -- an adversarial, fully
+       deterministic test (single mjx.forward(), no chaotic dynamics) at the
+       LARGEST morphology scale this project generates (SCALE_HI=1.4 in
+       morphology.py), where all 10 vases are placed at guaranteed-deep-
+       overlap midpoints between limb capsules. That construction produces
+       102 simultaneous real (dist<0) limb-vase pairs -- 6x this cap, denser
+       than default arena placement would organically produce -- and the
+       per-vase cost signal (what get_cost actually reads) still came out
+       exactly right: the torso geom, large and central, reliably held a
+       broad-phase slot against every vase, so each vase kept at least one
+       surviving pair even after 60 of the 102 real pairs were dropped.
+       This is a strong empirical result for this pose, not a formal
+       guarantee for every pose reachable mid-rollout -- rerun that script
+       after changing SCALE_LO/SCALE_HI or the arena's vase count/keepout.
        !! max_geom_pairs MUST stay the FIRST <numeric> in this file. MJX's
        _numeric() (collision_driver.py) indexes numeric_data by the numeric's
        *id* instead of its *adr*, so if init_qpos comes first this reads
