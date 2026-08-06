@@ -43,6 +43,9 @@ dependencies = [
 # bundles its own CUDA 12 runtime via nvidia-*-cu12 wheels, so it does not
 # depend on which `module load cuda-*` is active -- only on the host driver.
 cuda = ["jax[cuda12]==0.10.2"]
+# scripts/evolve.py + scripts/fitness_noise.py (NSGA-II morphology search).
+# Separate extra: irrelevant to anyone just training/replaying a fixed body.
+evolve = ["pymoo==0.6.2"]
 
 [project.urls]
 Homepage = "https://github.com/Wallnuty/MorphoSafety"

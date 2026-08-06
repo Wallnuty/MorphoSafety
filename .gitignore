@@ -178,3 +178,10 @@ pyrightconfig.json
 .python-version
 
 MorphoSafetyToken.txt
+
+### Project-specific ###
+# Trained policy checkpoints (binary, per-run artifacts -- not source).
+# Previously untracked-but-committed history already bloated .git to ~142MB;
+# this stops it from growing further. Existing large blobs stay in history
+# unless someone runs a filter-repo pass separately.
+checkpoints/
