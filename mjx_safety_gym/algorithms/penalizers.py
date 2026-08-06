@@ -113,10 +113,16 @@ def get_penalizer(
     *,
     eta: float = 0.0,
     burnin: int = 0,
-    multiplier_lr: float = 1e-2,
-    initial_lagrange_multiplier: float = 0.0,
+    multiplier_lr: float = 7e-7,
+    initial_lagrange_multiplier: float = 0.01,
 ) -> tuple[Optional[Penalizer], Optional[Params]]:
     """Build a penalizer and its initial state from simple keyword args.
+
+    multiplier_lr/initial_lagrange_multiplier default to ss2r's own values
+    (agent/penalizer/ppo_lagrangian.yaml), not empirically tuned for this
+    repo's exact setup -- see train_ppo.py's --lagrangian_multiplier_lr help
+    text for the caveat (never actually validated against go_to_goal by
+    ss2r's own authors either, since their go_to_goal reference uses Saute).
 
     Unlike ss2r's Hydra-driven `get_penalizer`, this takes explicit
     keyword arguments so it can be used without a config framework.

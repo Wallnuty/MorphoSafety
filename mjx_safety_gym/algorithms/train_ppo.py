@@ -100,10 +100,44 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["crpo", "ppo_lagrangian", "saute", "none"],
         default="crpo",
     )
-    parser.add_argument("--safety_budget", type=float, default=25.0)
+    parser.add_argument(
+        "--safety_budget",
+        type=float,
+        default=150.0,
+        help="Raised from ss2r's own reference value of 25: that number was "
+        "calibrated for Saute+terminate=true (go_to_goal_simple_ppo.yaml), "
+        "where hitting the budget ends the episode immediately, implicitly "
+        "bounding cost. Under CRPO/Lagrangian (no early termination) cost "
+        "runs for the full episode -- porting 25 across that mechanism "
+        "change, on top of this repo's stricter surface-based (not centre-"
+        "based) hazard cost, measurably produced a degenerate policy for the "
+        "point (0.19 goals/ep vs a 3.94 unconstrained ceiling, even with a "
+        "well-tuned multiplier). 150 sits above the untrained ant's step-0 "
+        "cost of 108.94; still an extrapolation, not a measurement -- pair "
+        "the first real run with a short unconstrained baseline to check it.",
+    )
     parser.add_argument("--crpo_eta", type=float, default=0.0)
     parser.add_argument("--crpo_burnin", type=int, default=0)
-    parser.add_argument("--lagrangian_multiplier_lr", type=float, default=1e-2)
+    parser.add_argument(
+        "--lagrangian_multiplier_lr",
+        type=float,
+        default=7e-7,
+        help="ss2r's own default (agent/penalizer/ppo_lagrangian.yaml). The "
+        "previous default of 1e-2 traces to ss2r's go1_sim_to_real "
+        "experiment, an unrelated robot/task -- not validated for "
+        "go_to_goal (whose own ss2r reference config uses Saute, not "
+        "Lagrangian, and never overrides this). At 7e-7 the multiplier will "
+        "move far more slowly than the 90-273 range measured at 1e-2 -- "
+        "watch training logs for it staying near its initial value "
+        "(under-enforcing) rather than assuming this is well-calibrated.",
+    )
+    parser.add_argument(
+        "--initial_lagrange_multiplier",
+        type=float,
+        default=0.01,
+        help="ss2r's own default (same file as --lagrangian_multiplier_lr). "
+        "Previously hardcoded to 0.0 and not reachable from the CLI at all.",
+    )
     parser.add_argument(
         "--saute_penalty",
         type=float,
@@ -358,6 +392,7 @@ def train(args: argparse.Namespace):
         eta=args.crpo_eta,
         burnin=args.crpo_burnin,
         multiplier_lr=args.lagrangian_multiplier_lr,
+        initial_lagrange_multiplier=args.initial_lagrange_multiplier,
     )
 
     def progress_fn(step, metrics):
