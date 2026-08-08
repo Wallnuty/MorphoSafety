@@ -140,15 +140,25 @@ class Saute(Wrapper):
             False,
         )
         rng = state.info["prng"]
-        rng, sample_rng = jax.random.split(rng)
-        nstate.info["prng"] = rng
-        terminate = jp.where(
-            terminate,
-            jax.random.bernoulli(sample_rng, self.termination_probability).astype(
-                jp.bool_
-            ),
-            jp.zeros_like(terminate),
-        )
+        if self.termination_probability >= 1.0:
+            # Bernoulli(1.0) is always True, so `jp.where(terminate, True,
+            # False) == terminate` exactly -- the split+sample below is
+            # mathematically a no-op at the CLI default (1.0), just extra
+            # per-step GPU RNG kernel launches for a result already known.
+            # `self.termination_probability` is a plain python float fixed at
+            # __init__, so this branch resolves at trace time (one compiled
+            # graph per value), not a runtime cond.
+            nstate.info["prng"] = rng
+        else:
+            rng, sample_rng = jax.random.split(rng)
+            nstate.info["prng"] = rng
+            terminate = jp.where(
+                terminate,
+                jax.random.bernoulli(sample_rng, self.termination_probability).astype(
+                    jp.bool_
+                ),
+                jp.zeros_like(terminate),
+            )
         saute_state = jp.where(terminate, ones, saute_state)
         nstate.info["saute_state"] = saute_state
         nstate.info["eval_reward"] = nstate.reward
