@@ -30,30 +30,23 @@
 # that's exactly what this job settles. If sbatch REJECTS the job outright
 # (rather than the job running and failing), that's a sign this flag isn't
 # valid on this partition -- remove it and resubmit.
-
 #SBATCH --job-name=gpu-smoke-test
 #SBATCH --output=gpu_smoke_test_%j.log
 #SBATCH --partition=bigbatch
-#SBATCH --gres=gpu:1
 #SBATCH --time=00:10:00
-
 set -u
-
 echo "=== node ==="
 hostname
 date
-
 echo
 echo "=== nvidia-smi (host driver + GPU visibility) ==="
 nvidia-smi
-
 echo
 echo "=== conda env ==="
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate mjx-safety-gym
 python --version
 pip show jax jaxlib jax-cuda12-plugin 2>&1 | grep -E "^Name|^Version"
-
 echo
 echo "=== jax device check ==="
 # pyproject.toml's own warning: "on a headless cluster node a missing plugin
@@ -72,7 +65,6 @@ assert gpu_devices, (
 )
 print(f'PASS: {len(gpu_devices)} GPU device(s) found: {gpu_devices}')
 "
-
 echo
 echo "=== minimal MJX step (confirms the CUDA path actually executes, not just initializes) ==="
 python -c "
@@ -90,6 +82,5 @@ d = mjx.step(mx, d)
 d.qpos.block_until_ready()
 print('PASS: mjx.step executed on device, qpos =', d.qpos)
 "
-
 echo
 echo "=== done ==="
