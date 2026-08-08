@@ -260,8 +260,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # sensors (e.g. the ant's joint angles/velocities). Total dim is cached so
         # observation_size reflects the actual sensor layout of the chosen robot.
         self._obs_sensor_names = BASE_SENSORS + robot_config["extra_sensors"]
-        self._obs_sensor_dim = int(
-            sum(self._mj_model.sensor(name).dim for name in self._obs_sensor_names)
+        # `.item()`, not `int(...)` on the summed generator: numpy's strictness
+        # around converting non-0-d arrays to scalars varies by version --
+        # `sensor(name).dim` is a shape-(1,) array on some numpy/mujoco
+        # combinations, and summing several of those keeps it shape-(1,), which
+        # `int()` rejects on newer numpy even though it's a single value.
+        self._obs_sensor_dim = sum(
+            np.asarray(self._mj_model.sensor(name).dim).item()
+            for name in self._obs_sensor_names
         )
 
         # For position updates: either two planar slide joints (point) or a single
