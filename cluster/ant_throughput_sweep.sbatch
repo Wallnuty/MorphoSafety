@@ -13,8 +13,13 @@
 #
 # THREE THINGS ARE BEING VARIED:
 #
-# A. num_envs 256 -> 512 -> 2048. 256 was sized for a 6GB laptop card. Raising
-#    it is the direct test of whether the GPU is starved of parallel work.
+# A. num_envs 256 -> 2048. 256 was sized for a 6GB laptop card. Raising it is
+#    the direct test of whether the GPU is starved of parallel work. An
+#    intermediate 512-env arm was deliberately dropped: 512 is the ceiling
+#    reachable without touching num_minibatches, but it answers a strict subset
+#    of what the 2048 arm answers and cost ~45 min for almost no extra
+#    information. If 2048 turns out to destabilise or OOM, 512 is the obvious
+#    fallback to add back.
 #
 # B. num_minibatches 16 -> 64, ONLY as the mechanism for reaching 2048 envs.
 #    validate() requires num_envs to divide batch_size*num_minibatches, so 512
@@ -23,7 +28,6 @@
 #
 #      num_envs  num_mb  transitions/grad_step  grad_steps @37.5M
 #           256      16                    320             23,438
-#           512      16                    320             23,438
 #          2048      64                    320             23,438   <- via num_minibatches
 #          2048      16                      -             REJECTED by validate()
 #
@@ -77,8 +81,13 @@ python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 
-UTILDIR="$(mktemp -d)"
-trap 'rm -rf "$UTILDIR"' EXIT
+# Deliberately NOT mktemp -d. If the job hits its wall time mid-arm, Slurm
+# SIGKILLs everything and that arm's summarize_util never runs -- with the
+# samples in /tmp on a node you no longer have, they are gone. Writing them
+# beside the log means a timed-out run still leaves the raw utilization data
+# for the arm that was interrupted, which is usually the interesting one.
+UTILDIR="ant_sweep_util_${SLURM_JOB_ID:-manual}"
+mkdir -p "$UTILDIR"
 
 # Sample real GPU business every 3s. utilization.gpu is the percentage of time
 # any kernel was resident over the sampling interval -- it is NOT occupancy, so
@@ -131,13 +140,11 @@ run_arm () {
   summarize_util "$uf"
 }
 
-run_arm 1 "num_envs=256  mb=16  RK4         (current baseline)" 1000000 \
+run_arm 1 "num_envs=256  mb=16  RK4          (current baseline)" 1000000 \
         --num_envs 256  --num_minibatches 16
-run_arm 2 "num_envs=512  mb=16  RK4         (free parallelism)" 1000000 \
-        --num_envs 512  --num_minibatches 16
-run_arm 3 "num_envs=2048 mb=64  RK4         (max parallelism)"  4000000 \
+run_arm 2 "num_envs=2048 mb=64  RK4          (max parallelism)"  4000000 \
         --num_envs 2048 --num_minibatches 64
-run_arm 4 "num_envs=2048 mb=64  implicitfast (parallel+cheap)"  4000000 \
+run_arm 3 "num_envs=2048 mb=64  implicitfast (parallel + cheap)" 4000000 \
         --num_envs 2048 --num_minibatches 64 --integrator implicitfast
 
 echo
@@ -151,23 +158,23 @@ echo "    and num_envs=256 is leaving the 3090 idle. Arms 2 and 3 then say how"
 echo "    much of that is recoverable."
 echo "  * HIGH gpu_util everywhere with flat training/sps means we are already"
 echo "    compute-bound and more parallelism buys nothing -- in which case the"
-echo "    integrator (arm 4) is the ONLY remaining lever."
-echo "  * Arms 1-3 differ ONLY in parallelism, never in optimization: 320"
-echo "    transitions per gradient step and 23,438 total gradient steps in all"
-echo "    three. So their eval/episode_cost and eval/episode_reward MUST agree"
+echo "    integrator (arm 3) is the ONLY remaining lever."
+echo "  * Arms 1 and 2 differ ONLY in parallelism, never in optimization: 320"
+echo "    transitions per gradient step and 23,438 total gradient steps in"
+echo "    both. So their eval/episode_cost and eval/episode_reward MUST agree"
 echo "    within noise. If they do not, the larger batch is doing something"
 echo "    unintended and must be understood before adopting."
-echo "  * Arm 4 vs arm 3 isolates the integrator, and is a JUDGEMENT CALL, not"
+echo "  * Arm 3 vs arm 2 isolates the integrator, and is a JUDGEMENT CALL, not"
 echo "    an automatic adopt. Weigh the speedup against the ~25% gait-"
 echo "    displacement difference. If adopted, every prior ant cost number"
 echo "    becomes incomparable AGAIN and --safety_budget must be re-derived."
-echo "  * Watch for arm 3/4 compile time specifically. Laptop compile went 46s"
+echo "  * Watch for arm 2/3 compile time specifically. Laptop compile went 46s"
 echo "    at 256 envs to 264s at 1024; cluster CPUs are 2012-era Xeons and"
 echo "    compile slower, so 2048 envs could cost 15-30 min before the first"
 echo "    step. That is a one-off per shape, cached in ~/.cache/jax, and it is"
 echo "    a real cost to weigh for short runs but irrelevant for a 15h one."
 echo "  * Any arm exiting 139 is the laptop segfault class reaching the cluster."
-echo "    Arm 3/4 are the most likely to OOM or destabilise -- 2048 envs has"
+echo "    Arm 2/3 are the most likely to OOM or destabilise -- 2048 envs has"
 echo "    never been run for the ant anywhere (the laptop got host-RAM"
 echo "    OOM-killed at 2048; this node has 128GB, so it should be fine)."
 echo
