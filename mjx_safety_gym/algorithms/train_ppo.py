@@ -34,6 +34,7 @@ from mjx_safety_gym.algorithms.wrappers import (
     Saute,
 )
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
+from mjx_safety_gym.envs.run_forward import RunForward
 
 
 # Checkpoints live outside the package so they are not swept up by a package
@@ -43,60 +44,48 @@ from mjx_safety_gym.envs.go_to_goal import GoToGoal
 CHECKPOINT_ROOT = Path(__file__).resolve().parents[2] / "checkpoints"
 
 
-# Per-robot defaults for the three settings whose correct value depends on how
-# fast the robot physically moves. Everything else is shared.
-#
-# WHY THE ANT NEEDS ITS OWN VALUES. The point's numbers came from ss2r's
-# `go_to_goal_simple_ppo.yaml`, which was tuned for the point and only ever
-# validated on it. Applying them unchanged to the ant produced a policy that
-# learned to stand perfectly still (measured: 0.011 m of travel per episode vs
-# 0.313 m for uniform random actions). That is a rational outcome, not a bug:
-# reward is a signed distance delta, so undirected motion has strictly negative
-# expected return (distance-to-a-point is convex, so any zero-mean displacement
-# increases expected distance by Jensen), while freezing scores exactly 0.
-# Freezing is therefore the best policy reachable without a working gait, and
-# PPO correctly converges to it.
-#
-# The escape is to make a goal reachable often enough that the +1 bonus ever
-# fires. Measured on the nominal ant (CPU MuJoCo, uniform random actions, mean
-# net torso displacement over 24 seeds):
-#
-#     10 s episode, 0.04 s control period   0.316 m
-#     10 s episode, 0.1 s  control period   0.444 m
-#     100 s episode, 0.1 s control period   1.370 m
-#
-# A goal spawns ~0.8 m away with a 0.3 m capture radius, so ~0.5 m of travel is
-# needed. At 10 s the ant essentially never touches one by accident and never
-# discovers goals exist; the extra time and the coarser control period are what
-# make accidental success possible.
-#
-# These values are deliberately a middle path between our old settings and
-# safety-gymnasium's own (`frameskip_binom_n=10`, 1000 control steps => 100 s
-# per episode for the ant, vs 20 s for its point -- it gives the ant 5x the
-# point's wall-clock budget by using a 5x larger physics timestep). Matching
-# their 100 s outright would cost 10x the physics per episode. 2500/10 instead
-# buys 25 s of simulated time while holding decisions per episode at 250,
-# exactly as before -- so PPO's network cost and the eval unroll length
-# (episode_length // action_repeat) are both unchanged, and only physics
-# stepping goes up 2.5x.
-#
-# discounting 0.97: at 0.1 s per decision that is a ~3.3 s effective horizon
-# (1/(1-gamma) decisions), against a measured best scripted gait period of
-# 0.3 s. The old 0.9 at 0.04 s gave 0.4 s -- barely one gait cycle, too short
-# for a value function to credit the setup moves a gait is made of.
-#
-# CAVEAT, deliberately not auto-corrected here: `num_timesteps` counts physics
-# steps *including* action_repeat (see env_step_per_training_step in
-# ppo/train.py), so a fixed budget now buys 2.5x FEWER gradient steps. Scale
-# --num_timesteps up accordingly when comparing against older ant runs.
+# Per-robot defaults for the settings whose correct value depends on how fast
+# the robot physically moves. Everything else is shared.
 #
 # NOTE: --safety_discounting is left at 0.9 for both robots on purpose. The
-# same slow-timescale argument applies to the cost critic, but changing it also
-# shifts the constraint's semantics while the safety-budget calibration is
-# still an open question -- a research call, not a bug fix.
+# same slow-timescale argument applies to the cost critic, but changing it
+# also shifts the constraint's semantics while the safety-budget calibration
+# is still an open question -- a research call, not a bug fix.
+# !! action_repeat is NOT the frameskip. GoToGoal.step calls mjx_env.step with
+# n_substeps=2, so the real control period is action_repeat * 2 * timestep, and
+# simulated seconds per episode is
+#     (episode_length / action_repeat) * action_repeat * 2 * timestep
+#   = episode_length * 2 * timestep.
+# An earlier version of this table set the ant to action_repeat=10 to match
+# safety-gymnasium's frameskip_binom_n=10, having missed that n_substeps=2 was
+# already in the chain -- that made the control period 0.2 s, DOUBLE theirs.
+# Measured cost of getting this wrong (scripted-gait sweep, 20 s of sim time,
+# best gait period per row):
+#
+#     action_repeat  control period  best gait travel  random travel
+#                 2          0.04 s           2.718 m        0.276 m
+#                 4          0.08 s           4.090 m        0.620 m   <- best
+#                 6          0.12 s           1.979 m        0.635 m
+#                 8          0.16 s           2.133 m        0.637 m
+#                10          0.20 s           1.499 m        0.634 m
+#
+# Random-action travel saturates by action_repeat=4, so coarser control buys no
+# extra exploration, while the achievable-locomotion CEILING falls 2.7x from 4
+# to 10. action_repeat stays at 4 for both robots; episode duration is bought
+# with episode_length instead, which is free of that tradeoff.
+#
+# The ant's episode_length of 2500 is 625 decisions = 50 s of simulated time
+# (against the point's 1000 -> 250 decisions = 20 s). The ant needs it: at its
+# measured best of ~0.2 m/s it covers ~10 m in 50 s, which is what makes a
+# 12 m corridor (envs/run_forward.py) a task it can actually make progress on.
+# safety-gymnasium gives its own ant 100 s per episode and its point 20 s.
+#
+# discounting 0.97 at a 0.08 s control period is a ~2.7 s horizon, about seven
+# gait cycles at the measured 0.4 s best gait period. The point keeps ss2r's
+# 0.9 (a 0.4 s horizon), which is fine for a robot whose "gait" is one actuator.
 _ROBOT_DEFAULTS = {
     "point": {"action_repeat": 4, "episode_length": 1000, "discounting": 0.9},
-    "ant": {"action_repeat": 10, "episode_length": 2500, "discounting": 0.97},
+    "ant": {"action_repeat": 4, "episode_length": 2500, "discounting": 0.97},
 }
 
 
@@ -271,6 +260,64 @@ def build_argparser() -> argparse.ArgumentParser:
         "Note --num_timesteps counts physics steps INCLUDING action_repeat, "
         "so raising this shrinks the gradient-step count at a fixed budget.",
     )
+    parser.add_argument(
+        "--task",
+        choices=["goal", "run"],
+        default="goal",
+        help="'goal' is the original navigate-to-a-respawning-goal task. 'run' "
+        "is RunForward: start at one end of a corridor and get as far in +x as "
+        "possible without hitting anything. 'run' exists because 'goal' is "
+        "provably unlearnable for the ant -- its distance-delta reward is convex, "
+        "so undirected motion has negative expected return while freezing scores "
+        "0, and the trained ant converged to standing still (0.011 m/episode vs "
+        "0.313 m for random actions). 'run' rewards x-displacement, which is "
+        "LINEAR, so exploration is free. See envs/run_forward.py.",
+    )
+    parser.add_argument(
+        "--corridor_length",
+        type=float,
+        default=None,
+        help="[--task run] Corridor length in metres. Defaults to 12 x the "
+        "robot's arena_scale (12 m for ant, 48 m for ant_gym), because a "
+        "corridor only means anything relative to the robot in it. The 10 hazards and 10 "
+        "vases are spread across it, so obstacle DENSITY falls as this rises -- "
+        "size it to the robot, or it never reaches the first hazard and cost is "
+        "identically zero. Measured over a 50 s episode at the 0.08 s control "
+        "period: safety-gymnasium's ant covers ~3 m under a scripted gait "
+        "(~1.1 m random), the Gym/Brax ant ~21 m (~6 m random).",
+    )
+    parser.add_argument(
+        "--corridor_half_width",
+        type=float,
+        default=None,
+        help="[--task run] Half-width of the corridor. Defaults to 1 x the "
+        "robot's arena_scale. Leaving it costs "
+        "--boundary_cost_weight per step.",
+    )
+    parser.add_argument(
+        "--forward_reward_weight",
+        type=float,
+        default=1.0,
+        help="[--task run] Scale on per-step +x progress. Episode return is "
+        "this times total metres travelled.",
+    )
+    parser.add_argument(
+        "--ctrl_cost_weight",
+        type=float,
+        default=0.0,
+        help="[--task run] Quadratic action penalty. DEFAULTS TO 0 ON PURPOSE: "
+        "a control cost is paid by any moving policy and not by a frozen one, so "
+        "a positive weight re-creates the freeze attractor this task exists to "
+        "escape. Raise only once the robot reliably walks.",
+    )
+    parser.add_argument(
+        "--boundary_cost_weight",
+        type=float,
+        default=1.0,
+        help="[--task run] Cost per step for leaving the corridor. Without it "
+        "the safe optimum is to step out of the obstacle band and run in clean "
+        "air -- full reward, zero cost -- making the constraint vacuous.",
+    )
     parser.add_argument("--num_timesteps", type=int, default=5_000_000)
     parser.add_argument(
         "--num_envs",
@@ -431,16 +478,25 @@ def train(args: argparse.Namespace):
         )
         print(f"Checkpoints: {checkpoint_logdir}")
 
-    env = GoToGoal(
-        robot=args.robot,
-        morphology_conditioning=bool(args.num_morphologies),
-        integrator=args.integrator,
-    )
-    eval_env = GoToGoal(
-        robot=args.robot,
-        morphology_conditioning=bool(args.num_morphologies),
-        integrator=args.integrator,
-    )
+    def build_env():
+        common = dict(
+            robot=args.robot,
+            morphology_conditioning=bool(args.num_morphologies),
+            integrator=args.integrator,
+        )
+        if args.task == "run":
+            return RunForward(
+                corridor_length=args.corridor_length,
+                corridor_half_width=args.corridor_half_width,
+                forward_reward_weight=args.forward_reward_weight,
+                ctrl_cost_weight=args.ctrl_cost_weight,
+                boundary_cost_weight=args.boundary_cost_weight,
+                **common,
+            )
+        return GoToGoal(**common)
+
+    env = build_env()
+    eval_env = build_env()
 
     # Composition order matters and is NOT arbitrary: any obs-shape-changing
     # wrapper (Saute, morphology randomization) must be applied to the raw
