@@ -1,58 +1,62 @@
 #!/bin/bash
-# Throughput sweep: what should the 15-hour ant baseline actually be configured
-# with? Run this BEFORE cluster/ant_unconstrained_baseline.sbatch.
+# Throughput + GPU-utilization sweep. Run this BEFORE
+# cluster/ant_unconstrained_baseline.sbatch, which is currently sized at ~15h
+# from settings that were never chosen on evidence.
 #
-# The baseline job is currently sized at ~15h from a config whose two biggest
-# knobs were never chosen on evidence:
+# THE QUESTION THIS EXISTS TO ANSWER: how much of the 3090 are we actually
+# using? Note that XLA_PYTHON_CLIENT_MEM_FRACTION cannot tell you -- it
+# PREALLOCATES a fixed pool, so nvidia-smi reports that pool as "used"
+# regardless of real demand (the laptop peaked at 979 MiB of genuine VRAM at
+# 1024 envs). Memory has never been this workload's constraint. So every arm
+# below samples utilization.gpu, which is independent of the preallocation and
+# reports whether the SMs are actually busy.
 #
-#   * --num_envs 256 was sized for a 6GB laptop card, not a 24GB 3090.
-#   * ant.xml declares integrator="RK4" purely because safety-gymnasium's copy
-#     did. RK4 does FOUR force evaluations per step against one for
-#     implicitfast/euler, and physics is ~90% of per-decision cost (decomposed
-#     from two measured throughputs: ~2.71 ms per physics step against ~3.02 ms
-#     fixed per-decision overhead). CPU stepping measured 3.5x cheaper.
+# THREE THINGS ARE BEING VARIED:
 #
-# Spending ~1.5h here to pick those two is cheap insurance against spending 15h
-# at the wrong settings -- and the sweep doubles as a crash test, since the ant
-# segfaults on the laptop at full size and has only ever passed here once.
+# A. num_envs 256 -> 512 -> 2048. 256 was sized for a 6GB laptop card. Raising
+#    it is the direct test of whether the GPU is starved of parallel work.
 #
-# ARM A: --num_envs 256 -> 512. FREE AND SAFE. validate() requires num_envs to
-# divide batch_size*num_minibatches (32*16=512), so 512 is the ceiling that
-# needs no PPO hyperparameter change, and total data per update is IDENTICAL
-# either way (512 x unroll_length 10 = 5120 transitions). The only difference
-# is 512 envs x 1 unroll instead of 256 envs x 2 sequential unrolls -- half the
-# sequential rollout depth per training step, and slightly MORE decorrelated
-# data, which if anything helps. Going past 512 would mean raising batch_size
-# or num_minibatches, which changes the optimization rather than just its
-# speed, so it is deliberately not tested here.
+# B. num_minibatches 16 -> 64, ONLY as the mechanism for reaching 2048 envs.
+#    validate() requires num_envs to divide batch_size*num_minibatches, so 512
+#    is the ceiling at the current 32*16. Reaching 2048 needs that product to
+#    be 2048, and HOW you get there matters:
 #
-# ARM B: RK4 -> implicitfast. NOT FREE -- this is a research decision, which is
-# why the sweep measures it rather than the default adopting it. Measured on
-# CPU at the shipped timestep of 0.01: passive settling is near-identical
-# (equilibrium torso height 0.159 m RK4 vs 0.161 m implicitfast, max trajectory
-# deviation 0.0225 m, no instability) but a scripted gait travels 1.010 m under
-# RK4 against 0.770 m under implicitfast, ~25% less. That is a genuine dynamics
-# change, not roundoff. Two things make it worth measuring anyway: point.xml
-# already uses euler, so the ant's RK4 is the anomaly and overriding it makes
-# the two robots CONSISTENT; and if it really is ~3x, it converts the 15h
-# baseline into something like 5h, which changes what experiments are
-# affordable at all. Not tested here but worth knowing: standard practice pairs
-# a single-evaluation integrator with a smaller timestep, and implicitfast at
-# dt=0.005 would still be ~2x cheaper than RK4 at dt=0.01 and more accurate
-# than either.
+#      num_envs  num_mb  transitions/grad_step  grad_steps @37.5M
+#           256      16                    320             23,438
+#           512      16                    320             23,438
+#          2048      64                    320             23,438   <- via num_minibatches
+#          2048      16                      -             REJECTED by validate()
 #
-# WHAT TO COMPARE. training/sps is the throughput answer, but do NOT pick on
-# speed alone -- also compare eval/episode_cost and eval/episode_reward across
-# arms. Arms 1 and 2 differ only in parallelism and MUST agree on those within
-# noise; if they do not, something is wrong with the larger batch rather than
-# faster. Arm 3 changes the physics, so it is EXPECTED to differ -- the question
-# is whether it differs enough to matter for a study about safety, where cost
-# comes from contact with hazards and vases.
+#    Raising num_minibatches keeps transitions per gradient step at
+#    batch_size*unroll_length = 320 AND keeps the total gradient-step count
+#    identical (4x fewer training steps, 4x more gradient steps in each, so it
+#    cancels). Raising batch_size to 128 instead would have reached 2048 too,
+#    but with 1280 transitions per gradient step -- a 4x larger gradient batch,
+#    a different optimizer regime, and a different experiment. So this sweep
+#    scales via num_minibatches deliberately: the ONLY thing that changes is
+#    that a training step sees 2048 distinct envs instead of 256 sampled twice
+#    as deep, which if anything decorrelates the data slightly better.
 #
-# Each arm is 500k env steps with 2 evals, matching the stage-2 smoke test so
-# the numbers are comparable to what is already recorded. Sequential, not an
-# array job: one GPU, and concurrent JAX processes would contend for it and
-# corrupt the measurement.
+# C. RK4 -> implicitfast. RK4 does FOUR force evaluations per step against one,
+#    and physics is ~90% of per-decision cost (decomposed from two measured
+#    throughputs: ~2.71 ms per physics step against ~3.02 ms fixed per-decision
+#    overhead); CPU stepping measured 3.5x cheaper. ant.xml declares RK4 only
+#    because safety-gymnasium's copy did -- point.xml already takes MuJoCo's
+#    Euler default. NOT free, and NOT an automatic adopt: at the shipped
+#    timestep of 0.01 passive settling is near-identical (equilibrium torso
+#    height 0.159 m RK4 vs 0.161 m implicitfast, 0.0225 m max trajectory
+#    deviation, no instability) but a scripted gait travels 1.010 m under RK4
+#    against 0.770 m under implicitfast, ~25% less. That is a real dynamics
+#    change in a project whose subject is contact-driven cost.
+#
+# num_timesteps is NOT constant across arms, on purpose. env steps per training
+# step scale with num_minibatches (51,200 at mb=16, 204,800 at mb=64), so a
+# fixed budget would give the 2048-env arms only a couple of training steps and
+# a training/sps number that is pure compile noise. Each arm instead gets ~20
+# training steps: 1M for the mb=16 arms, 4M for the mb=64 arms.
+#
+# Sequential, not an array job: one GPU, and concurrent JAX processes would
+# contend for it and corrupt both the timing and the utilization sampling.
 #
 # Submit from the repo root on the cluster:
 #   sbatch cluster/ant_throughput_sweep.sbatch
@@ -60,7 +64,7 @@
 #SBATCH --job-name=ant-sweep
 #SBATCH --output=ant_sweep_%j.log
 #SBATCH --partition=bigbatch
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 set -u
 echo "=== node ==="
 hostname
@@ -73,6 +77,34 @@ python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 
+UTILDIR="$(mktemp -d)"
+trap 'rm -rf "$UTILDIR"' EXIT
+
+# Sample real GPU business every 3s. utilization.gpu is the percentage of time
+# any kernel was resident over the sampling interval -- it is NOT occupancy, so
+# 100% does not prove the card is saturated, but a LOW number is conclusive
+# evidence it is starved. Read it that way round.
+sample_util () {
+  while true; do
+    nvidia-smi --query-gpu=utilization.gpu,memory.used \
+               --format=csv,noheader,nounits 2>/dev/null || true
+    sleep 3
+  done
+}
+
+summarize_util () {
+  local f="$1"
+  local n; n=$(wc -l < "$f" 2>/dev/null || echo 0)
+  if [ "$n" -lt 3 ]; then echo "    gpu_util: too few samples ($n)"; return; fi
+  local mean p50 p90 max
+  mean=$(cut -d, -f1 "$f" | awk '{s+=$1} END{printf "%.0f", s/NR}')
+  p50=$(cut -d, -f1 "$f" | sort -n | awk -v n="$n" 'NR>=int(n*0.5){print; exit}')
+  p90=$(cut -d, -f1 "$f" | sort -n | awk -v n="$n" 'NR>=int(n*0.9){print; exit}')
+  max=$(cut -d, -f1 "$f" | sort -n | tail -1)
+  echo "    gpu_util: mean=${mean}% p50=${p50}% p90=${p90}% max=${max}%  (n=$n samples)"
+  echo "    (memory.used is meaningless here -- MEM_FRACTION=0.75 preallocates ~18GB)"
+}
+
 # python -u is NOT optional -- a laptop run reached 573k steps and left a
 # COMPLETELY EMPTY log, because Python block-buffers stdout when redirected and
 # a segfault never flushes it.
@@ -81,40 +113,65 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 # they resolve from _ROBOT_DEFAULTS for --robot ant and each arm prints the
 # resolved values on its first line, so the log records what actually ran.
 run_arm () {
-  local label="$1"; shift
+  local tag="$1"; local label="$2"; local steps="$3"; shift 3
+  local uf="$UTILDIR/$tag"
   echo
-  echo "==================== ARM: $label ===================="
-  echo "cmd: $*"
+  echo "==================== ARM $tag: $label ===================="
+  echo "steps=$steps  extra args: $*"
   date
-  # Peak VRAM is not readable from inside the run (MEM_FRACTION preallocates a
-  # fixed pool, so nvidia-smi reports the pool, not demand) -- the useful
-  # signal is simply whether the arm survives.
+  sample_util > "$uf" &
+  local sampler=$!
   time python -u -m mjx_safety_gym.algorithms.train_ppo \
     --robot ant --penalizer none \
-    --num_timesteps 500_000 --num_evals 2 --no_checkpoint "$@"
-  echo "--- $label exit status: $? ---"
+    --num_timesteps "$steps" --num_evals 2 --no_checkpoint "$@"
+  local st=$?
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+  echo "--- ARM $tag exit status: $st ---"
+  summarize_util "$uf"
 }
 
-run_arm "1. baseline      (num_envs=256, RK4)"          --num_envs 256
-run_arm "2. wider         (num_envs=512, RK4)"          --num_envs 512
-run_arm "3. wider + cheap (num_envs=512, implicitfast)" --num_envs 512 --integrator implicitfast
+run_arm 1 "num_envs=256  mb=16  RK4         (current baseline)" 1000000 \
+        --num_envs 256  --num_minibatches 16
+run_arm 2 "num_envs=512  mb=16  RK4         (free parallelism)" 1000000 \
+        --num_envs 512  --num_minibatches 16
+run_arm 3 "num_envs=2048 mb=64  RK4         (max parallelism)"  4000000 \
+        --num_envs 2048 --num_minibatches 64
+run_arm 4 "num_envs=2048 mb=64  implicitfast (parallel+cheap)"  4000000 \
+        --num_envs 2048 --num_minibatches 64 --integrator implicitfast
 
 echo
 echo "=============================================================="
-echo "SUMMARY -- training/sps per arm (higher is better):"
+echo "HOW TO READ THIS"
 echo "=============================================================="
-grep -h "training/sps" ant_sweep_*.log 2>/dev/null | tail -3 || true
+echo "Compare training/sps across arms, and read each arm's gpu_util with it."
 echo
-echo "How to decide:"
-echo "  * Arm2 vs Arm1: pure parallelism win, no dynamics change. If Arm2 is"
-echo "    faster, adopt --num_envs 512 unconditionally. Its cost/reward MUST"
-echo "    match Arm1 within noise -- if not, investigate before adopting."
-echo "  * Arm3 vs Arm2: isolates the integrator. This one is a judgement call,"
-echo "    not an automatic adopt. Weigh the speedup against the ~25% gait-"
-echo "    displacement difference measured on CPU, and against deviating from"
-echo "    safety-gymnasium's ant.xml. If adopted, EVERY prior ant cost number"
-echo "    becomes incomparable and --safety_budget must be re-derived again."
-echo "  * Then update cluster/ant_unconstrained_baseline.sbatch with the winner"
-echo "    and reproject its --time from the new training/sps before submitting."
-echo "  * Any arm exiting 139 = the laptop segfault class reaching the cluster."
+echo "  * LOW gpu_util in arm 1 (say <50%) is the headline: the card is starved"
+echo "    and num_envs=256 is leaving the 3090 idle. Arms 2 and 3 then say how"
+echo "    much of that is recoverable."
+echo "  * HIGH gpu_util everywhere with flat training/sps means we are already"
+echo "    compute-bound and more parallelism buys nothing -- in which case the"
+echo "    integrator (arm 4) is the ONLY remaining lever."
+echo "  * Arms 1-3 differ ONLY in parallelism, never in optimization: 320"
+echo "    transitions per gradient step and 23,438 total gradient steps in all"
+echo "    three. So their eval/episode_cost and eval/episode_reward MUST agree"
+echo "    within noise. If they do not, the larger batch is doing something"
+echo "    unintended and must be understood before adopting."
+echo "  * Arm 4 vs arm 3 isolates the integrator, and is a JUDGEMENT CALL, not"
+echo "    an automatic adopt. Weigh the speedup against the ~25% gait-"
+echo "    displacement difference. If adopted, every prior ant cost number"
+echo "    becomes incomparable AGAIN and --safety_budget must be re-derived."
+echo "  * Watch for arm 3/4 compile time specifically. Laptop compile went 46s"
+echo "    at 256 envs to 264s at 1024; cluster CPUs are 2012-era Xeons and"
+echo "    compile slower, so 2048 envs could cost 15-30 min before the first"
+echo "    step. That is a one-off per shape, cached in ~/.cache/jax, and it is"
+echo "    a real cost to weigh for short runs but irrelevant for a 15h one."
+echo "  * Any arm exiting 139 is the laptop segfault class reaching the cluster."
+echo "    Arm 3/4 are the most likely to OOM or destabilise -- 2048 envs has"
+echo "    never been run for the ant anywhere (the laptop got host-RAM"
+echo "    OOM-killed at 2048; this node has 128GB, so it should be fine)."
+echo
+echo "THEN: update cluster/ant_unconstrained_baseline.sbatch with the winning"
+echo "num_envs/num_minibatches (and integrator, if adopted) and reproject its"
+echo "--time from the new training/sps before submitting the real run."
 echo "=== done ==="
