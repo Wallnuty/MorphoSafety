@@ -56,14 +56,15 @@ python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 echo
 echo "=== ant training smoke test (ALL size defaults, the laptop-crashing config) ==="
-# Capped at 0.5 (~12GB of the 3090's 24GB) rather than letting JAX preallocate
-# its ~75% default (~18GB). Whether bigbatch hands out whole nodes or shares
-# them between jobs is unverified, so this errs toward being a good tenant --
-# grabbing 18 of 24GB would starve any co-scheduled job. This does NOT weaken
-# the test: runtime VRAM was never the binding constraint (point at 1024 envs
-# peaked at 979MiB, and this crash happens during compilation, not execution),
-# and 12GB is still 2x the laptop's entire card.
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.5
+# 0.75 (~18GB of the 3090's 24GB) -- JAX's own default, set explicitly so the
+# intent is documented rather than implicit. Deliberately not throttled for
+# co-tenancy: this allocation is for one user's own jobs.
+# There is a positive reason to keep this generous rather than merely tolerable:
+# XLA's autotuner allocates scratch buffers to benchmark candidate kernels at
+# COMPILE time, which is exactly where ant dies (see header), so a larger pool
+# gives it more room. Can be raised to ~0.9 if a bigger config ever needs it;
+# avoid 1.0, which leaves nothing for driver/context overhead.
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 # --no_checkpoint: this is a survival/throughput probe, not a policy worth keeping.
 time python -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant \
