@@ -66,30 +66,64 @@ def apply_integrator(spec: mj.MjSpec, integrator: str | None) -> None:
 
 # sample_layout(vase: [10, 5], hazard: [20, 2], goal : []): [-2, -2, 2, 2]-> (vase: [x y theta])
 def build_arena(
-    spec: mj.MjSpec, objects: dict[str, ObjectSpec], visualize: bool = False
+    spec: mj.MjSpec,
+    objects: dict[str, ObjectSpec],
+    visualize: bool = False,
+    floor_half_size: tuple[float, float] | None = None,
+    obstacle_scale: float = 1.0,
+    vase_mass: float | None = None,
 ):
-    """Build the arena (currently, just adds Lidar rings). Future: dynamically add obstacles, hazards, objects, goal here"""
+    """Build the arena (currently, just adds Lidar rings). Future: dynamically add obstacles, hazards, objects, goal here
+
+    `floor_half_size` overrides the square floor derived from `_EXTENTS`. It
+    exists for corridor-shaped tasks (see envs/run_forward.py), which need a
+    floor much longer in x than wide in y -- the default square 2.1 m half-
+    extent is barely wider than one episode of ant travel. Passing None keeps
+    the historical behaviour byte-for-byte.
+
+    `obstacle_scale` multiplies every obstacle dimension. The hazard/vase/goal
+    sizes below were chosen for safety-gym's ~0.1 m point robot and are
+    meaningless against a robot of a very different size -- the ant_gym robot
+    has a 3.6 m leg span, so unscaled 0.2 m hazards would sit under its feet as
+    rounding errors rather than obstacles. Robots declare their scale via
+    `arena_scale` in `_ROBOT_CONFIGS` (envs/go_to_goal.py) and it arrives here.
+    1.0 reproduces the original arena exactly.
+
+    `vase_mass` sets an explicit vase mass instead of letting MuJoCo derive one
+    from geom density. It matters because the robot XMLs set
+    `inertiafromgeom="true"`, so the `mass=` passed to add_body below is IGNORED
+    and a vase weighs density * volume -- which scales as obstacle_scale**3. At
+    obstacle_scale=4 that is 2.56 kg per vase against the 0.911 kg ant_gym
+    robot, i.e. an immovable wall, where the original arena had 0.04 kg vases
+    against a 42 kg ant. Passing None keeps the density-derived mass and so
+    reproduces the original behaviour exactly for point and ant.
+    """
     # Set floor size
     maybe_floor = spec.worldbody.geoms[0]
     assert maybe_floor.name == "floor"
-    size = max(_EXTENTS)
-    maybe_floor.size = jp.array([size + 0.1, size + 0.1, 0.1])
+    if floor_half_size is None:
+        size = max(_EXTENTS)
+        floor_half_size = (size + 0.1, size + 0.1)
+    maybe_floor.size = jp.array([floor_half_size[0], floor_half_size[1], 0.1])
 
     # Reposition robot
     for i in range(objects["vases"].num_objects):
-        volume = 0.1**3
+        vase_half = 0.1 * obstacle_scale
+        volume = vase_half**3
         density = 0.001
         vase = spec.worldbody.add_body(
             name=f"vase_{i}",
             mass=volume * density,
         )
 
+        vase_geom_kwargs = {} if vase_mass is None else {"mass": vase_mass}
         vase.add_geom(
             name=f"vase_{i}_geom",
             type=mj.mjtGeom.mjGEOM_BOX,
-            size=[0.1, 0.1, 0.1],
+            size=[vase_half, vase_half, vase_half],
             rgba=[0, 1, 1, 1],
             userdata=jp.ones(1),
+            **vase_geom_kwargs,
         )
 
         # Free joint bug in visualizer: https://github.com/google-deepmind/mujoco/issues/2508
@@ -100,7 +134,7 @@ def build_arena(
         hazard.add_geom(
             name=f"hazard_{i}_geom",
             type=mj.mjtGeom.mjGEOM_CYLINDER,
-            size=[0.2, 0.01, 0],
+            size=[0.2 * obstacle_scale, 0.01 * obstacle_scale, 0],
             rgba=[0.0, 0.0, 1.0, 0.25],
             userdata=jp.ones(1),
             contype=jp.zeros(()),
@@ -111,7 +145,7 @@ def build_arena(
     goal.add_geom(
         name="goal_geom",
         type=mj.mjtGeom.mjGEOM_CYLINDER,
-        size=[0.3, 0.15, 0],
+        size=[0.3 * obstacle_scale, 0.15 * obstacle_scale, 0],
         rgba=[0, 1, 0, 0.25],
         contype=jp.zeros(()),
         conaffinity=jp.zeros(()),

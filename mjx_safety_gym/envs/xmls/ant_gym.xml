@@ -1,0 +1,201 @@
+<!--
+Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<!--
+  ant.xml at 4x length scale with the ankle density hack removed. This is the
+  standard Gym/Brax/MuJoCo ant, reconstructed inside this repo's conventions.
+
+  WHY. safety-gymnasium's ant (envs/xmls/ant.xml) and the Gym/Brax ant are the
+  SAME design at different scale -- identical geom names, and every Gym
+  dimension is exactly 4x ours (torso 0.0625 -> 0.25, segments 0.05 -> 0.2,
+  ankle 0.1 -> 0.4, capsule radius 0.02 -> 0.08). The other difference is that
+  ours overrides `density="50000.0"` on the four ankle geoms against a model
+  default of 5.0, putting 42.24 of the ant's 42.26 kg into four small feet.
+  Against a fixed gear of 150 that leaves 3.5 N.m per kg -- the robot is
+  severely under-actuated, and it shows: it manages ~3 m of travel in a 50 s
+  episode under the best scripted gait we could find.
+
+  Applying BOTH changes reproduces the Gym ant's mass to three decimals
+  (0.911 kg), which is what confirms the reconstruction. Measured at this
+  repo's 0.08 s control period over a 50 s episode, sweeping gait period:
+
+      scale  ankle density   mass kg  torque/kg   random  best gait
+        1.0  50000 (ours)     42.255        3.5     1.31       3.03
+        1.0  5   (uniform)     0.014    10539.3     0.38       0.95
+        2.0  5   (uniform)     0.114     1317.4     1.12       6.62
+        3.0  5   (uniform)     0.384      390.3     2.31      12.29
+        4.0  5   (uniform)     0.911      164.7     4.44      40.93   <- this file
+
+  Note the second row: removing the density hack ALONE makes the ant worse, not
+  better. At scale 1 it becomes a 14 g robot driven by gear-150 motors, which
+  flails rather than walks. Scale and mass have to move together, which is why
+  this is a new file rather than a two-line edit to ant.xml.
+
+  WHAT IS DELIBERATELY KEPT FROM ant.xml, so that a run against this file
+  differs from a run against ant.xml in MORPHOLOGY ONLY:
+    * integrator RK4 and timestep 0.01 (Gym/Brax ships Euler; use the
+      --integrator flag to A/B that separately rather than confounding it here)
+    * condim 6 and the collision setup in which every limb geom collides. The
+      Gym ant sets contype=0 on everything but the feet, which would be faster,
+      but this repo's cost function detects vase contact via geoms_colliding()
+      on the limb geoms -- switching those off would silently zero the safety
+      signal.
+    * joint ranges (hip +-0.70 rad, ankle 0.52..1.74 rad). These are WIDER than
+      Gym's (+-30 deg, 30..70 deg), and measurably better here: 40.93 m of
+      scripted-gait travel against 21.30 m for the literal Gym XML.
+    * all geom and body names, so mjx_safety_gym/morphology.py's segment maps
+      keep working unchanged against this file.
+    * the sensor block, so observation width is identical (76 for the ant).
+
+  ARENA SCALE IS NOT OPTIONAL WITH THIS FILE. The leg span here is 3.6 m
+  against 0.9 m for ant.xml, while the default arena has 0.2 m-radius hazards
+  and a 1.0 m corridor half-width -- an ant wider than the corridor. Robots
+  declaring this XML must also declare an arena_scale (see _ROBOT_CONFIGS in
+  envs/go_to_goal.py), or every obstacle is a rounding error under its feet.
+
+  max_geom_pairs stays at 16: scaling is uniform, so the pair COUNTS are
+  unchanged (topology is identical) even though the geometry is larger. Re-run
+  scripts/verify_contact_capping.py against this file before trusting the cost
+  signal at large morphology scales.
+-->
+
+<mujoco model="ant_gym">
+  <size njmax="3000" nconmax="1000"/>
+  <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+  <option integrator="RK4" timestep="0.01"/>
+  <statistic meansize="0.92" extent="15.84"/>
+  <!-- !! max_geom_pairs MUST stay the FIRST <numeric> in this file. MJX's
+       _numeric() (collision_driver.py) indexes numeric_data by the numeric's
+       *id* instead of its *adr*, so if init_qpos comes first this reads
+       init_qpos's second element (0.0), the cap becomes 0, every collision
+       group empties and model construction dies with "Need at least one array
+       to concatenate". Upstream bug; the ordering is the workaround. -->
+  <custom>
+    <numeric data="16" name="max_geom_pairs"/>
+    <numeric data="0.0 0.0 2.2 1.0 0.0 0.0 0.0 0.0 1.0 0.0 -1.0 0.0 -1.0 0.0 1.0" name="init_qpos"/>
+  </custom>
+  <default>
+    <joint armature="1" damping="1" limited="true"/>
+    <geom condim="6" density="5.0"/>
+    <site size="0.128" type="sphere"/>
+  </default>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.527 0.582 0.906" rgb2="0.1 0.1 0.35"
+      width="800" height="800" markrgb="1 1 1" mark="random" random="0.001"/>
+    <texture name="texplane" builtin="checker" height="100" width="100"
+      rgb1="0.7 0.7 0.7" rgb2="0.8 0.8 0.8" type="2d"/>
+    <material name="MatPlane" reflectance="0.1" shininess="0.1" specular="0.1"
+      texrepeat="10 10" texture="texplane"/>
+  </asset>
+  <worldbody>
+    <light cutoff="100" diffuse="1 1 1" dir="0 0 -1" directional="true" exponent="1" pos="0 0 2.0" specular="0 0 0" castshadow="false"/>
+    <geom name="floor" size="20 20 0.1" type="plane" condim="6" conaffinity="3" material="MatPlane"/>
+    <body name="robot" pos="0 0 0.75">
+      <site name="robot" rgba="1 0 0 .1" pos="0 0 -0.08"/>
+      <camera name="vision" pos="0 0.2 0.2" euler="1.57 0 0" fovy="100"/>
+      <geom name="torso_geom" pos="0 0 0" size="0.25" type="sphere" rgba="0.8 0.6 0.4 1"/>
+      <joint armature="0" damping="0" limited="false" margin="0.01" name="root" pos="0 0 0" type="free"/>
+      <body name="front_left_leg" pos="0 0 0">
+        <geom fromto="0.0 0.0 0.0 0.2 0.2 0.0" name="aux_1_geom" size="0.08" type="capsule" rgba="0.0039 0.1529 0.3961 1"/>
+        <body name="aux_1" pos="0.2 0.2 0">
+          <joint axis="0 0 1" name="hip_1" pos="0.0 0.0 0.0" range="-0.70 0.70" type="hinge"/>
+          <geom fromto="0.0 0.0 0.0 0.2 0.2 0.0" name="left_leg_geom" size="0.08" type="capsule" rgba="0.0039 0.1529 0.3961 1"/>
+          <body pos="0.2 0.2 0" name="front_left_foot">
+            <joint axis="-1 1 0" name="ankle_1" pos="0.0 0.0 0.0" range="0.52 1.74" type="hinge"/>
+            <geom fromto="0.0 0.0 0.0 0.4 0.4 0.0" name="left_ankle_geom" size="0.08" type="capsule" rgba=".8 .5 .3 1"/>
+          </body>
+        </body>
+      </body>
+      <body name="front_right_leg" pos="0 0 0">
+        <geom fromto="0.0 0.0 0.0 -0.2 0.2 0.0" name="aux_2_geom" size="0.08" type="capsule" rgba="0.0039 0.1529 0.3961 1"/>
+        <body name="aux_2" pos="-0.2 0.2 0">
+          <joint axis="0 0 1" name="hip_2" pos="0.0 0.0 0.0" range="-0.70 0.70" type="hinge"/>
+          <geom fromto="0.0 0.0 0.0 -0.2 0.2 0.0" name="right_leg_geom" size="0.08" type="capsule" rgba="0.0039 0.1529 0.3961 1"/>
+          <body pos="-0.2 0.2 0" name="front_right_foot">
+            <joint axis="1 1 0" name="ankle_2" pos="0.0 0.0 0.0" range="-1.74 -0.52" type="hinge"/>
+            <geom fromto="0.0 0.0 0.0 -0.4 0.4 0.0" name="right_ankle_geom" size="0.08" type="capsule" rgba="0.8 0.6 0.4 1"/>
+          </body>
+        </body>
+      </body>
+      <body name="left_back_leg" pos="0 0 0">
+        <geom fromto="0.0 0.0 0.0 -0.2 -0.2 0.0" name="aux_3_geom" size="0.08" type="capsule" rgba="0.7412 0.0431 0.1843 1"/>
+        <body name="aux_3" pos="-0.2 -0.2 0">
+          <joint axis="0 0 1" name="hip_3" pos="0.0 0.0 0.0" range="-0.70 0.70" type="hinge"/>
+          <geom fromto="0.0 0.0 0.0 -0.2 -0.2 0.0" name="back_leg_geom" size="0.08" type="capsule" rgba="0.7412 0.0431 0.1843 1"/>
+          <body pos="-0.2 -0.2 0" name="left_back_foot">
+            <joint axis="-1 1 0" name="ankle_3" pos="0.0 0.0 0.0" range="-1.74 -0.52" type="hinge"/>
+            <geom fromto="0.0 0.0 0.0 -0.4 -0.4 0.0" name="third_ankle_geom" size="0.08" type="capsule" rgba="0.8 0.6 0.4 1"/>
+          </body>
+        </body>
+      </body>
+      <body name="right_back_leg" pos="0 0 0">
+        <geom fromto="0.0 0.0 0.0 0.2 -0.2 0.0" name="aux_4_geom" size="0.08" type="capsule" rgba="0.7412 0.0431 0.1843 1"/>
+        <body name="aux_4" pos="0.2 -0.2 0">
+          <joint axis="0 0 1" name="hip_4" pos="0.0 0.0 0.0" range="-0.70 0.70" type="hinge"/>
+          <geom fromto="0.0 0.0 0.0 0.2 -0.2 0.0" name="rightback_leg_geom" size="0.08" type="capsule" rgba="0.7412 0.0431 0.1843 1"/>
+          <body pos="0.2 -0.2 0" name="right_back_foot">
+            <joint axis="1 1 0" name="ankle_4" pos="0.0 0.0 0.0" range="0.52 1.74" type="hinge"/>
+            <geom fromto="0.0 0.0 0.0 0.4 -0.4 0.0" name="fourth_ankle_geom" size="0.08" type="capsule" rgba=".8 .5 .3 1"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <sensor>
+    <!-- Used for observation -->
+    <accelerometer site="robot" name="accelerometer"/>
+    <velocimeter site="robot" name="velocimeter"/>
+    <gyro site="robot" name="gyro"/>
+    <magnetometer site="robot" name="magnetometer"/>
+
+    <!-- Used for intrinsic constraints -->
+    <subtreecom body="robot" name="subtreecom"/>
+    <subtreelinvel body="robot" name="subtreelinvel"/>
+    <subtreeangmom body="robot" name="subtreeangmom"/>
+
+    <framepos objtype="site" objname="robot" name="robot_pos"/>
+
+    <jointpos joint="hip_1" name="hip_1"/>
+    <jointpos joint="ankle_1" name="ankle_1"/>
+    <jointpos joint="hip_2" name="hip_2"/>
+    <jointpos joint="ankle_2" name="ankle_2"/>
+    <jointpos joint="hip_3" name="hip_3"/>
+    <jointpos joint="ankle_3" name="ankle_3"/>
+    <jointpos joint="hip_4" name="hip_4"/>
+    <jointpos joint="ankle_4" name="ankle_4"/>
+
+    <frameangvel objtype="site" objname="robot" name="robot_qvel"/>
+
+    <jointvel joint="hip_1" name="hip_1_vel"/>
+    <jointvel joint="ankle_1" name="ankle_1_vel"/>
+    <jointvel joint="hip_2" name="hip_2_vel"/>
+    <jointvel joint="ankle_2" name="ankle_2_vel"/>
+    <jointvel joint="hip_3" name="hip_3_vel"/>
+    <jointvel joint="ankle_3" name="ankle_3_vel"/>
+    <jointvel joint="hip_4" name="hip_4_vel"/>
+    <jointvel joint="ankle_4" name="ankle_4_vel"/>
+  </sensor>
+  <actuator>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="hip_1" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="ankle_1" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="hip_2" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="ankle_2" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="hip_3" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="ankle_3" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="hip_4" gear="150"/>
+    <motor ctrllimited="true" ctrlrange="-1.0 1.0" joint="ankle_4" gear="150"/>
+  </actuator>
+</mujoco>

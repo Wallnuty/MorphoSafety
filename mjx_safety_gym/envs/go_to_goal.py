@@ -28,6 +28,7 @@ _XML_DIR = files("mjx_safety_gym.envs.xmls")
 _ROBOT_XMLS = {
     "point": "point.xml",
     "ant": "ant.xml",
+    "ant_gym": "ant_gym.xml",
 }
 
 # Per-robot morphology description. `collision_geoms` are the robot geoms checked
@@ -39,6 +40,16 @@ _ROBOT_CONFIGS = {
         "slide_joints": ["x", "y"],
         "free_joint": None,
         "spawn_height": None,
+        # Multiplies every arena dimension -- obstacle geom sizes, placement
+        # keepouts and drop heights. Exists because obstacle sizes were chosen
+        # for the ~0.1 m point robot and are meaningless for a robot of a
+        # different scale: ant_gym has a 3.6 m leg span, so unscaled 0.2 m
+        # hazards would sit under its feet as rounding errors. Keep at 1.0 for
+        # any robot whose size matches the original safety-gym arena.
+        "arena_scale": 1.0,
+        # Explicit vase mass, or None to let geom density decide (see
+        # world.build_arena). Only needed where arena_scale != 1.
+        "vase_mass": None,
         # Proprioceptive sensors appended to the observation (beyond BASE_SENSORS).
         "extra_sensors": [],
     },
@@ -54,6 +65,8 @@ _ROBOT_CONFIGS = {
         "free_joint": "root",
         # Torso height at which the ant spawns upright (matches the body pos in ant.xml).
         "spawn_height": 0.18,
+        "arena_scale": 1.0,
+        "vase_mass": None,
         # Joint angles + joint velocities so the policy can perceive its own legs.
         "extra_sensors": [
             "hip_1", "ankle_1", "hip_2", "ankle_2",
@@ -62,6 +75,19 @@ _ROBOT_CONFIGS = {
             "hip_3_vel", "ankle_3_vel", "hip_4_vel", "ankle_4_vel",
         ],
     },
+}
+
+# ant_gym is ant.xml at 4x length scale with the ankle density hack removed --
+# i.e. the standard Gym/Brax ant, which every geom/body/sensor/joint name is
+# shared with, so this entry is ant's with only the two scale-dependent numbers
+# changed. See envs/xmls/ant_gym.xml for the derivation and measurements.
+_ROBOT_CONFIGS["ant_gym"] = {
+    **_ROBOT_CONFIGS["ant"],
+    "spawn_height": 0.75,
+    "arena_scale": 4.0,
+    # ~5% of this robot's 0.911 kg: knockable, but not free to barge through.
+    # Without this a 4x-scaled vase weighs 2.56 kg and is effectively a wall.
+    "vase_mass": 0.05,
 }
 
 Observation = Union[jax.Array, Mapping[str, jax.Array]]
@@ -133,16 +159,20 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         self._robot = robot
         self._xml_path = _XML_DIR / _ROBOT_XMLS[robot]
 
+        # Keepouts scale with the arena, otherwise a large robot spawns
+        # overlapping the obstacles it is supposed to avoid.
+        self._arena_scale = float(_ROBOT_CONFIGS[robot]["arena_scale"])
+        a = self._arena_scale
         self.spec = {
-            "robot": ObjectSpec(0.4, 1),
-            "goal": ObjectSpec(0.305, 1),
-            "hazards": ObjectSpec(0.18, 10),
-            "vases": ObjectSpec(0.15, 10),
+            "robot": ObjectSpec(0.4 * a, 1),
+            "goal": ObjectSpec(0.305 * a, 1),
+            "hazards": ObjectSpec(0.18 * a, 10),
+            "vases": ObjectSpec(0.15 * a, 10),
         }
 
         mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
         apply_integrator(mjSpec, integrator)
-        build_arena(mjSpec, objects=self.spec, visualize=True)
+        self._build_arena(mjSpec)
         self._mj_model = mjSpec.compile()
 
         # print(mjSpec.to_xml())
@@ -193,6 +223,22 @@ class GoToGoal(playground_mjx_env.MjxEnv):
                 use_rasterizer=self._vision_config.use_rasterizer,
                 viz_gpu_hdls=None,
             )
+
+    def _build_arena(self, mjSpec: mj.MjSpec) -> None:
+        """Add obstacles/goal/lidar rings to the spec, before it is compiled.
+
+        A hook rather than an inline call so subclasses can reshape the arena
+        without duplicating __init__'s whole compile sequence -- see
+        envs/run_forward.py, which needs a long corridor instead of the default
+        square. Overriding this is the ONLY supported way to change arena
+        geometry: it runs before compile(), which is the last moment the
+        MjSpec is still mutable.
+        """
+        build_arena(
+            mjSpec, objects=self.spec, visualize=True,
+            obstacle_scale=self._arena_scale,
+            vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
+        )
 
     def _post_init(self) -> None:
         """Post initialization for the model."""
@@ -482,17 +528,19 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             adr = self._vase_joint_qposadr[i]
             rotation = jax.random.uniform(rng_, minval=0.0, maxval=2 * jp.pi)
             quat = _rot2quat(rotation)
-            qpos = qpos.at[adr : adr + 7].set(jp.hstack([xy, 0.1, quat]))
+            qpos = qpos.at[adr : adr + 7].set(
+                jp.hstack([xy, 0.1 * self._arena_scale, quat])
+            )
 
         # Set hazard positions
         for i, (_, xy) in enumerate(layout["hazards"]):
             mocap_pos = mocap_pos.at[self._hazard_mocap_id[i]].set(
-                jp.hstack([xy, 0.02])
+                jp.hstack([xy, 0.02 * self._arena_scale])
             )
 
         # Set goal position
         mocap_pos = mocap_pos.at[self._goal_mocap_id].set(
-            jp.hstack([layout["goal"][0][1], 0.3 / 2.0 + 1e-2])
+            jp.hstack([layout["goal"][0][1], (0.3 / 2.0 + 1e-2) * self._arena_scale])
         )
 
         data = data.replace(qpos=qpos, mocap_pos=mocap_pos)
