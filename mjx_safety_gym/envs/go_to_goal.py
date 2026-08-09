@@ -19,6 +19,7 @@ from mjx_safety_gym.world import (
     _EXTENTS,
     ObjectSpec,
     _sample_layout,
+    apply_integrator,
     build_arena,
     draw_until_valid,
 )
@@ -123,6 +124,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         vision: bool = False,
         vision_config=default_vision_config(),
         morphology_conditioning: bool = False,
+        integrator: str | None = None,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -139,6 +141,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         }
 
         mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
+        apply_integrator(mjSpec, integrator)
         build_arena(mjSpec, objects=self.spec, visualize=True)
         self._mj_model = mjSpec.compile()
 

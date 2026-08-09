@@ -294,6 +294,23 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num_minibatches", type=int, default=16)
     parser.add_argument("--unroll_length", type=int, default=10)
     parser.add_argument(
+        "--integrator",
+        choices=["rk4", "implicitfast", "euler"],
+        default=None,
+        help="Override the integrator the robot's XML declares. Default None "
+        "keeps the XML's own choice, so existing runs and checkpoints are "
+        "unaffected. This is the single largest throughput lever available: "
+        "ant.xml declares RK4 (inherited from safety-gymnasium), which does 4 "
+        "force evaluations per step against 1 for implicitfast/euler, and "
+        "physics is ~90%% of per-decision cost -- measured 3.5x cheaper "
+        "stepping on CPU. NOT free: at the shipped timestep of 0.01 a scripted "
+        "gait travels 1.010 m under RK4 vs 0.770 m under implicitfast (~25%% "
+        "less), though passive settling is near-identical and neither is "
+        "unstable. point.xml already uses euler by default, so overriding the "
+        "ant makes the two robots consistent. Measure both speed AND learning "
+        "before adopting -- see cluster/ant_throughput_sweep.sbatch.",
+    )
+    parser.add_argument(
         "--num_evals",
         type=int,
         default=10,
@@ -415,10 +432,14 @@ def train(args: argparse.Namespace):
         print(f"Checkpoints: {checkpoint_logdir}")
 
     env = GoToGoal(
-        robot=args.robot, morphology_conditioning=bool(args.num_morphologies)
+        robot=args.robot,
+        morphology_conditioning=bool(args.num_morphologies),
+        integrator=args.integrator,
     )
     eval_env = GoToGoal(
-        robot=args.robot, morphology_conditioning=bool(args.num_morphologies)
+        robot=args.robot,
+        morphology_conditioning=bool(args.num_morphologies),
+        integrator=args.integrator,
     )
 
     # Composition order matters and is NOT arbitrary: any obs-shape-changing
@@ -454,13 +475,21 @@ def train(args: argparse.Namespace):
         rng = jax.random.PRNGKey(args.seed)
         train_rng, eval_rng = jax.random.split(rng)
         train_batched, train_in_axes, train_genes = morphology_lib.randomization_fn(
-            env.mjx_model, train_rng, args.num_morphologies, args.num_envs
+            env.mjx_model,
+            train_rng,
+            args.num_morphologies,
+            args.num_envs,
+            integrator=args.integrator,
         )
         env = MorphologyDomainRandomizationWrapper(
             env, train_batched, train_in_axes, train_genes
         )
         eval_batched, eval_in_axes, eval_genes = morphology_lib.randomization_fn(
-            eval_env.mjx_model, eval_rng, args.num_morphologies, args.num_eval_envs
+            eval_env.mjx_model,
+            eval_rng,
+            args.num_morphologies,
+            args.num_eval_envs,
+            integrator=args.integrator,
         )
         eval_env = MorphologyDomainRandomizationWrapper(
             eval_env, eval_batched, eval_in_axes, eval_genes

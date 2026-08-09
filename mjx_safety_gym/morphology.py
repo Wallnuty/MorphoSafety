@@ -29,7 +29,7 @@ import mujoco as mj
 import numpy as np
 from mujoco import mjx
 
-from mjx_safety_gym.world import ObjectSpec, build_arena
+from mjx_safety_gym.world import ObjectSpec, apply_integrator, build_arena
 
 _ANT_XML = files("mjx_safety_gym.envs.xmls") / "ant.xml"
 
@@ -138,18 +138,24 @@ class MorphologySpec:
 def build_mj_model(
     spec: MorphologySpec,
     arena_spec: dict[str, ObjectSpec] | None = None,
+    integrator: str | None = None,
 ) -> mj.MjModel:
     """Compile a single ant with the given morphology, arena included.
 
     Mirrors GoToGoal.__init__'s own compile path (envs/go_to_goal.py) so a
     model built here has identical topology to (and is thus batchable with)
-    what the env normally produces.
+    what the env normally produces. `integrator` must therefore be threaded
+    through to match whatever the env was built with -- under morphology
+    randomization these models REPLACE the env's `_mjx_model`, so if only
+    GoToGoal honoured the override the randomized run would silently step
+    different physics from the nominal one.
     """
     if arena_spec is None:
         arena_spec = _DEFAULT_ARENA_SPEC
     scales = spec.scales
 
     s = mj.MjSpec.from_file(str(_ANT_XML))
+    apply_integrator(s, integrator)
     geoms = {g.name: g for g in s.geoms}
     bodies = {b.name: b for b in s.bodies}
 
@@ -216,7 +222,7 @@ def build_batch(
     specs: Sequence[MorphologySpec],
     arena_spec: dict[str, ObjectSpec] | None = None,
 ) -> tuple[mjx.Model, mjx.Model]:
-    mj_models = [build_mj_model(spec, arena_spec) for spec in specs]
+    mj_models = [build_mj_model(spec, arena_spec, integrator) for spec in specs]
     return batch_models(mj_models)
 
 
@@ -226,6 +232,7 @@ def randomization_fn(
     num_morphologies: int,
     num_envs: int,
     arena_spec: dict[str, ObjectSpec] | None = None,
+    integrator: str | None = None,
 ) -> tuple[mjx.Model, mjx.Model, jax.Array]:
     """Sample `num_morphologies` ant bodies and repeat each to fill `num_envs`.
 

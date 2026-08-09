@@ -16,6 +16,54 @@ class ObjectSpec(NamedTuple):
     num_objects: int
 
 
+INTEGRATORS = {
+    "rk4": mj.mjtIntegrator.mjINT_RK4,
+    "implicitfast": mj.mjtIntegrator.mjINT_IMPLICITFAST,
+    "euler": mj.mjtIntegrator.mjINT_EULER,
+}
+
+
+def apply_integrator(spec: mj.MjSpec, integrator: str | None) -> None:
+    """Override the integrator an XML declares, in place, before compile().
+
+    Exists because the integrator is the single largest throughput lever in
+    this workload and the two robots disagree on it by accident of ancestry:
+    `ant.xml` declares `integrator="RK4"` (inherited verbatim from
+    safety-gymnasium) while `point.xml` declares nothing and gets MuJoCo's
+    default Euler. RK4 does FOUR force evaluations per step against one, and
+    physics is ~90% of this workload's per-decision cost -- measured 3.5x
+    cheaper stepping on CPU for implicitfast/euler.
+
+    It is NOT a free win, which is why this is an explicit override rather than
+    a change to the XML: the dynamics genuinely differ. Measured on the nominal
+    ant at the shipped timestep of 0.01, a scripted gait travels 1.010 m under
+    RK4 and 0.770 m under implicitfast (~25% less), though passive settling is
+    near-identical (equilibrium torso height 0.159 vs 0.161 m, max trajectory
+    deviation 0.0225 m) and neither shows instability. implicitfast and euler
+    agree with each other to the digits printed. Standard practice would pair a
+    single-evaluation integrator with a smaller timestep; implicitfast at
+    dt=0.005 would still be ~2x cheaper than RK4 at dt=0.01 and more accurate
+    than either -- untested here.
+
+    Applied to the MjSpec rather than the compiled model so that every compile
+    path picks it up identically: GoToGoal.__init__ and morphology.py's
+    build_mj_model both compile from the same XML, and if only one honoured the
+    override, morphology-randomized runs would silently step different physics
+    from the base env.
+
+    Passing None leaves whatever the XML declares, so existing behaviour and
+    every checkpoint trained under it are untouched by default.
+    """
+    if integrator is None:
+        return
+    key = integrator.lower()
+    if key not in INTEGRATORS:
+        raise ValueError(
+            f"Unknown integrator {integrator!r}. Available: {sorted(INTEGRATORS)}"
+        )
+    spec.option.integrator = INTEGRATORS[key]
+
+
 # sample_layout(vase: [10, 5], hazard: [20, 2], goal : []): [-2, -2, 2, 2]-> (vase: [x y theta])
 def build_arena(
     spec: mj.MjSpec, objects: dict[str, ObjectSpec], visualize: bool = False
