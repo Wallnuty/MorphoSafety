@@ -65,13 +65,19 @@ echo "=== ant training smoke test (ALL size defaults, the laptop-crashing config
 # gives it more room. Can be raised to ~0.9 if a bigger config ever needs it;
 # avoid 1.0, which leaves nothing for driver/context overhead.
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
-# --no_checkpoint: this is a survival/throughput probe, not a policy worth keeping.
+# Checkpointing left ON deliberately, despite 500k steps being too short to
+# produce a policy worth keeping. The point is to exercise the checkpoint-WRITE
+# path on cluster storage (orbax -> /home-mscluster/<user>/MorphoSafety/
+# checkpoints/ant/) before any long run depends on it: permissions, filesystem
+# behaviour and quota are all untested there, and finding out it's broken ten
+# hours into a real run would be expensive. Cost is ~6MB per eval x 3 evals
+# against a 50GB home quota. `checkpoints/` is gitignored, so nothing leaks
+# into version control.
 time python -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant \
   --penalizer none \
   --num_timesteps 500_000 \
-  --num_evals 3 \
-  --no_checkpoint
+  --num_evals 3
 status=$?
 echo
 echo "=== exit status: $status ==="
@@ -81,6 +87,10 @@ if [ "$status" -eq 139 ]; then
 elif [ "$status" -eq 0 ]; then
   echo "PASS -- ant survives full default size here. No eval compromise needed;"
   echo "use the training/sps above to schedule the real multi-hour runs."
+  echo
+  echo "--- checkpoints written (confirms the orbax write path works here) ---"
+  ls -la checkpoints/ant/ 2>&1 | tail -6
+  du -sh checkpoints/ant/ 2>&1
 else
   echo "Failed with an unexpected status -- read the traceback above; this is"
   echo "probably a setup/config problem rather than the known crash."
