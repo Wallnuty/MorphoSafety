@@ -43,6 +43,79 @@ from mjx_safety_gym.envs.go_to_goal import GoToGoal
 CHECKPOINT_ROOT = Path(__file__).resolve().parents[2] / "checkpoints"
 
 
+# Per-robot defaults for the three settings whose correct value depends on how
+# fast the robot physically moves. Everything else is shared.
+#
+# WHY THE ANT NEEDS ITS OWN VALUES. The point's numbers came from ss2r's
+# `go_to_goal_simple_ppo.yaml`, which was tuned for the point and only ever
+# validated on it. Applying them unchanged to the ant produced a policy that
+# learned to stand perfectly still (measured: 0.011 m of travel per episode vs
+# 0.313 m for uniform random actions). That is a rational outcome, not a bug:
+# reward is a signed distance delta, so undirected motion has strictly negative
+# expected return (distance-to-a-point is convex, so any zero-mean displacement
+# increases expected distance by Jensen), while freezing scores exactly 0.
+# Freezing is therefore the best policy reachable without a working gait, and
+# PPO correctly converges to it.
+#
+# The escape is to make a goal reachable often enough that the +1 bonus ever
+# fires. Measured on the nominal ant (CPU MuJoCo, uniform random actions, mean
+# net torso displacement over 24 seeds):
+#
+#     10 s episode, 0.04 s control period   0.316 m
+#     10 s episode, 0.1 s  control period   0.444 m
+#     100 s episode, 0.1 s control period   1.370 m
+#
+# A goal spawns ~0.8 m away with a 0.3 m capture radius, so ~0.5 m of travel is
+# needed. At 10 s the ant essentially never touches one by accident and never
+# discovers goals exist; the extra time and the coarser control period are what
+# make accidental success possible.
+#
+# These values are deliberately a middle path between our old settings and
+# safety-gymnasium's own (`frameskip_binom_n=10`, 1000 control steps => 100 s
+# per episode for the ant, vs 20 s for its point -- it gives the ant 5x the
+# point's wall-clock budget by using a 5x larger physics timestep). Matching
+# their 100 s outright would cost 10x the physics per episode. 2500/10 instead
+# buys 25 s of simulated time while holding decisions per episode at 250,
+# exactly as before -- so PPO's network cost and the eval unroll length
+# (episode_length // action_repeat) are both unchanged, and only physics
+# stepping goes up 2.5x.
+#
+# discounting 0.97: at 0.1 s per decision that is a ~3.3 s effective horizon
+# (1/(1-gamma) decisions), against a measured best scripted gait period of
+# 0.3 s. The old 0.9 at 0.04 s gave 0.4 s -- barely one gait cycle, too short
+# for a value function to credit the setup moves a gait is made of.
+#
+# CAVEAT, deliberately not auto-corrected here: `num_timesteps` counts physics
+# steps *including* action_repeat (see env_step_per_training_step in
+# ppo/train.py), so a fixed budget now buys 2.5x FEWER gradient steps. Scale
+# --num_timesteps up accordingly when comparing against older ant runs.
+#
+# NOTE: --safety_discounting is left at 0.9 for both robots on purpose. The
+# same slow-timescale argument applies to the cost critic, but changing it also
+# shifts the constraint's semantics while the safety-budget calibration is
+# still an open question -- a research call, not a bug fix.
+_ROBOT_DEFAULTS = {
+    "point": {"action_repeat": 4, "episode_length": 1000, "discounting": 0.9},
+    "ant": {"action_repeat": 10, "episode_length": 2500, "discounting": 0.97},
+}
+
+
+def apply_robot_defaults(args: argparse.Namespace) -> None:
+    """Fill in per-robot defaults for flags left unset on the command line.
+
+    These three flags parse with `default=None` precisely so an explicit CLI
+    value is distinguishable from an unset one; anything the user passes is
+    left untouched.
+    """
+    resolved = []
+    for name, value in _ROBOT_DEFAULTS[args.robot].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+            resolved.append(f"{name}={value}")
+    if resolved:
+        print(f"[{args.robot}] robot defaults applied: {', '.join(resolved)}")
+
+
 def default_checkpoint_dir(robot: str) -> Path:
     """Where runs for `robot` write checkpoints unless told otherwise."""
     return CHECKPOINT_ROOT / robot
@@ -165,7 +238,15 @@ def build_argparser() -> argparse.ArgumentParser:
         "exhaustion actually ends the episode (soft-terminates otherwise). "
         "ss2r's default is 1.0 (always terminate once triggered).",
     )
-    parser.add_argument("--episode_length", type=int, default=1000)
+    parser.add_argument(
+        "--episode_length",
+        type=int,
+        default=None,
+        help="Physics steps per episode (NOT decisions -- CostEpisodeWrapper "
+        "advances `steps` by action_repeat, so decisions per episode is "
+        "episode_length // action_repeat). Defaults per robot: point 1000 "
+        "(10 s of simulated time), ant 2500 (25 s) -- see _ROBOT_DEFAULTS.",
+    )
     parser.add_argument(
         "--num_morphologies",
         type=int,
@@ -180,11 +261,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--action_repeat",
         type=int,
-        default=4,
-        help="Physics steps per policy decision. The reference config uses 4, "
-        "which quarters the number of decisions per episode at unchanged "
-        "physics fidelity -- a large throughput win, and it lengthens the "
-        "effective horizon seen under discounting=0.9.",
+        default=None,
+        help="Physics steps per policy decision. Fewer decisions per episode "
+        "at unchanged physics fidelity -- a throughput win, and it lengthens "
+        "the effective horizon seen under --discounting. Defaults per robot: "
+        "point 4 (ss2r's reference config), ant 10 (matching "
+        "safety-gymnasium's own frameskip_binom_n for the ant; measured to "
+        "raise random-policy displacement ~40%% at fixed simulated time). "
+        "Note --num_timesteps counts physics steps INCLUDING action_repeat, "
+        "so raising this shrinks the gradient-step count at a fixed budget.",
     )
     parser.add_argument("--num_timesteps", type=int, default=5_000_000)
     parser.add_argument(
@@ -229,7 +314,15 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--entropy_cost", type=float, default=1e-4)
-    parser.add_argument("--discounting", type=float, default=0.9)
+    parser.add_argument(
+        "--discounting",
+        type=float,
+        default=None,
+        help="Reward discount factor. Defaults per robot: point 0.9 (ss2r's "
+        "reference config), ant 0.97 -- a ~3.3 s effective horizon at the "
+        "ant's 0.1 s control period, against a measured best gait period of "
+        "0.3 s. See _ROBOT_DEFAULTS.",
+    )
     parser.add_argument("--safety_discounting", type=float, default=0.9)
     parser.add_argument("--clipping_epsilon", type=float, default=0.3)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -438,6 +531,7 @@ def train(args: argparse.Namespace):
 
 if __name__ == "__main__":
     args = build_argparser().parse_args()
+    apply_robot_defaults(args)
     validate(args)
     print(f"JAX compilation cache: {jax_cache.configure()}")
     train(args)
