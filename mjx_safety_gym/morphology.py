@@ -31,14 +31,48 @@ from mujoco import mjx
 
 from mjx_safety_gym.world import ObjectSpec, apply_integrator, build_arena
 
-_ANT_XML = files("mjx_safety_gym.envs.xmls") / "ant.xml"
+_XML_DIR = files("mjx_safety_gym.envs.xmls")
+_ANT_XML = _XML_DIR / "ant.xml"
 
-_DEFAULT_ARENA_SPEC: dict[str, ObjectSpec] = {
-    "robot": ObjectSpec(0.4, 1),
-    "goal": ObjectSpec(0.305, 1),
-    "hazards": ObjectSpec(0.18, 10),
-    "vases": ObjectSpec(0.15, 10),
+# Per-robot facts this module needs, deliberately DUPLICATED from
+# _ROBOT_CONFIGS in envs/go_to_goal.py rather than imported: go_to_goal imports
+# NUM_GENES from here, so importing it back would be a cycle. Keep the two in
+# step -- if a robot's arena_scale or vase_mass changes there, change it here.
+#
+# mass_band is this module's own, and is NOT in _ROBOT_CONFIGS: it bounds which
+# sampled morphologies are worth evaluating at all. The ant band (15-90 kg
+# around a 42.255 kg nominal) is 0.36x-2.13x nominal; ant_gym's is the same
+# ratio band around its 0.911 kg nominal. Getting this wrong is silent and
+# total -- an ant_gym run against the ant band would reject EVERY sampled
+# morphology, since none of them come close to 15 kg.
+_MORPH_ROBOTS: dict[str, dict] = {
+    "ant": {
+        "xml": "ant.xml",
+        "arena_scale": 1.0,
+        "vase_mass": None,
+        "mass_band": (15.0, 90.0),
+    },
+    "ant_gym": {
+        "xml": "ant_gym.xml",
+        "arena_scale": 4.0,
+        "vase_mass": 0.05,
+        "mass_band": (0.3, 2.0),
+    },
 }
+
+
+def _arena_spec_for(robot: str) -> dict[str, ObjectSpec]:
+    """Placement keepouts, scaled to the robot -- mirrors GoToGoal.__init__."""
+    a = _MORPH_ROBOTS[robot]["arena_scale"]
+    return {
+        "robot": ObjectSpec(0.4 * a, 1),
+        "goal": ObjectSpec(0.305 * a, 1),
+        "hazards": ObjectSpec(0.18 * a, 10),
+        "vases": ObjectSpec(0.15 * a, 10),
+    }
+
+
+_DEFAULT_ARENA_SPEC: dict[str, ObjectSpec] = _arena_spec_for("ant")
 
 # Each of the ant's 3 leg segments (aux -> leg -> ankle) is 4-fold symmetric
 # across the 4 legs, so one length + one radius gene per segment covers the
@@ -78,11 +112,11 @@ NUM_GENES = len(GENE_NAMES)
 SCALE_LO = 0.6
 SCALE_HI = 1.4
 
-# Nominal ant is ~42.3 kg, of which 42.2 kg sits in the four feet (see the
-# project plan's note on ankle geom density). Reject specs outside a band
-# around that: too light barely touches the floor under gravity, too heavy is
-# dead weight against a fixed actuator_gear=150 that cannot move it -- either
-# way, a wasted fitness evaluation.
+# Reject specs outside a band around the robot's nominal mass: too light barely
+# touches the floor under gravity, too heavy is dead weight against a fixed
+# actuator_gear=150 that cannot move it -- either way, a wasted fitness
+# evaluation. Per-robot bands live in _MORPH_ROBOTS; this is the "ant" one,
+# kept as a module constant for backwards compatibility with existing callers.
 MASS_BAND: tuple[float, float] = (15.0, 90.0)
 
 _BATCHED_FIELDS: tuple[str, ...] = (
@@ -139,6 +173,7 @@ def build_mj_model(
     spec: MorphologySpec,
     arena_spec: dict[str, ObjectSpec] | None = None,
     integrator: str | None = None,
+    robot: str = "ant",
 ) -> mj.MjModel:
     """Compile a single ant with the given morphology, arena included.
 
@@ -150,11 +185,12 @@ def build_mj_model(
     GoToGoal honoured the override the randomized run would silently step
     different physics from the nominal one.
     """
+    cfg = _MORPH_ROBOTS[robot]
     if arena_spec is None:
-        arena_spec = _DEFAULT_ARENA_SPEC
+        arena_spec = _arena_spec_for(robot)
     scales = spec.scales
 
-    s = mj.MjSpec.from_file(str(_ANT_XML))
+    s = mj.MjSpec.from_file(str(_XML_DIR / cfg["xml"]))
     apply_integrator(s, integrator)
     geoms = {g.name: g for g in s.geoms}
     bodies = {b.name: b for b in s.bodies}
@@ -174,15 +210,39 @@ def build_mj_model(
     torso = geoms["torso_geom"]
     torso.size = np.array([torso.size[0] * scales["torso_rad"], 0.0, 0.0])
 
-    build_arena(s, objects=arena_spec, visualize=True)
+    build_arena(
+        s,
+        objects=arena_spec,
+        visualize=True,
+        obstacle_scale=cfg["arena_scale"],
+        vase_mass=cfg["vase_mass"],
+    )
     return s.compile()
 
 
 def total_mass(mj_model: mj.MjModel) -> float:
-    return float(mj_model.body_mass.sum())
+    """Mass of the ROBOT, not of the whole compiled model.
+
+    `body_mass.sum()` would also count the arena -- ten vases, ten hazards and
+    the goal cylinder are all worldbody children with real geom-derived mass.
+    That was invisible while the ant weighed 42 kg against a 0.95 kg arena (2%),
+    but it is fatal at other scales: ant_gym's robot is 0.911 kg against a
+    ~35.7 kg scaled arena, so the whole-model sum is 97% obstacles and the mass
+    band below would be gating on hazard geometry rather than on the morphology
+    being evaluated. Reading the robot body's subtree mass counts the torso and
+    all four legs and nothing else.
+    """
+    return float(mj_model.body_subtreemass[mj_model.body("robot").id])
 
 
-def mass_in_band(mj_model: mj.MjModel, band: tuple[float, float] = MASS_BAND) -> bool:
+def mass_in_band(
+    mj_model: mj.MjModel,
+    band: tuple[float, float] | None = None,
+    robot: str = "ant",
+) -> bool:
+    """Is this morphology worth evaluating? Band is per-robot; see _MORPH_ROBOTS."""
+    if band is None:
+        band = _MORPH_ROBOTS[robot]["mass_band"]
     m = total_mass(mj_model)
     return band[0] <= m <= band[1]
 
@@ -222,7 +282,9 @@ def build_batch(
     specs: Sequence[MorphologySpec],
     arena_spec: dict[str, ObjectSpec] | None = None,
 ) -> tuple[mjx.Model, mjx.Model]:
-    mj_models = [build_mj_model(spec, arena_spec, integrator) for spec in specs]
+    mj_models = [
+        build_mj_model(spec, arena_spec, integrator, robot) for spec in specs
+    ]
     return batch_models(mj_models)
 
 
@@ -233,6 +295,7 @@ def randomization_fn(
     num_envs: int,
     arena_spec: dict[str, ObjectSpec] | None = None,
     integrator: str | None = None,
+    robot: str = "ant",
 ) -> tuple[mjx.Model, mjx.Model, jax.Array]:
     """Sample `num_morphologies` ant bodies and repeat each to fill `num_envs`.
 
