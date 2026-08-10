@@ -53,7 +53,7 @@ from mjx_safety_gym.morphology import (
 _DEFAULT_SEEDS = tuple(range(8))
 
 
-def load_policy_fn(checkpoint: str):
+def load_policy_fn(checkpoint: str, robot: str = "ant"):
     """Load a morphology-conditioned policy, matching main.py's convention.
 
     Rebuilds the network from known shapes (GoToGoal's own
@@ -72,7 +72,7 @@ def load_policy_fn(checkpoint: str):
     normalizer = running_statistics.RunningStatisticsState(**loaded[0])
     policy_params, value_params = loaded[1]["policy"], loaded[1]["value"]
 
-    base_env = GoToGoal(robot="ant", morphology_conditioning=True)
+    base_env = GoToGoal(robot=robot, morphology_conditioning=True)
     network = ppo_networks.make_ppo_networks(
         base_env.observation_size,
         base_env.action_size,
@@ -85,7 +85,8 @@ def load_policy_fn(checkpoint: str):
 
 
 def make_rollout_fn(
-    env: GoToGoal, policy_fn, episode_length: int, num_seeds: int, seeds=None
+    env: GoToGoal, policy_fn, episode_length: int, num_seeds: int, seeds=None,
+    robot: str = "ant",
 ):
     """Batched (K morphologies x S fixed seeds) rollout, K*S lanes total.
 
@@ -141,7 +142,7 @@ def make_rollout_fn(
     def rollout(specs: list[MorphologySpec]):
         K = len(specs)
         S = num_seeds
-        mj_models = [build_mj_model(s) for s in specs]
+        mj_models = [build_mj_model(s, robot=robot) for s in specs]
         masses = np.array([total_mass(m) for m in mj_models])
         batched, in_axes = batch_models(mj_models)
         batched = batched.tree_replace(
@@ -170,16 +171,22 @@ class MorphologyProblem(Problem):
     instead of hitting a hard wall.
     """
 
-    def __init__(self, rollout_fn, log_path: Path):
+    def __init__(self, rollout_fn, log_path: Path, robot: str = "ant"):
         super().__init__(n_var=NUM_GENES, n_obj=2, xl=0.0, xu=1.0)
         self.rollout_fn = rollout_fn
         self.log_path = log_path
+        self.robot = robot
         self.generation = 0
 
     def _evaluate(self, X, out, *args, **kwargs):
         specs = [MorphologySpec(genes=row) for row in X]
         returns, costs, goals, masses = self.rollout_fn(specs)
-        infeasible = ~np.array([mass_in_band(build_mj_model(s)) for s in specs])
+        infeasible = ~np.array(
+            [
+                mass_in_band(build_mj_model(s, robot=self.robot), robot=self.robot)
+                for s in specs
+            ]
+        )
         penalty = np.where(infeasible, 1e3, 0.0)
         out["F"] = np.column_stack([-returns + penalty, costs + penalty])
 
@@ -207,6 +214,16 @@ class MorphologyProblem(Problem):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--robot",
+        choices=["ant", "ant_gym"],
+        default="ant",
+        help="Which ant to evolve. MUST match the robot the checkpoint was "
+        "trained on: both have observation width 76, so a mismatch loads "
+        "cleanly and silently evaluates the wrong body. ant_gym is 4x the "
+        "length scale with a ~46x lighter mass and needs its own arena scale "
+        "and mass band -- see _MORPH_ROBOTS in mjx_safety_gym/morphology.py.",
+    )
     parser.add_argument("--checkpoint", default="checkpoints/ant")
     parser.add_argument("--population", type=int, default=32)
     parser.add_argument("--generations", type=int, default=20)
@@ -216,9 +233,11 @@ def main():
     parser.add_argument("--log", default="scratchpad/evolve_log.jsonl")
     args = parser.parse_args()
 
-    policy_fn, env = load_policy_fn(args.checkpoint)
-    rollout_fn = make_rollout_fn(env, policy_fn, args.episode_length, args.num_seeds)
-    problem = MorphologyProblem(rollout_fn, Path(args.log))
+    policy_fn, env = load_policy_fn(args.checkpoint, robot=args.robot)
+    rollout_fn = make_rollout_fn(
+        env, policy_fn, args.episode_length, args.num_seeds, robot=args.robot
+    )
+    problem = MorphologyProblem(rollout_fn, Path(args.log), robot=args.robot)
 
     algorithm = NSGA2(
         pop_size=args.population,
