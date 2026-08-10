@@ -33,7 +33,7 @@ from mjx_safety_gym.algorithms.wrappers import (
     MorphologyDomainRandomizationWrapper,
     Saute,
 )
-from mjx_safety_gym.envs.go_to_goal import GoToGoal
+from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
 from mjx_safety_gym.envs.run_forward import RunForward
 
 
@@ -86,6 +86,11 @@ CHECKPOINT_ROOT = Path(__file__).resolve().parents[2] / "checkpoints"
 _ROBOT_DEFAULTS = {
     "point": {"action_repeat": 4, "episode_length": 1000, "discounting": 0.9},
     "ant": {"action_repeat": 4, "episode_length": 2500, "discounting": 0.97},
+    # ant_gym is 4x the ant's length scale but its measured best gait period is
+    # similar (0.5 s vs 0.4 s), so the same control period and horizon apply.
+    # It travels far more per second, which episode_length does not need to
+    # change for -- 50 s is ~20-40 m for it, matching the 48 m default corridor.
+    "ant_gym": {"action_repeat": 4, "episode_length": 2500, "discounting": 0.97},
 }
 
 
@@ -156,7 +161,9 @@ def wrap_for_brax_training(
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--robot", choices=["point", "ant"], default="point")
+    parser.add_argument(
+        "--robot", choices=sorted(_ROBOT_XMLS), default="point"
+    )
     parser.add_argument(
         "--penalizer",
         choices=["crpo", "ppo_lagrangian", "saute", "none"],
@@ -447,10 +454,11 @@ def validate(args: argparse.Namespace) -> None:
             f"episodes short."
         )
     if args.num_morphologies:
-        if args.robot != "ant":
+        if args.robot not in morphology_lib._MORPH_ROBOTS:
             raise SystemExit(
-                "--num_morphologies is only wired up for --robot ant "
-                "(point has no morphology parameters)."
+                f"--num_morphologies is not wired up for --robot {args.robot} "
+                f"(point has no morphology parameters). Supported: "
+                f"{sorted(morphology_lib._MORPH_ROBOTS)}."
             )
         if args.num_envs % args.num_morphologies != 0:
             raise SystemExit(
