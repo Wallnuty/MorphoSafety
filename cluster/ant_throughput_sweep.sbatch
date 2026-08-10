@@ -1,4 +1,25 @@
 #!/bin/bash
+# !! SUPERSEDED 2026-08-10 -- DO NOT SUBMIT WITHOUT READING THIS !!
+# This job targets `--robot ant` on the GoToGoal task, which was measured this
+# night to be UNLEARNABLE for the ant: over 16 seeds, a scripted gait that
+# walks several metres earns +0.0781 +- 0.6715 return, i.e. statistically zero,
+# because goals sit in a uniformly random direction and locomotion alone is
+# worth nothing. The ant also never travels far enough to touch an obstacle --
+# measured hazard cost was 0.0 in every mode -- so any cost number this job
+# produces describes a near-stationary robot and is the wrong number to
+# calibrate --safety_budget from.
+#
+# The replacements are `--task run` (envs/run_forward.py, reward linear in
+# +x displacement) and `--robot ant_gym` (envs/xmls/ant_gym.xml, the
+# Gym-proportioned ant: ~20x the travel per episode, and the first config to
+# register non-zero hazard cost at all).
+#
+# Everything below is kept because the sizing arithmetic, the python -u
+# rationale and the checkpoint-path validation are all still correct -- only
+# the task/robot choice is stale. Re-point --robot/--task before submitting,
+# and note that action_repeat is back to 4, so the step accounting in any
+# header below that assumes 10 is wrong by 2.5x.
+#
 # Throughput + GPU-utilization sweep. Run this BEFORE
 # cluster/ant_unconstrained_baseline.sbatch, which is currently sized at ~15h
 # from settings that were never chosen on evidence.
