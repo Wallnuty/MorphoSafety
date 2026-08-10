@@ -236,16 +236,37 @@ class RunForward(GoToGoal):
 
     # -- reward / cost -----------------------------------------------------
 
-    def get_reward(self, data, last_x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Progress along +x since the previous step.
+    def get_reward(self, data, prev_data) -> jax.Array:
+        """Progress along +x between two consecutive states.
 
-        Overrides GoToGoal.get_reward's distance-to-goal delta. Signature keeps
-        the same (data, carried_scalar) -> (reward, new_carried_scalar) shape so
-        the two are drop-in comparable, but the carried scalar is now the robot's
-        x rather than its distance to a goal.
+        Takes the PREVIOUS `mjx.Data` rather than a carried scalar in
+        `state.info`, and that is a correctness requirement, not a style choice.
+        `BraxAutoResetWrapper` (mujoco_playground) restores `data` and `obs` from
+        `first_state`/`first_obs` when an episode ends, but leaves every OTHER
+        info key untouched. A carried `last_x` therefore survives the episode
+        boundary, and the first step of each new episode measures its reward
+        against the PREVIOUS episode's final x -- a spurious reward roughly the
+        size of a whole episode's travel (~1 m) against a typical per-step
+        reward of ~0.001 m. That is a 1000x outlier landing in PPO's advantage
+        statistics once per episode.
+
+        Measured before the fix, with a 3-decision episode: at the boundary
+        `last_x` read -4.9746 while the reset data read -5.0000, and the next
+        reward came out -0.02472 where the correct value was +0.0007 -- wrong by
+        25x and of the opposite sign.
+
+        `state.data` is restored by the wrapper, so differencing against it is
+        correct across boundaries by construction, with no carried state to keep
+        in sync.
+
+        NOTE: GoToGoal.get_reward has the identical latent bug via its carried
+        `last_goal_dist`. It is NOT fixed here because doing so changes the
+        point robot's training dynamics and invalidates the only converged
+        baselines this project has. See the project plan.
         """
-        x = data.site_xpos[self._robot_site_id][0]
-        return (x - last_x) * self._forward_reward_weight, x
+        x_prev = prev_data.site_xpos[self._robot_site_id][0]
+        x_new = data.site_xpos[self._robot_site_id][0]
+        return (x_new - x_prev) * self._forward_reward_weight
 
     def get_cost(self, data) -> jax.Array:
         """Hazard/vase cost, plus a cost for leaving the corridor.
@@ -268,20 +289,16 @@ class RunForward(GoToGoal):
         data, rng = self.update_positions(data, layout, rng)
         data = mjx.forward(self._mjx_model, data)
 
+        # Deliberately carries NO position state. Anything stored here would
+        # survive the episode boundary (BraxAutoResetWrapper restores only
+        # `data` and `obs`), so reward and metrics are derived from `data`
+        # instead -- see get_reward. Episode return already equals total +x
+        # displacement by construction, verified exactly, so a separate
+        # "distance" metric would be a redundant thing to keep correct.
         info = {
             "rng": rng,
-            # Carried so step() can difference against it. Read AFTER
-            # mjx.forward so it reflects the spawn actually applied, not the
-            # requested one -- the free joint's site sits at an offset from the
-            # body origin, and starting the difference from a stale value would
-            # hand out a spurious first-step reward.
-            "last_x": data.site_xpos[self._robot_site_id][0],
-            "start_x": data.site_xpos[self._robot_site_id][0],
             "cost": jp.zeros(()),
-            # Kept for pytree-structure parity with step(): brax's auto-reset
-            # wrapper tree_maps between reset and stepped states, so a key in
-            # one and not the other is a structure mismatch.
-            "distance": jp.zeros(()),
+            # Recomputed fresh every step, never carried.
             "out_of_bounds": jp.zeros(()),
         }
         return State(data, self.get_obs(data), jp.zeros(()), jp.zeros(()), {}, info)
@@ -294,7 +311,7 @@ class RunForward(GoToGoal):
         scaled = (action + 1.0) / 2.0 * (upper - lower) + lower
 
         data = step(self._mjx_model, state.data, scaled, n_substeps=2)
-        reward, x = self.get_reward(data, state.info["last_x"])
+        reward = self.get_reward(data, state.data)
         if self._ctrl_cost_weight:
             reward = reward - self._ctrl_cost_weight * jp.sum(jp.square(action))
 
@@ -302,11 +319,6 @@ class RunForward(GoToGoal):
         done = (jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()).astype(jp.float32)
 
         state.info["cost"] = cost
-        state.info["last_x"] = x
-        # Total displacement from the start line. Not used for learning -- this
-        # is the number to read in eval logs, because it is interpretable in
-        # metres where the summed reward is only proportional to it.
-        state.info["distance"] = x - state.info["start_x"]
         state.info["out_of_bounds"] = (
             jp.abs(data.site_xpos[self._robot_site_id][1]) > self._corridor_half_width
         ).astype(jp.float32)

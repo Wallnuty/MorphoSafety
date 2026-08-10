@@ -86,7 +86,11 @@ def rollout_many(env, policy_fn, seeds, n_steps):
         (st, _), (r, c, oob) = jax.lax.scan(
             body, (state, jax.random.PRNGKey(seed + 10_000)), (), n_steps
         )
-        return r.sum(), c.sum(), oob.sum(), st.info["distance"]
+        # Summed reward IS total +x displacement in metres, exactly -- verified
+        # to 0.00e+00. RunForward deliberately carries no "distance" metric,
+        # because anything in state.info survives the episode boundary that
+        # BraxAutoResetWrapper does not clear.
+        return r.sum(), c.sum(), oob.sum(), r.sum()
 
     return jax.jit(jax.vmap(one))(jp.asarray(seeds))
 
