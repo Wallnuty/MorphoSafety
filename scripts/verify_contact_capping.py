@@ -43,6 +43,8 @@ Usage:
     python -m scripts.verify_contact_capping
 """
 
+import argparse
+
 import numpy as np
 import jax.numpy as jp
 import mujoco as mj
@@ -81,17 +83,23 @@ LEG_PAIRS = [
     ("torso_geom", "aux_1_geom"), ("torso_geom", "aux_3_geom"),
 ]
 
-# ant.xml's own standing pose (its "init_qpos" custom numeric): root xyz +
-# quat, then 8 hip/ankle joint angles.
-INIT_QPOS = np.array(
-    [0.0, 0.0, 0.55, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0]
-)
+# The robot XML's own standing pose (its "init_qpos" custom numeric): root xyz
+# + quat, then 8 hip/ankle joint angles. Read from the model rather than
+# hardcoded, because ant_gym's spawn height is 4x ant's and a pose baked for
+# one drops the other through the floor or leaves it hanging in the air.
+def _init_qpos(mj_model: mj.MjModel) -> np.ndarray:
+    for i in range(mj_model.nnumeric):
+        if mj.mj_id2name(mj_model, mj.mjtObj.mjOBJ_NUMERIC, i) == "init_qpos":
+            start = mj_model.numeric_adr[i]
+            n = mj_model.numeric_size[i]
+            return np.array(mj_model.numeric_data[start : start + n])
+    raise RuntimeError("no init_qpos numeric in this model")
 
 
-def _build(spec: morphology.MorphologySpec, cap: int) -> mj.MjModel:
+def _build(spec: morphology.MorphologySpec, cap: int, robot: str = "ant") -> mj.MjModel:
     """Mirrors morphology.build_mj_model, with the cap overridable for this
-    test (build_mj_model itself always uses ant.xml's baked-in value)."""
-    s = mj.MjSpec.from_file(str(morphology._ANT_XML))
+    test (build_mj_model itself always uses the XML's baked-in value)."""
+    s = mj.MjSpec.from_file(str(morphology._XML_DIR / morphology._MORPH_ROBOTS[robot]["xml"]))
     geoms = {g.name: g for g in s.geoms}
     bodies = {b.name: b for b in s.bodies}
     scales = spec.scales
@@ -134,9 +142,15 @@ def _count_true_touches(data, robot_geom_ids, vase_ids) -> int:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--robot", choices=sorted(morphology._MORPH_ROBOTS), default="ant")
+    args = ap.parse_args()
+    robot = args.robot
+    print(f"robot: {robot}")
+
     spec_max = morphology.MorphologySpec(genes=np.ones(morphology.NUM_GENES))
-    mj_uncapped = _build(spec_max, cap=150)
-    mj_capped = _build(spec_max, cap=16)
+    mj_uncapped = _build(spec_max, cap=150, robot=robot)
+    mj_capped = _build(spec_max, cap=16, robot=robot)
     assert mj_uncapped.ngeom == mj_capped.ngeom == 35
     print(f"mass at max scale: {morphology.total_mass(mj_uncapped):.2f} kg")
 
@@ -150,7 +164,7 @@ def main() -> None:
     robot_geom_ids_arr = jp.array(robot_geom_ids)
 
     qpos = np.array(mjx.make_data(mx_uncapped).qpos)
-    qpos[:15] = INIT_QPOS
+    qpos[:15] = _init_qpos(mj_uncapped)
     d0 = mjx.forward(mx_uncapped, mjx.make_data(mx_uncapped).replace(qpos=jp.asarray(qpos)))
     capsule_xpos = dict(zip(ROBOT_GEOMS, np.array(d0.geom_xpos[robot_geom_ids_arr])))
 
