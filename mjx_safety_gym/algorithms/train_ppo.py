@@ -479,8 +479,17 @@ def train(args: argparse.Namespace):
     if args.no_checkpoint:
         checkpoint_logdir = None
     else:
+        # .resolve() is NOT cosmetic. orbax raises "Checkpoint path should be
+        # absolute" from inside the save call, which happens at the FIRST EVAL
+        # -- i.e. after all the compilation and, with a small --num_evals,
+        # potentially after hours of training. A 1.5M-step run was lost to
+        # exactly this: it trained for 55 minutes, reported its final eval, and
+        # then threw on every checkpoint write, leaving nothing on disk. The
+        # default from default_checkpoint_dir() is already absolute; only a
+        # user-supplied relative --checkpoint_logdir could trip it, which is the
+        # natural thing to type and is what every cluster script here does.
         checkpoint_logdir = str(
-            Path(args.checkpoint_logdir)
+            Path(args.checkpoint_logdir).resolve()
             if args.checkpoint_logdir
             else default_checkpoint_dir(args.robot)
         )
