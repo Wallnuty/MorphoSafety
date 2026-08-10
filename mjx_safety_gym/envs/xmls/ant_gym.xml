@@ -66,10 +66,15 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   declaring this XML must also declare an arena_scale (see _ROBOT_CONFIGS in
   envs/go_to_goal.py), or every obstacle is a rounding error under its feet.
 
-  max_geom_pairs stays at 16: scaling is uniform, so the pair COUNTS are
-  unchanged (topology is identical) even though the geometry is larger. Re-run
-  scripts/verify_contact_capping.py against this file before trusting the cost
-  signal at large morphology scales.
+  max_geom_pairs stays at 16, and that has been VERIFIED against this file
+  rather than assumed. `python scripts/verify_contact_capping.py --robot
+  ant_gym` builds the largest morphology this project generates (all genes at
+  1.0, 2.50 kg) with all ten vases placed at guaranteed-deep-overlap midpoints
+  between limb capsules, and compares capped(16) against effectively-uncapped
+  (150) in a single deterministic mjx.forward: 50 simultaneous real (dist<0)
+  limb-vase pairs, 3x the cap, and all 10 vases still register in the per-vase
+  cost signal. The same check on ant.xml gives 102 pairs, also all detected.
+  Re-run it after changing SCALE_LO/SCALE_HI or the arena's vase count/keepout.
 -->
 
 <mujoco model="ant_gym">
