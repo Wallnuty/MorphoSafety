@@ -14,14 +14,23 @@ from brax.training.acme import running_statistics
 from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import latest_checkpoint
-from mjx_safety_gym.envs.go_to_goal import GoToGoal
+from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.run_forward import RunForward
 import mjx_safety_gym.lidar as lidar
 
 _parser = argparse.ArgumentParser(
     description="Replay the newest trained policy for a robot in the viewer, "
     "or drive it with random actions if nothing has been trained yet."
 )
-_parser.add_argument("--robot", choices=["point", "ant"], default="point")
+_parser.add_argument("--robot", choices=sorted(_ROBOT_XMLS), default="point")
+_parser.add_argument(
+    "--task",
+    choices=["goal", "run"],
+    default="goal",
+    help="Must match the task the checkpoint was trained on. Both tasks give "
+    "the same observation width, so a mismatch loads cleanly and replays a "
+    "policy against a world it was never trained in.",
+)
 _parser.add_argument(
     "--deterministic",
     action="store_true",
@@ -61,7 +70,7 @@ DETERMINISTIC = _args.deterministic
 jax_cache.configure()
 
 # Create environment
-env = GoToGoal(robot=ROBOT)
+env = RunForward(robot=ROBOT) if _args.task == "run" else GoToGoal(robot=ROBOT)
 rng = jax.random.PRNGKey(_args.seed)
 
 # Reset environment
