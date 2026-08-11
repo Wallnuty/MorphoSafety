@@ -27,7 +27,7 @@ twice on identical seeds and an identical checkpoint, changing nothing but
 adding two extra outputs to the scan, moved the untrained control's mean
 episode cost from 8.8 to 26.6 and its boundary cost from 5.2 to 18.9. The extra
 outputs re-fuse the XLA graph, which changes float association, which chaotic
-contact dynamics amplify to full decorrelation over 625 steps. So:
+contact dynamics amplify to full decorrelation over a full episode. So:
 
   * The +-SE printed below is the spread ACROSS EPISODES within one run. It is
     not a run-to-run reproducibility bound, and it understates how much a
@@ -51,6 +51,7 @@ import orbax.checkpoint as ocp
 from brax.training.acme import running_statistics
 
 from mjx_safety_gym import jax_cache
+from mjx_safety_gym.algorithms import train_ppo
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.envs.run_forward import RunForward
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
@@ -87,34 +88,49 @@ def build_policy(ckpt_dir: Path | None, env, deterministic: bool, seed: int):
     )
 
 
-def rollout_many(env, policy_fn, seeds, n_steps):
-    """Roll out one episode per seed, vmapped. Returns per-episode arrays."""
+def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
+    """Roll out one episode per seed, vmapped. Returns per-episode arrays.
+
+    ACTION REPEAT IS NOT OPTIONAL HERE. Training does not step the raw env once
+    per decision -- CostEpisodeWrapper holds each action for `action_repeat`
+    inner `env.step` calls and sums reward and cost over them, and the episode
+    ends at `steps >= episode_length` where `steps` grows by `action_repeat`.
+    So a training episode is `episode_length` inner steps (2500 for the ants),
+    reached in `episode_length // action_repeat` decisions (625).
+
+    An earlier version of this function ran 625 INNER steps with a fresh action
+    each, which is a quarter of the episode at four times the control rate --
+    and control period alone is worth 2.7x in achievable gait travel on this
+    robot. It reported episode_cost ~26 where the in-training eval on the same
+    policy reported 353.
+    """
 
     site = env._robot_site_id
 
     def one(seed):
         state = env.reset(jax.random.PRNGKey(seed))
 
-        def body(carry, _):
+        def decision(carry, _):
             st, key = carry
             key, ak = jax.random.split(key)
             action, _ = policy_fn(st.obs, ak)
-            nst = env.step(st, action)
-            # per-step displacement, so a policy that thrashes in place is
-            # distinguishable from one that stands still -- net displacement
-            # alone cannot tell them apart, and that ambiguity is exactly what
-            # made the first run of this script unreadable.
-            d = nst.data.site_xpos[site][:2] - st.data.site_xpos[site][:2]
-            return (nst, key), (
-                nst.reward,
-                nst.info["cost"],
-                nst.info["out_of_bounds"],
-                jp.linalg.norm(d),
-                d[1],
-            )
+
+            def inner(s, _):
+                ns = env.step(s, action)
+                # per-step displacement, so a policy that thrashes in place is
+                # distinguishable from one that stands still -- net
+                # displacement alone cannot tell them apart, and that ambiguity
+                # is exactly what made the first run of this script unreadable.
+                d = ns.data.site_xpos[site][:2] - s.data.site_xpos[site][:2]
+                return ns, (ns.reward, ns.info["cost"], ns.info["out_of_bounds"],
+                            jp.linalg.norm(d), d[1])
+
+            nst, inner_out = jax.lax.scan(inner, st, (), action_repeat)
+            # summed over the repeat, matching CostEpisodeWrapper
+            return (nst, key), tuple(x.sum(axis=0) for x in inner_out)
 
         (st, _), (r, c, oob, seglen, dy) = jax.lax.scan(
-            body, (state, jax.random.PRNGKey(seed + 10_000)), (), n_steps
+            decision, (state, jax.random.PRNGKey(seed + 10_000)), (), n_decisions
         )
         # Summed reward IS total +x displacement in metres, exactly -- verified
         # to 0.00e+00. RunForward deliberately carries no "distance" metric,
@@ -151,12 +167,15 @@ def main() -> None:
     ap.add_argument("--checkpoint", default="checkpoints/ant_gym_run")
     ap.add_argument("--episodes", type=int, default=128)
     ap.add_argument(
-        "--steps",
+        "--episode_length",
         type=int,
-        default=625,
-        help="env.step calls per episode. Training uses episode_length // "
-        "action_repeat = 2500 // 4 = 625 for the ant robots.",
+        default=None,
+        help="inner env.step calls per episode. Defaults to the robot's own "
+        "training value from train_ppo._ROBOT_DEFAULTS, so this cannot drift "
+        "away from what training actually ran.",
     )
+    ap.add_argument("--action_repeat", type=int, default=None,
+                    help="same default source as --episode_length")
     ap.add_argument("--deterministic", action="store_true")
     args = ap.parse_args()
 
@@ -168,11 +187,22 @@ def main() -> None:
     )
     seeds = np.arange(args.episodes) + 1000  # common random numbers across arms
 
-    print(f"{args.robot} / {args.task}, {args.episodes} episodes x {args.steps} steps")
+    defaults = train_ppo._ROBOT_DEFAULTS[args.robot]
+    episode_length = args.episode_length or defaults["episode_length"]
+    action_repeat = args.action_repeat or defaults["action_repeat"]
+    n_decisions = episode_length // action_repeat
+
+    print(
+        f"{args.robot} / {args.task}, {args.episodes} episodes x {episode_length}"
+        f" env steps ({n_decisions} decisions x action_repeat {action_repeat})"
+    )
     print("untrained control:")
     untrained = summarise(
         "untrained",
-        rollout_many(env, build_policy(None, env, args.deterministic, 0), seeds, args.steps),
+        rollout_many(
+            env, build_policy(None, env, args.deterministic, 0), seeds,
+            n_decisions, action_repeat,
+        ),
     )
     ckpt = Path(args.checkpoint)
     trained = None
@@ -181,7 +211,8 @@ def main() -> None:
         trained = summarise(
             "trained",
             rollout_many(
-                env, build_policy(ckpt, env, args.deterministic, 0), seeds, args.steps
+                env, build_policy(ckpt, env, args.deterministic, 0), seeds,
+                n_decisions, action_repeat,
             ),
         )
     else:
