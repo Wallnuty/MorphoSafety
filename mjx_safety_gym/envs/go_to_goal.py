@@ -610,7 +610,25 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         action = (action + 1.0) / 2.0 * (upper - lower) + lower
 
         data = step(self._mjx_model, state.data, action, n_substeps=2)
-        reward, goal_dist = self.get_reward(data, state.info["last_goal_dist"])
+        # The previous distance is RECOMPUTED from state.data rather than read
+        # from state.info. BraxAutoResetWrapper restores `data` and `obs` from
+        # the reset state when an episode ends but leaves every other info key
+        # untouched, so a carried scalar makes the first step of each episode
+        # difference against the PREVIOUS episode's final goal distance. That
+        # produced a ~1 m spurious reward once per episode against a typical
+        # per-step ~0.01 m -- a 100x outlier landing straight in PPO's
+        # advantage normalisation. Deriving it from `data` is correct across
+        # episode boundaries by construction.
+        #
+        # mocap_pos, NOT xpos: _reset_goal writes mocap_pos without re-running
+        # forward kinematics (see its comment), so xpos still holds the OLD
+        # goal for one step after a mid-episode respawn. reset() measures
+        # initial_goal_dist the same way.
+        prev_goal_dist = jp.linalg.norm(
+            state.data.mocap_pos[self._goal_mocap_id][:2]
+            - state.data.site_xpos[self._robot_site_id][0:2]
+        )
+        reward, goal_dist = self.get_reward(data, prev_goal_dist)
 
         # Reset goal if robot inside goal
         condition = goal_dist < 0.3
@@ -637,6 +655,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # training wrappers (e.g. "steps", "truncation") survive the step.
         state.info["rng"] = rng
         state.info["cost"] = cost
+        # DIAGNOSTIC ONLY (scripts/interactive.py reads it). Do not feed this
+        # back into the reward: it survives the auto-reset boundary. See the
+        # prev_goal_dist comment above.
         state.info["last_goal_dist"] = goal_dist
         state.info["goal_reached"] = condition.astype(jp.float32)
         info = state.info

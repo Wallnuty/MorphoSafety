@@ -259,10 +259,12 @@ class RunForward(GoToGoal):
         correct across boundaries by construction, with no carried state to keep
         in sync.
 
-        NOTE: GoToGoal.get_reward has the identical latent bug via its carried
-        `last_goal_dist`. It is NOT fixed here because doing so changes the
-        point robot's training dynamics and invalidates the only converged
-        baselines this project has. See the project plan.
+        NOTE: GoToGoal had the identical bug via its carried `last_goal_dist`,
+        for every run this project has ever done including the point baselines.
+        It is now fixed there too (2026-08-11), by recomputing the previous
+        distance from `state.data.mocap_pos`. Point results recorded before
+        that date describe a slightly different reward function and are not
+        directly comparable.
         """
         x_prev = prev_data.site_xpos[self._robot_site_id][0]
         x_new = data.site_xpos[self._robot_site_id][0]
