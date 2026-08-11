@@ -20,6 +20,23 @@ initialised policy evaluated under exactly the same arena seeds, and by more
 than the standard error of the difference. Both are run on the SAME seeds
 (common random numbers), which removes arena-layout variance from the
 comparison rather than averaging over it.
+
+WHAT THE SEEDS DO AND DO NOT PIN. They pin the arena layout and the action
+noise. They do NOT pin the trajectory. Measured 2026-08-11: running this script
+twice on identical seeds and an identical checkpoint, changing nothing but
+adding two extra outputs to the scan, moved the untrained control's mean
+episode cost from 8.8 to 26.6 and its boundary cost from 5.2 to 18.9. The extra
+outputs re-fuse the XLA graph, which changes float association, which chaotic
+contact dynamics amplify to full decorrelation over 625 steps. So:
+
+  * The +-SE printed below is the spread ACROSS EPISODES within one run. It is
+    not a run-to-run reproducibility bound, and it understates how much a
+    number will move if anything about the compiled graph changes.
+  * At 128 episodes, `cost`/`boundary` do not resolve. In that same pair of
+    runs the trained-vs-untrained cost comparison came out "7x worse" once and
+    "identical" the other time. Do not quote cost from this harness without
+    re-running it and seeing the effect twice.
+  * `net +x` and `path` DID replicate in sign and rough magnitude. Prefer them.
 """
 
 from __future__ import annotations
@@ -73,6 +90,8 @@ def build_policy(ckpt_dir: Path | None, env, deterministic: bool, seed: int):
 def rollout_many(env, policy_fn, seeds, n_steps):
     """Roll out one episode per seed, vmapped. Returns per-episode arrays."""
 
+    site = env._robot_site_id
+
     def one(seed):
         state = env.reset(jax.random.PRNGKey(seed))
 
@@ -81,22 +100,33 @@ def rollout_many(env, policy_fn, seeds, n_steps):
             key, ak = jax.random.split(key)
             action, _ = policy_fn(st.obs, ak)
             nst = env.step(st, action)
-            return (nst, key), (nst.reward, nst.info["cost"], nst.info["out_of_bounds"])
+            # per-step displacement, so a policy that thrashes in place is
+            # distinguishable from one that stands still -- net displacement
+            # alone cannot tell them apart, and that ambiguity is exactly what
+            # made the first run of this script unreadable.
+            d = nst.data.site_xpos[site][:2] - st.data.site_xpos[site][:2]
+            return (nst, key), (
+                nst.reward,
+                nst.info["cost"],
+                nst.info["out_of_bounds"],
+                jp.linalg.norm(d),
+                d[1],
+            )
 
-        (st, _), (r, c, oob) = jax.lax.scan(
+        (st, _), (r, c, oob, seglen, dy) = jax.lax.scan(
             body, (state, jax.random.PRNGKey(seed + 10_000)), (), n_steps
         )
         # Summed reward IS total +x displacement in metres, exactly -- verified
         # to 0.00e+00. RunForward deliberately carries no "distance" metric,
         # because anything in state.info survives the episode boundary that
         # BraxAutoResetWrapper does not clear.
-        return r.sum(), c.sum(), oob.sum(), r.sum()
+        return r.sum(), c.sum(), oob.sum(), r.sum(), seglen.sum(), dy.sum()
 
     return jax.jit(jax.vmap(one))(jp.asarray(seeds))
 
 
 def summarise(name, out):
-    r, c, oob, dist = (np.asarray(x) for x in out)
+    r, c, oob, dist, path, dy = (np.asarray(x) for x in out)
     n = len(r)
     return {
         "name": name,
@@ -106,7 +136,11 @@ def summarise(name, out):
         "cost_se": c.std(ddof=1) / np.sqrt(n),
         "boundary": oob.mean(),
         "hazard": c.mean() - oob.mean(),
+        "path": path.mean(),
+        "lateral": np.abs(dy).mean(),
         "raw": dist,
+        "raw_cost": c,
+        "raw_path": path,
     }
 
 
@@ -154,30 +188,51 @@ def main() -> None:
         print(f"  (no checkpoint at {ckpt}, control only)")
 
     print()
-    print(f"{'policy':<11}{'distance m':>13}{'cost':>12}{'boundary':>11}{'hazard':>9}")
-    print("-" * 58)
+    print(f"{'policy':<11}{'net +x m':>13}{'path m':>9}{'|dy| m':>8}"
+          f"{'cost':>12}{'boundary':>10}{'hazard':>8}")
+    print("-" * 71)
     for row in filter(None, (untrained, trained)):
         print(
             f"{row['name']:<11}{row['distance']:>8.3f} +-{row['distance_se']:<4.2f}"
+            f"{row['path']:>9.2f}{row['lateral']:>8.2f}"
             f"{row['cost']:>7.1f} +-{row['cost_se']:<4.1f}"
-            f"{row['boundary']:>11.1f}{row['hazard']:>9.1f}"
+            f"{row['boundary']:>10.1f}{row['hazard']:>8.1f}"
         )
+    print()
+    print("net +x is the episode return. `path` is total distance travelled by "
+          "the torso\nsite (thrashing in place shows up here and nowhere else); "
+          "`|dy|` is net lateral\ntravel, which is what running out of the "
+          "corridor looks like.")
 
     if trained is not None:
-        # paired difference: same arena seed in both arms, so the per-episode
+        # paired differences: same arena seed in both arms, so the per-episode
         # difference cancels layout variance instead of averaging over it
+        print()
+        for label, key, unit in (
+            ("net +x  ", "raw", "m"),
+            ("path    ", "raw_path", "m"),
+            ("cost    ", "raw_cost", ""),
+        ):
+            d = trained[key] - untrained[key]
+            se = d.std(ddof=1) / np.sqrt(len(d))
+            n_se = d.mean() / se if se else float("nan")
+            verdict = "same" if abs(n_se) < 2 else ("HIGHER" if n_se > 0 else "LOWER")
+            print(f"paired {label} {d.mean():+9.3f} +- {se:6.3f} {unit:<2}"
+                  f"({n_se:+5.1f} SE)  {verdict}")
+
         d = trained["raw"] - untrained["raw"]
         se = d.std(ddof=1) / np.sqrt(len(d))
         print()
-        print(f"paired improvement: {d.mean():+.3f} +- {se:.3f} m  "
-              f"({d.mean()/se if se else float('nan'):+.1f} SE)")
         if d.mean() > 2 * se:
-            print("  => LEARNED: trained beats untrained by more than 2 SE")
+            print("  => LEARNED: trained travels further in +x than untrained by"
+                  " more than 2 SE")
         elif d.mean() < -2 * se:
-            print("  => WORSE than untrained by more than 2 SE")
+            print("  => WORSE in +x than untrained by more than 2 SE")
         else:
-            print("  => INCONCLUSIVE: within 2 SE of no change. Either it has not"
-                  " learned yet, or more episodes are needed to see it.")
+            print("  => INCONCLUSIVE on +x: within 2 SE of no change. Read the"
+                  " path and cost\n     rows before concluding nothing was"
+                  " learned -- a policy can learn to move\n     a lot without"
+                  " moving in the rewarded direction.")
 
 
 if __name__ == "__main__":
