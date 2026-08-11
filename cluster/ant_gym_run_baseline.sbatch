@@ -87,6 +87,37 @@ python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 df -h ~ | tail -1
 echo
+# PREFLIGHT: abort if JAX cannot see a GPU.
+#
+# This is not paranoia. Job 40227 landed on mscluster65, whose GPU0 was in a
+# bad state ("Unable to determine the device handle for GPU0: 0000:17:00.0:
+# Unknown Error", then "cuInit(0) failed: CUDA_ERROR_UNKNOWN"). JAX does NOT
+# fail on that -- it prints a WARNING and silently falls back to CPU. The job
+# then ran the first sweep arm on CPU for eight hours and was killed at the
+# time limit having produced zero data points, and all 9,484 nvidia-smi
+# samples it collected read "No devices were found".
+#
+# pyproject.toml documents this fallback, and cluster/gpu_smoke_test.sbatch
+# already asserts against it -- but the assertion lived only in the smoke test,
+# i.e. only in the job that could afford to fail. Thirty seconds here saves a
+# whole time allocation. Assert on device PLATFORM, not on jax.devices()
+# merely returning without raising, or a CPU fallback reads as a pass.
+echo "=== GPU preflight ==="
+python -c "
+import jax
+devices = jax.devices()
+print('JAX devices:', devices)
+gpus = [d for d in devices if d.platform == 'gpu']
+assert gpus, (
+    'ABORT: jax.devices() returned no GPU -- silently fell back to CPU. '
+    'This node cannot run the job. Check nvidia-smi output above: if it '
+    'reports a device handle error, the NODE is broken, not the code -- '
+    'resubmit (SLURM will usually pick a different node) and consider '
+    'reporting the node to support@wits-mss.supportsystem.com.'
+)
+print(f'PASS: {len(gpus)} GPU device(s): {gpus}')
+" || { echo "=== GPU preflight FAILED, aborting before spending the allocation ==="; exit 1; }
+echo
 echo "=== unconstrained ant_gym on RunForward: 15M env steps = 3.75M decisions ==="
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 # python -u is NOT optional. A laptop run reached 573k steps (proven by

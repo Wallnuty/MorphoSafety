@@ -55,6 +55,20 @@ conda activate mjx-safety-gym
 python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 echo
+# PREFLIGHT: abort if JAX cannot see a GPU. Job 40227 landed on mscluster65
+# whose GPU0 was broken; JAX printed a WARNING and fell back to CPU, and the
+# job burned its whole 8h allocation producing zero data points. Assert on
+# device PLATFORM -- a silent CPU fallback otherwise reads as a pass. See the
+# long note in cluster/ant_gym_run_baseline.sbatch.
+echo "=== GPU preflight ==="
+python -c "
+import jax
+gpus = [d for d in jax.devices() if d.platform == 'gpu']
+print('JAX devices:', jax.devices())
+assert gpus, 'ABORT: no GPU -- silently fell back to CPU. Node likely broken; resubmit.'
+print(f'PASS: {len(gpus)} GPU device(s)')
+" || { echo "=== GPU preflight FAILED, aborting ==="; exit 1; }
+echo
 echo "=== ant training smoke test (ALL size defaults, the laptop-crashing config) ==="
 # 0.75 (~18GB of the 3090's 24GB) -- JAX's own default, set explicitly so the
 # intent is documented rather than implicit. Deliberately not throttled for
