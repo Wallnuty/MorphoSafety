@@ -23,18 +23,24 @@
 #     C      2048               64          81,920     2,048   2048/2048 = 1
 #     D      4096              128         163,840     4,096   4096/4096 = 1
 #
-# Every arm runs the SAME 30 iterations, so --num_timesteps scales with
-# env_steps/iter. That makes the arms comparable on wall-clock per iteration,
-# which is the number that actually decides how long a real run takes.
+# EVERY ARM GETS THE SAME --num_timesteps, AND THAT IS FAIR. Per
+# ppo/train.py:189, env steps per training step is
+# batch_size*unroll_length*num_minibatches*action_repeat, while gradient steps
+# per training step is num_updates_per_batch*num_minibatches. num_minibatches
+# appears in both and CANCELS:
 #
-# NOTE what this does and does not tell you. Holding batch_size at 32 while
-# num_minibatches rises keeps transitions-per-gradient-step at 320, so the
-# OPTIMIZATION is unchanged arm to arm -- but each iteration consumes 8x more
-# env steps at D than at A, so at a FIXED --num_timesteps budget the
-# higher-parallelism arms take 8x fewer gradient steps. Faster wall-clock per
-# env step is not automatically faster learning. Decide with both numbers:
-# adopt the arm with the best sps only if you also raise --num_timesteps to
-# keep the gradient-step count you actually want.
+#   gradient steps = num_timesteps * num_updates_per_batch
+#                    / (batch_size * unroll_length * action_repeat)
+#                  = num_timesteps * num_updates_per_batch / 1280
+#
+# independent of num_minibatches AND of num_envs. So at a fixed
+# --num_timesteps all four arms perform exactly the same number of gradient
+# updates on exactly the same 320 transitions each. The ONLY thing that
+# differs is how fast the hardware gets through them.
+#
+# That makes this sweep simple to act on: WALL-CLOCK PER ARM IS THE ANSWER.
+# The fastest arm trains the same policy in less time, with no offsetting cost
+# to hunt for. Just take the winner.
 #
 # ======================= WHY PREALLOCATION IS OFF HERE ======================
 #
@@ -57,14 +63,10 @@
 #
 # ================================== RUNTIME ================================
 #
-# 30 iterations per arm. If the GPU is already saturated at A, every arm takes
-# about the same wall time and the sweep is short. If A is starved -- which is
-# the hypothesis worth testing on a 24 GB 3090, since these defaults were sized
-# for a 6 GB laptop -- the later arms process far more env steps in the same
-# time, which is exactly the result being looked for.
-#
-#   A: 614,400 env steps    -- ~14 min at the measured 750 sps
-#   D: 4,915,200 env steps  -- ~18 min if it scales 8x, ~1.8 h if it does not
+# 2,000,000 env steps per arm. At the measured 750 sps that is ~44 min for arm
+# A. If A is starved -- the hypothesis worth testing on a 24 GB 3090, since
+# these defaults were sized for a 6 GB laptop -- the later arms finish the SAME
+# work in a fraction of that, and the ratio is the speedup a real run gets.
 #
 # Plus compile, which grows with shape: the laptop went 46 s at 256 envs to
 # 264 s at 1024, and cluster CPUs are 2012-era Xeons, so arms C/D could cost
@@ -112,7 +114,7 @@ echo
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 UTILDIR="$(pwd)/sweep_util_${SLURM_JOB_ID:-local}"
 mkdir -p "$UTILDIR"
-ITERS=30
+STEPS=2000000   # identical for every arm: same gradient-step count
 
 # utilization.gpu is the fraction of the sampling interval during which any
 # kernel was resident. It is NOT occupancy, so 100% does not prove the card is
@@ -154,11 +156,11 @@ summarize_util () {
 run_arm () {
   local tag="$1"; local envs="$2"; local mb="$3"
   local per_iter=$(( 32 * 10 * mb * 4 ))
-  local steps=$(( per_iter * ITERS ))
   local uf="$UTILDIR/$tag"
   echo
   echo "==================== ARM $tag: num_envs=$envs num_minibatches=$mb ===================="
-  echo "env_steps/iter=$per_iter  x ${ITERS} iters = $steps env steps"
+  echo "env_steps/iter=$per_iter  total=$STEPS env steps"
+  echo "gradient steps: $STEPS * num_updates_per_batch / 1280 -- SAME IN EVERY ARM"
   date
   sample_util > "$uf" &
   local sampler=$!
@@ -166,7 +168,7 @@ run_arm () {
   python -u -m mjx_safety_gym.algorithms.train_ppo \
     --robot ant_gym --task run --penalizer none \
     --num_envs "$envs" --num_minibatches "$mb" \
-    --num_timesteps "$steps" --num_evals 3 \
+    --num_timesteps "$STEPS" --num_evals 3 \
     --num_eval_envs 8 --num_eval_episodes 1 \
     --no_checkpoint
   local st=$?
@@ -213,10 +215,12 @@ echo "4. Compile time (wall minus the sps-implied training time). It grows"
 echo "   sharply with shape and is paid once per shape. Irrelevant for a 15 h"
 echo "   run, decisive for short ones."
 echo
-echo "5. Then RE-READ the caveat in this file's header: higher parallelism"
-echo "   means fewer gradient steps per env step. Adopting arm C or D means"
-echo "   raising --num_timesteps proportionally, or the run will be faster AND"
-echo "   learn less. Do not skip this."
+echo "5. THE DECISION IS JUST THE WALL CLOCK. Every arm ran the same 2M env"
+echo "   steps and therefore the same number of gradient updates on the same"
+echo "   320 transitions each (num_minibatches cancels -- see the header)."
+echo "   So the fastest arm trains the identical policy in less time, with no"
+echo "   offsetting cost. Take the winner and put its --num_envs and"
+echo "   --num_minibatches into ant_gym_entropy_ab.sbatch."
 echo
 echo "--- utilisation samples kept in $UTILDIR ---"
 echo "=== done ==="
