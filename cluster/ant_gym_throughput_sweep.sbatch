@@ -63,17 +63,31 @@
 #
 # ================================== RUNTIME ================================
 #
-# 2,000,000 env steps per arm. At the measured 750 sps that is ~44 min for arm
-# A. If A is starved -- the hypothesis worth testing on a 24 GB 3090, since
-# these defaults were sized for a 6 GB laptop -- the later arms finish the SAME
-# work in a fraction of that, and the ratio is the speedup a real run gets.
+# 500,000 env steps per arm, and COMPILE TIME DOMINATES, which is why it is
+# not lower. All this needs is one clean post-compile interval: brax reports
+# training/sps cumulatively at each eval, so with --num_evals 3 you difference
+# the last two and get the steady-state rate. sps is very stable once compiled
+# (a laptop run measured 403 incremental against 383/403 cumulative), so ~1-2
+# minutes of training per interval is already ample.
 #
-# Plus compile, which grows with shape: the laptop went 46 s at 256 envs to
-# 264 s at 1024, and cluster CPUs are 2012-era Xeons, so arms C/D could cost
-# 15-30 min each before their first step. That is a one-off per shape, cached
-# in ~/.cache/jax, and it is a real cost for short runs but irrelevant for a
-# 15 h one -- the log reports it separately so it can be weighed, not hidden.
-# --time 8h covers the pessimistic case.
+# num_training_steps_per_epoch = ceil(num_timesteps / (2 * env_steps_per_iter)),
+# so 500k resolves to, and the measured interval lasts, at the 750 sps baseline:
+#
+#   arm  steps/iter  iters/epoch  actual steps  per interval  @750 sps
+#     A      20,480           13       532,480       266,240      355 s
+#     B      40,960            7       573,440       286,720      382 s
+#     C      81,920            4       655,360       327,680      437 s
+#     D     163,840            2       655,360       327,680      437 s
+#
+# Arms run up to 23% different ACTUAL step counts because of that ceil(). That
+# is fine: sps is a RATE, and the arms are compared on rate, not on totals.
+#
+# Going below ~500k saves little, because compile is the bulk of each arm and
+# is paid per shape regardless: the laptop went 46 s at 256 envs to 264 s at
+# 1024, and these are 2012-era Xeons, so arms C/D could cost 15-30 min each
+# before their first step. Cutting steps trims the cheap part and leaves the
+# expensive part untouched. (It is cached in ~/.cache/jax, so a rerun of this
+# sweep is much faster than the first.) --time 8h covers the pessimistic case.
 #
 # Submit from the repo root on the cluster:
 #   sbatch cluster/ant_gym_throughput_sweep.sbatch
@@ -114,7 +128,7 @@ echo
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 UTILDIR="$(pwd)/sweep_util_${SLURM_JOB_ID:-local}"
 mkdir -p "$UTILDIR"
-STEPS=2000000   # identical for every arm: same gradient-step count
+STEPS=500000    # identical for every arm; see RUNTIME in the header
 
 # utilization.gpu is the fraction of the sampling interval during which any
 # kernel was resident. It is NOT occupancy, so 100% does not prove the card is
