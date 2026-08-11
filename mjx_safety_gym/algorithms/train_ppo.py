@@ -83,14 +83,38 @@ CHECKPOINT_ROOT = Path(__file__).resolve().parents[2] / "checkpoints"
 # discounting 0.97 at a 0.08 s control period is a ~2.7 s horizon, about seven
 # gait cycles at the measured 0.4 s best gait period. The point keeps ss2r's
 # 0.9 (a 0.4 s horizon), which is fine for a robot whose "gait" is one actuator.
+# healthy_reward / terminate_on_flip are point-exempt on purpose: the point
+# robot is a slider-driven puck with no meaningful "upright", so inverting is
+# not a failure mode it can have, and terminating it on torso orientation
+# would be nonsense. The ants get both -- see RunForward.is_upright for the
+# measurement that motivated them.
 _ROBOT_DEFAULTS = {
-    "point": {"action_repeat": 4, "episode_length": 1000, "discounting": 0.9},
-    "ant": {"action_repeat": 4, "episode_length": 2500, "discounting": 0.97},
+    "point": {
+        "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
+        "healthy_reward": 0.0, "terminate_on_flip": False,
+    },
+    "ant": {
+        "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
+        "healthy_reward": 0.002, "terminate_on_flip": True,
+    },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period and horizon apply.
     # It travels far more per second, which episode_length does not need to
     # change for -- 50 s is ~20-40 m for it, matching the 48 m default corridor.
-    "ant_gym": {"action_repeat": 4, "episode_length": 2500, "discounting": 0.97},
+    "ant_gym": {
+        "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
+        # 0.002/step is ~5 over a full 2500-step episode. Sized against what a
+        # FROZEN policy can farm, not against the best gait: measured, a
+        # zero-action ant_gym stays upright 100% of the episode, so the bonus
+        # is fully collectable by doing nothing. It only has to beat flailing
+        # (the 1.5M policy managed +0.7 m of net +x while inverted) while
+        # staying well under a plausible LEARNED walk. An earlier 0.005 paid a
+        # frozen ant 12.5, which is inside the range an early walking policy
+        # would earn -- that re-creates the freeze attractor this task exists
+        # to escape, and the ~40 m figure it was sized against is a best-case
+        # SCRIPTED gait, not something a policy reaches early.
+        "healthy_reward": 0.002, "terminate_on_flip": True,
+    },
 }
 
 
@@ -325,6 +349,29 @@ def build_argparser() -> argparse.ArgumentParser:
         "the safe optimum is to step out of the obstacle band and run in clean "
         "air -- full reward, zero cost -- making the constraint vacuous.",
     )
+    parser.add_argument(
+        "--healthy_reward",
+        type=float,
+        default=None,
+        help="[--task run] Per-step bonus while the torso is upright (tilted "
+        "under ~60 deg). Resolves per robot. MEASURED 2026-08-12: without it "
+        "ant_gym is inverted for 94.4%% of steps untrained and 94.1%% after "
+        "1.5M steps of training -- training moved it 0.3 points, because "
+        "nothing in the reward mentioned staying upright. Note this is the "
+        "same class of hazard as --ctrl_cost_weight in reverse: it pays a "
+        "FROZEN upright policy, so it must stay well under what walking earns "
+        "(a measured good gait travels ~40 m per episode; the ant_gym default "
+        "of 0.005/step is worth ~12 over 2500 steps).",
+    )
+    parser.add_argument(
+        "--terminate_on_flip",
+        type=lambda v: v.lower() not in ("0", "false", "no"),
+        default=None,
+        help="[--task run] End the episode when the torso inverts. Resolves "
+        "per robot. This is the larger half of the fix: without it an ant that "
+        "goes over at step 50 still contributes 2450 further transitions from "
+        "a state where forward reward is unobtainable.",
+    )
     parser.add_argument("--num_timesteps", type=int, default=5_000_000)
     parser.add_argument(
         "--num_envs",
@@ -508,6 +555,8 @@ def train(args: argparse.Namespace):
                 forward_reward_weight=args.forward_reward_weight,
                 ctrl_cost_weight=args.ctrl_cost_weight,
                 boundary_cost_weight=args.boundary_cost_weight,
+                healthy_reward=args.healthy_reward,
+                terminate_on_flip=args.terminate_on_flip,
                 **common,
             )
         return GoToGoal(**common)

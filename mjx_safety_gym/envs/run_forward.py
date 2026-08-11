@@ -111,6 +111,8 @@ class RunForward(GoToGoal):
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.0,
         boundary_cost_weight: float = 1.0,
+        healthy_reward: float = 0.0,
+        terminate_on_flip: bool = False,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -131,6 +133,8 @@ class RunForward(GoToGoal):
         self._forward_reward_weight = float(forward_reward_weight)
         self._ctrl_cost_weight = float(ctrl_cost_weight)
         self._boundary_cost_weight = float(boundary_cost_weight)
+        self._healthy_reward = float(healthy_reward)
+        self._terminate_on_flip = bool(terminate_on_flip)
 
         # Robots start at -L/2 + margin and run toward +L/2. Obstacles fill the
         # span between the start line and the far end.
@@ -268,7 +272,45 @@ class RunForward(GoToGoal):
         """
         x_prev = prev_data.site_xpos[self._robot_site_id][0]
         x_new = data.site_xpos[self._robot_site_id][0]
-        return (x_new - x_prev) * self._forward_reward_weight
+        reward = (x_new - x_prev) * self._forward_reward_weight
+        if self._healthy_reward:
+            reward = reward + self._healthy_reward * self.is_upright(data)
+        return reward
+
+    # -- posture -----------------------------------------------------------
+    #
+    # MEASURED 2026-08-12, and the reason these exist at all. Over 32 full
+    # episodes of ant_gym, the torso is inverted for 94.4% of steps untrained
+    # and 94.1% trained (1.5M steps) -- i.e. training moved it by 0.3 points,
+    # because nothing in the reward ever mentioned staying upright and falling
+    # had no consequence. 100% / 96.9% of episodes ENDED inverted. The +x
+    # progress the 1.5M policy did make was made on its back.
+    #
+    # This is not a surprise once ant_gym is recognised as the standard Gym Ant
+    # (0.911 kg on gear-150 actuators, torque/kg 164.7): a random policy on
+    # actuators that strong throws itself over immediately. Gym's own Ant does
+    # the same, which is exactly why Gym pairs it with a healthy bonus AND
+    # termination. We adopted the morphology and left both behind.
+    #
+    # Orientation, not torso height, because height thresholds are tied to the
+    # robot's scale and would have to be re-derived for every morphology the
+    # search produces -- the same trap that made Gym's (0.2, 1.0) z-range
+    # unusable here. `xmat[2,2]` is the world-z component of the torso's own
+    # z axis: +1 perfectly upright, 0 on its side, -1 fully inverted. Measured
+    # +1.0000 at reset.
+
+    # Bonus is paid above this; termination happens below zero. The gap is
+    # deliberate -- an ant on its side is not earning, but is not yet dead.
+    _UPRIGHT_BONUS_THRESHOLD = 0.5  # ~60 degrees of tilt
+
+    def _torso_up(self, data: mjx.Data) -> jax.Array:
+        return data.xmat[self._robot_body_id].reshape(3, 3)[2, 2]
+
+    def is_upright(self, data: mjx.Data) -> jax.Array:
+        return (self._torso_up(data) > self._UPRIGHT_BONUS_THRESHOLD).astype(jp.float32)
+
+    def is_flipped(self, data: mjx.Data) -> jax.Array:
+        return (self._torso_up(data) < 0.0).astype(jp.float32)
 
     def get_cost(self, data) -> jax.Array:
         """Hazard/vase cost, plus a cost for leaving the corridor.
@@ -300,8 +342,11 @@ class RunForward(GoToGoal):
         info = {
             "rng": rng,
             "cost": jp.zeros(()),
-            # Recomputed fresh every step, never carried.
+            # Recomputed fresh every step, never carried. A key present in only
+            # one of reset/step is a pytree structure mismatch for the
+            # auto-reset wrapper, so both must list all of them.
             "out_of_bounds": jp.zeros(()),
+            "upright": self.is_upright(data),
         }
         return State(data, self.get_obs(data), jp.zeros(()), jp.zeros(()), {}, info)
 
@@ -319,8 +364,15 @@ class RunForward(GoToGoal):
 
         cost = self.get_cost(data)
         done = (jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()).astype(jp.float32)
+        # Ending the episode on a flip is the larger half of this fix. Without
+        # it an ant that goes over at step 50 still contributes 2450 further
+        # transitions from a state where forward reward is unobtainable -- 94%
+        # of every batch was that (see is_upright's note).
+        if self._terminate_on_flip:
+            done = jp.maximum(done, self.is_flipped(data))
 
         state.info["cost"] = cost
+        state.info["upright"] = self.is_upright(data)
         state.info["out_of_bounds"] = (
             jp.abs(data.site_xpos[self._robot_site_id][1]) > self._corridor_half_width
         ).astype(jp.float32)
