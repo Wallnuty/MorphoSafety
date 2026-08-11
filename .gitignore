@@ -185,3 +185,4 @@ MorphoSafetyToken.txt
 # this stops it from growing further. Existing large blobs stay in history
 # unless someone runs a filter-repo pass separately.
 checkpoints/
+cluster/download.md
