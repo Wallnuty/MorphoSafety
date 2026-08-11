@@ -122,30 +122,41 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
                 # displacement alone cannot tell them apart, and that ambiguity
                 # is exactly what made the first run of this script unreadable.
                 d = ns.data.site_xpos[site][:2] - s.data.site_xpos[site][:2]
-                return ns, (ns.reward, ns.info["cost"], ns.info["out_of_bounds"],
+                # .get, because the two tasks carry different info keys:
+                # out_of_bounds is RunForward-only and goal_reached is
+                # GoToGoal-only. Indexing either directly makes --task goal
+                # raise KeyError, which is what it used to do.
+                zero = jp.zeros(())
+                return ns, (ns.reward, ns.info["cost"],
+                            ns.info.get("out_of_bounds", zero),
+                            ns.info.get("goal_reached", zero),
                             jp.linalg.norm(d), d[1])
 
             nst, inner_out = jax.lax.scan(inner, st, (), action_repeat)
             # summed over the repeat, matching CostEpisodeWrapper
             return (nst, key), tuple(x.sum(axis=0) for x in inner_out)
 
-        (st, _), (r, c, oob, seglen, dy) = jax.lax.scan(
+        (st, _), (r, c, oob, goals, seglen, dy) = jax.lax.scan(
             decision, (state, jax.random.PRNGKey(seed + 10_000)), (), n_decisions
         )
-        # Summed reward IS total +x displacement in metres, exactly -- verified
-        # to 0.00e+00. RunForward deliberately carries no "distance" metric,
-        # because anything in state.info survives the episode boundary that
-        # BraxAutoResetWrapper does not clear.
-        return r.sum(), c.sum(), oob.sum(), r.sum(), seglen.sum(), dy.sum()
+        # On RunForward, summed reward IS total +x displacement in metres,
+        # exactly -- verified to 0.00e+00. RunForward deliberately carries no
+        # "distance" metric, because anything in state.info survives the
+        # episode boundary that BraxAutoResetWrapper does not clear. On
+        # GoToGoal the return is shaped progress plus a +1 per goal, so it is
+        # NOT a distance -- read `goals` there instead.
+        return (r.sum(), c.sum(), oob.sum(), goals.sum(), r.sum(),
+                seglen.sum(), dy.sum())
 
     return jax.jit(jax.vmap(one))(jp.asarray(seeds))
 
 
 def summarise(name, out):
-    r, c, oob, dist, path, dy = (np.asarray(x) for x in out)
+    r, c, oob, goals, dist, path, dy = (np.asarray(x) for x in out)
     n = len(r)
     return {
         "name": name,
+        "goals": goals.mean(),
         "distance": dist.mean(),
         "distance_se": dist.std(ddof=1) / np.sqrt(n),
         "cost": c.mean(),
@@ -218,22 +229,35 @@ def main() -> None:
     else:
         print(f"  (no checkpoint at {ckpt}, control only)")
 
+    goal_task = args.task == "goal"
+    # On RunForward the return IS net +x displacement in metres. On GoToGoal it
+    # is shaped progress plus +1 per goal, so calling it a distance would be a
+    # lie -- goals/ep is the readable number there (the point's unconstrained
+    # ceiling was 3.94).
+    ret_label = "return" if goal_task else "net +x m"
+    header = f"{'policy':<11}{ret_label:>13}"
+    if goal_task:
+        header += f"{'goals/ep':>10}"
+    header += f"{'path m':>9}{'|dy| m':>8}{'cost':>12}{'boundary':>10}{'hazard':>8}"
     print()
-    print(f"{'policy':<11}{'net +x m':>13}{'path m':>9}{'|dy| m':>8}"
-          f"{'cost':>12}{'boundary':>10}{'hazard':>8}")
-    print("-" * 71)
+    print(header)
+    print("-" * len(header))
     for row in filter(None, (untrained, trained)):
-        print(
-            f"{row['name']:<11}{row['distance']:>8.3f} +-{row['distance_se']:<4.2f}"
+        line = f"{row['name']:<11}{row['distance']:>8.3f} +-{row['distance_se']:<4.2f}"
+        if goal_task:
+            line += f"{row['goals']:>10.2f}"
+        line += (
             f"{row['path']:>9.2f}{row['lateral']:>8.2f}"
             f"{row['cost']:>7.1f} +-{row['cost_se']:<4.1f}"
             f"{row['boundary']:>10.1f}{row['hazard']:>8.1f}"
         )
+        print(line)
     print()
-    print("net +x is the episode return. `path` is total distance travelled by "
-          "the torso\nsite (thrashing in place shows up here and nowhere else); "
-          "`|dy|` is net lateral\ntravel, which is what running out of the "
-          "corridor looks like.")
+    print("`path` is total distance travelled by the torso site (thrashing in "
+          "place shows\nup here and nowhere else); `|dy|` is net lateral travel."
+          + ("" if goal_task else
+             " On the run task, net +x\nIS the episode return, and `boundary` is"
+             " the part of cost from leaving the\ncorridor."))
 
     if trained is not None:
         # paired differences: same arena seed in both arms, so the per-episode
