@@ -46,8 +46,14 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
 
   WHAT IS DELIBERATELY KEPT FROM ant.xml, so that a run against this file
   differs from a run against ant.xml in MORPHOLOGY ONLY:
-    * integrator RK4 and timestep 0.01 (Gym/Brax ships Euler; use the
-      --integrator flag to A/B that separately rather than confounding it here)
+    * integrator: now EULER, matching Gym/Brax. RK4 was the deviation and it
+      was expensive -- measured 2026-08-12 at 256 envs with the real arena,
+      RK4 ran 1,361 env-steps/s against 6,378 for Euler, a 4.7x physics
+      speedup (~1.35x end-to-end, since physics is only a third of training
+      time). Solver iterations are deliberately NOT pinned: dropping them from
+      the default 100/50 to point.xml's 6/8 was worth only 1.16x, which does
+      not justify the contact-accuracy risk on a scene where limb-vs-vase
+      contacts ARE the cost signal.
     * condim 6 and the collision setup in which every limb geom collides. The
       Gym ant sets contype=0 on everything but the feet, which would be faster,
       but this repo's cost function detects vase contact via geoms_colliding()
@@ -80,7 +86,7 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
 <mujoco model="ant_gym">
   <size njmax="3000" nconmax="1000"/>
   <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
-  <option integrator="RK4" timestep="0.01"/>
+  <option integrator="Euler" timestep="0.01"/>
   <statistic meansize="0.92" extent="15.84"/>
   <!-- !! max_geom_pairs MUST stay the FIRST <numeric> in this file. MJX's
        _numeric() (collision_driver.py) indexes numeric_data by the numeric's

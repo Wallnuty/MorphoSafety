@@ -17,7 +17,7 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
 <mujoco model="ant">
   <size njmax="3000" nconmax="1000"/>
   <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
-  <option integrator="RK4" timestep="0.01"/>
+  <option integrator="Euler" timestep="0.01"/>
   <statistic meansize="0.23" extent="3.96"/>
   <!-- max_geom_pairs: MJX pre-allocates a fixed contact buffer per
        collision-function group, so every step pays for every *possible* pair.
