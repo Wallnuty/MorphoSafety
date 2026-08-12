@@ -46,21 +46,35 @@
 # These are extrapolations from the ANT's cluster numbers, not measurements of
 # ant_gym -- read training/sps off the first eval and adjust if it disagrees.
 #
-# WHAT THIS ANSWERS
-#   1. DOES REWARD CLIMB? eval/episode_reward is metres travelled per episode.
-#      A laptop smoke test measured +0.5585 at step 0 (untrained). If it is
-#      still ~0.5 after a few million decisions, the task/robot change was not
-#      sufficient and the next lever is reward shaping, not more compute.
-#   2. WHAT SHOULD --safety_budget BE? Cost is now boundary + hazard + vase on
-#      a different episode length with a different robot, so EVERY cost figure
-#      recorded before 2026-08-10 is void, including the 728 and the 150
-#      default. Set it from this run's final eval/episode_cost.
-#   3. HOW IS COST SPLIT? Watch whether cost is dominated by the corridor
-#      boundary rather than by hazards. Untrained rollouts were boundary-heavy,
-#      which is expected for a flailing policy but would make the safety
-#      question vacuous if it persists once trained -- if so, narrow
-#      --corridor_half_width or shorten --corridor_length to raise obstacle
-#      density rather than reweighting the cost.
+# WHAT THIS ANSWERS -- REWRITTEN 2026-08-12, READ THIS BEFORE THE LOG
+#
+#   1. READ eval/avg_episode_length FIRST. NOT reward. The ant now terminates
+#      when it flips (RunForward.is_flipped), and it was measured inverted for
+#      94% of every episode before that existed. So episode length IS the
+#      uprightness learning curve: an untrained ant flips at ~100 steps against
+#      the 2500 cap. On the laptop, 1.5M steps moved it 99.75 -> 135.50, with a
+#      +-10 noise floor at 16 eval episodes. If this run does not push it
+#      substantially past ~200, the ant still cannot stand up and nothing
+#      downstream is meaningful.
+#
+#   2. eval/episode_cost WILL READ 0.0000 EARLY AND THAT IS NOT A BUG. Episodes
+#      end before the ant travels far enough to reach an obstacle, so the
+#      safety signal is vacuous until episodes lengthen. **--safety_budget
+#      CANNOT be derived from a run whose avg_episode_length is still ~100.**
+#      Only read cost once episode length is climbing.
+#
+#   3. eval/episode_reward is metres travelled in +x, but it is confounded with
+#      episode length now -- a longer-surviving policy has more time to travel.
+#      Read it only alongside avg_episode_length, never alone.
+#
+#   4. training/entropy_loss / -entropy_cost = entropy in nats. Expect it to go
+#      NEGATIVE (~-1.0, sigma ~0.21 against 1.0 at init). Do NOT reach for
+#      --entropy_cost to fix that: a matched 1.5M A/B measured 1e-3 giving the
+#      SAME collapsed entropy (-1.1 nats) and no survival benefit. That
+#      hypothesis is refuted; see cluster/ant_gym_entropy_ab.sbatch.
+#
+#   5. training/sps -- checks the ~750 extrapolation this --time was sized
+#      from. The laptop measures 472 on this config.
 #
 # Submit from the repo root on the cluster:
 #   sbatch cluster/ant_gym_run_baseline.sbatch

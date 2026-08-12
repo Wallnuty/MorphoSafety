@@ -1,4 +1,26 @@
 #!/bin/bash
+# ============================================================================
+# SUPERSEDED 2026-08-12 -- DO NOT SUBMIT. The hypothesis this job tests was
+# measured and REFUTED on the laptop before this job ever ran.
+#
+# Two matched 1.5M runs, identical but for entropy_cost:
+#
+#     entropy_cost   avg_episode_length      final entropy
+#                    step 0 -> step 1.5M
+#     1e-4            99.75 -> 135.50          -1.0 nats
+#     1e-3           109.25 -> 110.00          -1.1 nats
+#
+# 10x the entropy bonus produced the SAME collapsed entropy and no improvement
+# in survival. Whatever drives sigma down to ~0.21 is not an insufficient
+# entropy term, so arm 1 buys nothing and this array would spend ~15 GPU-hours
+# to learn that a second time.
+#
+# Submit cluster/ant_gym_run_baseline.sbatch instead -- it is arm 0 of this
+# job, and arm 0 is the only arm still worth running.
+#
+# Kept rather than deleted so the refutation is discoverable next to the
+# hypothesis. The reasoning below is preserved but is now HISTORY.
+# ============================================================================
 # ant_gym on RunForward, 15M env steps, entropy_cost 1e-4 vs 1e-3.
 #
 # SUPERSEDES SUBMITTING ant_gym_run_baseline.sbatch ON ITS OWN. Arm 0 here is
