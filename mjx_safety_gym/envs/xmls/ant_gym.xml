@@ -46,14 +46,27 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
 
   WHAT IS DELIBERATELY KEPT FROM ant.xml, so that a run against this file
   differs from a run against ant.xml in MORPHOLOGY ONLY:
-    * integrator: now EULER, matching Gym/Brax. RK4 was the deviation and it
-      was expensive -- measured 2026-08-12 at 256 envs with the real arena,
-      RK4 ran 1,361 env-steps/s against 6,378 for Euler, a 4.7x physics
-      speedup (~1.35x end-to-end, since physics is only a third of training
-      time). Solver iterations are deliberately NOT pinned: dropping them from
-      the default 100/50 to point.xml's 6/8 was worth only 1.16x, which does
-      not justify the contact-accuracy risk on a scene where limb-vs-vase
-      contacts ARE the cost signal.
+    * integrator RK4. NOT a leftover -- MEASURED 2026-08-12 to be the only
+      stable choice. Under a scripted trot (full-amplitude sinusoids, 6 gait
+      periods x 8 seeds, full episodes) the NaN rate was:
+
+          euler          16.7%   (0.4s=50%  0.5s=25%  0.6s=25%)
+          implicitfast   16.7%   (0.4s=50%  0.5s=38%  0.6s=12%)
+          rk4             0.0%   (every period)
+
+      Euler and implicitfast are ~4x cheaper (1,361 -> 6,378 env-steps/s at
+      256 envs, ~1.35x end-to-end since physics is only a third of training
+      time) and that is not worth taking. The blow-ups are mid-frequency only,
+      i.e. resonance from pumping energy in through gear-150 actuators faster
+      than contact dissipates it -- which means RANDOM actions are safe (0%
+      NaN, measured) and the risk appears exactly at the gaits a SUCCESSFULLY
+      TRAINED policy produces. It would detonate once training started working,
+      and a NaN reward lands directly in PPO's batch.
+
+      UNTESTED follow-up if throughput matters: Euler at timestep 0.005 with
+      n_substeps doubled. Euler is ~4x cheaper per step, so halving the step
+      could still net ~2x over RK4 while restoring stability. Changes episode
+      timing, so validate before adopting.
     * condim 6 and the collision setup in which every limb geom collides. The
       Gym ant sets contype=0 on everything but the feet, which would be faster,
       but this repo's cost function detects vase contact via geoms_colliding()
@@ -86,7 +99,7 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
 <mujoco model="ant_gym">
   <size njmax="3000" nconmax="1000"/>
   <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
-  <option integrator="Euler" timestep="0.01"/>
+  <option integrator="RK4" timestep="0.01"/>
   <statistic meansize="0.92" extent="15.84"/>
   <!-- !! max_geom_pairs MUST stay the FIRST <numeric> in this file. MJX's
        _numeric() (collision_driver.py) indexes numeric_data by the numeric's
