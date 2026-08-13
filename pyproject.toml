@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license-files = ["LICENSE"]
 authors = [
-  { name = "Sam Snyman", email = "your.email@example.com" }
+  { name = "Sam Snyman" }
 ]
 dependencies = [
   "absl-py>=2.2.2,<3.0.0",
@@ -46,6 +46,9 @@ cuda = ["jax[cuda12]==0.10.2"]
 # scripts/evolve.py + scripts/fitness_noise.py (NSGA-II morphology search).
 # Separate extra: irrelevant to anyone just training/replaying a fixed body.
 evolve = ["pymoo==0.6.2"]
+# `pip install -e .[dev] && pytest`. The suite runs on the CPU backend (see
+# tests/conftest.py) so it does not contend with a training run for the GPU.
+dev = ["pytest>=8.0"]
 
 [project.urls]
 Homepage = "https://github.com/Wallnuty/MorphoSafety"
@@ -59,3 +62,19 @@ include = ["mjx_safety_gym*"]
 
 [tool.setuptools.package-data]
 "mjx_safety_gym.envs" = ["xmls/*.xml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra so the reasons for skips/xfails are visible; these tests encode
+# measurements, and a silently skipped one is worse than a missing one.
+addopts = "-ra"
+markers = [
+    "slow: builds an ant env and compiles ant physics (tens of seconds on CPU)",
+]
+filterwarnings = [
+    # mujoco-mjx 3.3.2 casts float64 max to float32 in
+    # collision_convex._box_box, which warns on literally every reset.
+    # Upstream and harmless, but loud enough to bury real warnings.
+    "ignore:overflow encountered in cast:RuntimeWarning",
+    "ignore:JAXopt is no longer maintained:DeprecationWarning",
+]
