@@ -25,11 +25,15 @@ set -u
 
 CHAIN="${1:-$PWD/checkpoints/ant_gym_upright_chain}"
 SEED_CKPT="${2:-}"
-LOG="${3:-$PWD/ant_gym_upright_chain.log}"
+LOG="${3:-$PWD/logs/ant_gym_upright_chain.log}"
 STEPS_PER_GEN="${4:-5000000}"
 EVALS_PER_GEN="${5:-4}"
 
 mkdir -p "$CHAIN"
+# The log lives outside $CHAIN (default logs/), and every write below is an
+# append -- so without this a missing directory fails on the first line and
+# takes the whole chain with it.
+mkdir -p "$(dirname "$LOG")"
 
 newest_ckpt () {
   # newest numeric checkpoint dir across all generations, by mtime

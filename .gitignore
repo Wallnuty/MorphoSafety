@@ -185,4 +185,9 @@ MorphoSafetyToken.txt
 # this stops it from growing further. Existing large blobs stay in history
 # unless someone runs a filter-repo pass separately.
 checkpoints/
+# Training/eval logs (logs/). Per-run artifacts like checkpoints, not source.
+# NOTE: these are the only record of what a run actually did -- reward curves,
+# episode lengths, crash exit codes -- and being ignored they exist on ONE
+# machine. Copy anything you intend to cite in a writeup somewhere durable.
+logs/
 cluster/download.md
