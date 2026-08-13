@@ -281,7 +281,17 @@ def batch_models(mj_models: Sequence[mj.MjModel]) -> tuple[mjx.Model, mjx.Model]
 def build_batch(
     specs: Sequence[MorphologySpec],
     arena_spec: dict[str, ObjectSpec] | None = None,
+    integrator: str | None = None,
+    robot: str = "ant",
 ) -> tuple[mjx.Model, mjx.Model]:
+    """Compile every spec and stack them into one batched model.
+
+    `integrator` and `robot` are threaded through to `build_mj_model` rather
+    than defaulted here, because every model in a batch must be compiled
+    IDENTICALLY except for morphology -- a mismatched integrator or robot XML
+    changes topology, and `batch_models` would then either fail to stack or
+    silently produce a batch whose lanes are not comparable.
+    """
     mj_models = [
         build_mj_model(spec, arena_spec, integrator, robot) for spec in specs
     ]
@@ -331,7 +341,7 @@ def randomization_fn(
     seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
     np_rng = np.random.default_rng(seed)
     specs = [MorphologySpec.sample(np_rng) for _ in range(num_morphologies)]
-    batched, in_axes = build_batch(specs, arena_spec)
+    batched, in_axes = build_batch(specs, arena_spec, integrator, robot)
     genes = np.stack([s.genes for s in specs])  # (num_morphologies, NUM_GENES)
 
     batched = batched.tree_replace(
