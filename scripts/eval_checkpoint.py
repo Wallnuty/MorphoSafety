@@ -111,7 +111,7 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
         state = env.reset(jax.random.PRNGKey(seed))
 
         def decision(carry, _):
-            st, key = carry
+            st, key, alive = carry
             key, ak = jax.random.split(key)
             action, _ = policy_fn(st.obs, ak)
 
@@ -130,14 +130,29 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
                 return ns, (ns.reward, ns.info["cost"],
                             ns.info.get("out_of_bounds", zero),
                             ns.info.get("goal_reached", zero),
-                            jp.linalg.norm(d), d[1])
+                            jp.linalg.norm(d), d[1], ns.done)
 
             nst, inner_out = jax.lax.scan(inner, st, (), action_repeat)
+            *metrics, done = inner_out
             # summed over the repeat, matching CostEpisodeWrapper
-            return (nst, key), tuple(x.sum(axis=0) for x in inner_out)
+            summed = tuple(x.sum(axis=0) for x in metrics)
 
-        (st, _), (r, c, oob, goals, seglen, dy) = jax.lax.scan(
-            decision, (state, jax.random.PRNGKey(seed + 10_000)), (), n_decisions
+            # HONOUR TERMINATION. There is no auto-reset wrapper here, so
+            # env.step keeps integrating after `done` -- and with
+            # terminate_on_flip the ant flips at ~100 of 2500 steps, then
+            # spends the remaining 96% of the scan squirming on its back,
+            # accumulating reward and cost that training would never have
+            # collected. Everything after the first `done` is masked out
+            # instead, and `steps` records where the episode actually ended so
+            # it can be compared against eval/avg_episode_length.
+            still = alive * (1.0 - jp.clip(done.sum(), 0.0, 1.0))
+            masked = tuple(x * alive for x in summed)
+            return (nst, key, still), masked + (alive * action_repeat,)
+
+        (st, _, _), (r, c, oob, goals, seglen, dy, steps) = jax.lax.scan(
+            decision,
+            (state, jax.random.PRNGKey(seed + 10_000), jp.ones(())),
+            (), n_decisions,
         )
         # On RunForward, summed reward IS total +x displacement in metres,
         # exactly -- verified to 0.00e+00. RunForward deliberately carries no
@@ -146,17 +161,18 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
         # GoToGoal the return is shaped progress plus a +1 per goal, so it is
         # NOT a distance -- read `goals` there instead.
         return (r.sum(), c.sum(), oob.sum(), goals.sum(), r.sum(),
-                seglen.sum(), dy.sum())
+                seglen.sum(), dy.sum(), steps.sum())
 
     return jax.jit(jax.vmap(one))(jp.asarray(seeds))
 
 
 def summarise(name, out):
-    r, c, oob, goals, dist, path, dy = (np.asarray(x) for x in out)
+    r, c, oob, goals, dist, path, dy, steps = (np.asarray(x) for x in out)
     n = len(r)
     return {
         "name": name,
         "goals": goals.mean(),
+        "steps": steps.mean(),
         "distance": dist.mean(),
         "distance_se": dist.std(ddof=1) / np.sqrt(n),
         "cost": c.mean(),
@@ -238,7 +254,8 @@ def main() -> None:
     header = f"{'policy':<11}{ret_label:>13}"
     if goal_task:
         header += f"{'goals/ep':>10}"
-    header += f"{'path m':>9}{'|dy| m':>8}{'cost':>12}{'boundary':>10}{'hazard':>8}"
+    header += (f"{'steps':>8}{'path m':>9}{'|dy| m':>8}{'cost':>12}"
+               f"{'boundary':>10}{'hazard':>8}")
     print()
     print(header)
     print("-" * len(header))
@@ -247,7 +264,7 @@ def main() -> None:
         if goal_task:
             line += f"{row['goals']:>10.2f}"
         line += (
-            f"{row['path']:>9.2f}{row['lateral']:>8.2f}"
+            f"{row['steps']:>8.0f}{row['path']:>9.2f}{row['lateral']:>8.2f}"
             f"{row['cost']:>7.1f} +-{row['cost_se']:<4.1f}"
             f"{row['boundary']:>10.1f}{row['hazard']:>8.1f}"
         )
