@@ -2,7 +2,6 @@ import argparse
 import time
 from pathlib import Path
 import jax
-from jax import numpy as jp
 import numpy as np
 import mujoco
 from mujoco import mjx

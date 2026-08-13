@@ -357,13 +357,29 @@ def train(
         restored_penalizer_params = training_state.penalizer_params
         restored_optimizer_state = training_state.optimizer_state
 
+        # A FAILED RESTORE MUST NOT BE SILENT. Each of these blocks used to
+        # swallow its exception and leave the FRESHLY INITIALISED value in
+        # place, so a resume that could not read its checkpoint would train
+        # from scratch while every log line looked like a normal continuation.
+        # That matters most for the network params, and most of all under
+        # scripts/train_chain.sh, which resumes automatically across crashes:
+        # one unnoticed failure there silently discards every generation of
+        # progress. The layout fallbacks are still tolerated -- checkpoints
+        # written by older versions have a different element order -- but
+        # anything that falls through is reported.
         if len(loaded_params) >= 2:
             try:
                 restored_network_params = restore_state(
                     loaded_params[1], training_state.params
                 )
-            except Exception:
+            except Exception as exc:  # older layout: policy and value split
                 if len(loaded_params) >= 3:
+                    logging.warning(
+                        "Checkpoint network params did not match the current "
+                        "structure (%s); falling back to the split "
+                        "policy/value layout.",
+                        exc,
+                    )
                     restored_network_params = training_state.params.replace(  # type: ignore
                         policy=restore_state(
                             loaded_params[1], training_state.params.policy
@@ -372,20 +388,38 @@ def train(
                             loaded_params[2], training_state.params.value
                         ),
                     )
+                else:
+                    raise RuntimeError(
+                        f"Could not restore network parameters from "
+                        f"{restore_checkpoint_path}: {exc}. Refusing to "
+                        "continue, because the alternative is training from "
+                        "randomly initialised weights while appearing to "
+                        "resume."
+                    ) from exc
         if len(loaded_params) >= 3:
             try:
                 restored_penalizer_params = restore_state(
                     loaded_params[2], training_state.penalizer_params
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning(
+                    "Could not restore penalizer params (%s); starting the "
+                    "penalizer from its initial value. Expected when resuming "
+                    "a run trained under a different --penalizer.",
+                    exc,
+                )
         if len(loaded_params) >= 4:
             try:
                 restored_optimizer_state = restore_state(
                     loaded_params[3], training_state.optimizer_state
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning(
+                    "Could not restore optimizer state (%s); Adam moments "
+                    "restart from zero. Training continues from the restored "
+                    "weights, but expect a transient dip after the resume.",
+                    exc,
+                )
 
         training_state = training_state.replace(  # type: ignore
             normalizer_params=restored_normalizer,

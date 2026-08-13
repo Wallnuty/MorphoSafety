@@ -16,7 +16,6 @@ from mjx_safety_gym.mjx_env import State, step
 import mjx_safety_gym.lidar as lidar
 from mjx_safety_gym.morphology import NUM_GENES
 from mjx_safety_gym.world import (
-    _EXTENTS,
     ObjectSpec,
     _sample_layout,
     apply_integrator,
@@ -148,7 +147,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         self,
         robot: str = "point",
         vision: bool = False,
-        vision_config=default_vision_config(),
+        vision_config=None,
         morphology_conditioning: bool = False,
         integrator: str | None = None,
     ):
@@ -199,7 +198,12 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         self._post_init()
 
         self._vision = vision
-        self._vision_config = vision_config 
+        # Built per-instance rather than as an argument default: a
+        # ConfigDict default is constructed once at import and then
+        # SHARED by every env, so one env mutating it changes all of them.
+        self._vision_config = (
+            default_vision_config() if vision_config is None else vision_config
+        )
         if self._vision: 
             try:
                 # pylint: disable=import-outside-toplevel
