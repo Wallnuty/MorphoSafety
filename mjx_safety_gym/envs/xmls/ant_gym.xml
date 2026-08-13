@@ -67,11 +67,66 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
       n_substeps doubled. Euler is ~4x cheaper per step, so halving the step
       could still net ~2x over RK4 while restoring stability. Changes episode
       timing, so validate before adopting.
-    * condim 6 and the collision setup in which every limb geom collides. The
-      Gym ant sets contype=0 on everything but the feet, which would be faster,
-      but this repo's cost function detects vase contact via geoms_colliding()
-      on the limb geoms -- switching those off would silently zero the safety
-      signal.
+    * the collision setup in which every limb geom collides. The Gym ant sets
+      contype=0 on everything but the feet, which would be faster, but this
+      repo's cost function detects vase contact via geoms_colliding() on the
+      limb geoms -- switching those off would silently zero the safety signal.
+      (condim itself is NO LONGER inherited from ant.xml -- see below.)
+
+  CONDIM 3 + friction "1 0.5 0.5", ADOPTED 2026-08-13. REVERT CANDIDATE #1 IF
+  LOCOMOTION REGRESSES.
+
+    condim is how many dimensions of each contact the solver actually solves:
+    1 = normal only, 3 = + sliding, 4 = + torsional, 6 = + rolling. The
+    `friction` triple is the coefficients for exactly those dimensions, and
+    only the ones condim enables are read.
+
+    What this file used to have was the worst of both: condim 6, so the solver
+    paid for all six dimensions, with torsional/rolling left at MuJoCo's
+    defaults (0.005 / 0.0001) -- 100x and 5000x below the values the Gym ant
+    declares. Full price, almost no effect. Gym does the opposite: condim 3,
+    grip supplied by the sliding coefficient, which was already 1.0 in both.
+
+    Measured, random actions, 32 seeds, full episodes:
+
+        A was      (condim 6, 1/.005/.0001)  net +x -0.866+-0.67   55.2s
+        B grippy   (condim 6, 1/.5/.5)       net +x -1.376+-0.93   58.2s
+        C adopted  (condim 3, 1/.5/.5)       net +x +1.230+-0.73   34.3s
+
+    1.6x wall clock, and re-measured on the REAL wrapped training env (128
+    envs, action_repeat 4, through CostEpisodeWrapper + BraxAutoResetWrapper)
+    it is better than that: 856 -> 1,559 env-steps/s, 1.82x.
+
+    Friction is NOT a fix for the flipping -- upright fraction went 4.4% ->
+    9.1% -> 5.5% across those three, i.e. nowhere near the 94% inversion
+    problem the healthy bonus addresses.
+
+    STABILITY CHECKED THE WAY THE INTEGRATOR CHANGE SHOULD HAVE BEEN. Random
+    actions are a useless stability test here -- Euler passed them at 0% NaN
+    and then blew up at 16.7% under a scripted trot, because the blow-ups are
+    mid-frequency, i.e. exactly the gaits a working policy produces. So this
+    was swept over gait period instead: 16 seeds x 16 s of sim at trot periods
+    of 2/4/6/8/12/20 decisions, 0.0% NaN at every period.
+
+    SAFE FOR THE COST SIGNAL, and this is the part worth being sure about:
+    condim sets a contact's friction DIMENSIONALITY, not whether the contact is
+    DETECTED. get_cost reads geoms_colliding(), which asks whether the pair is
+    present in state.contact at all -- untouched by condim. This is exactly
+    unlike Gym's conaffinity=0 limb masking above, which removes the contacts
+    themselves and would zero the cost.
+
+    The floor geom is changed to match. A contact's condim is the MAX of the
+    two geoms', so leaving the floor at 6 would have silently kept every
+    robot-vs-floor contact at 6.
+
+    Our old condim 6 was inherited from safety-gym's Doggo, not chosen -- and
+    Doggo is a sprung, passively-stable design where the extra dimensions plausibly
+    do work. Nothing carried that justification over to a Gym-style ant.
+
+    IF SOMETHING BREAKS: this is a two-line revert (this file's <default> geom
+    and the floor geom, same in ant.xml). Symptoms that would implicate it:
+    feet skating or spinning in place, a gait that trained before failing to
+    train now, or per-vase cost dropping while contacts visibly happen.
     * joint ranges (hip +-0.70 rad, ankle 0.52..1.74 rad). These are WIDER than
       Gym's (+-30 deg, 30..70 deg), and measurably better here: 40.93 m of
       scripted-gait travel against 21.30 m for the literal Gym XML.
@@ -113,7 +168,9 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   </custom>
   <default>
     <joint armature="1" damping="1" limited="true"/>
-    <geom condim="6" density="5.0"/>
+    <!-- condim 3 + Gym's friction, adopted 2026-08-13. See the CONDIM note in
+         the header comment. Was condim="6" with MuJoCo's default friction. -->
+    <geom condim="3" friction="1 0.5 0.5" density="5.0"/>
     <site size="0.128" type="sphere"/>
   </default>
   <asset>
@@ -126,7 +183,10 @@ Copyright 2022-2023 OmniSafe Team. All Rights Reserved.
   </asset>
   <worldbody>
     <light cutoff="100" diffuse="1 1 1" dir="0 0 -1" directional="true" exponent="1" pos="0 0 2.0" specular="0 0 0" castshadow="false"/>
-    <geom name="floor" size="20 20 0.1" type="plane" condim="6" conaffinity="3" material="MatPlane"/>
+    <!-- condim MUST match the default class: a contact's condim is the MAX of
+         the two geoms', so a condim-6 floor would keep every robot-vs-floor
+         contact at 6 and the change below would buy nothing. -->
+    <geom name="floor" size="20 20 0.1" type="plane" condim="3" conaffinity="3" material="MatPlane"/>
     <body name="robot" pos="0 0 0.75">
       <site name="robot" rgba="1 0 0 .1" pos="0 0 -0.08"/>
       <camera name="vision" pos="0 0.2 0.2" euler="1.57 0 0" fovy="100"/>
