@@ -60,10 +60,19 @@ class CostEpisodeWrapper(brax_training.EpisodeWrapper):
 class Saute(Wrapper):
     """State-augmentation safety (https://arxiv.org/abs/2202.06558).
 
-    Ported from safe-learning/ss2r/benchmark_suites/wrappers.py:391. Wraps
-    *outside* the full vmap -> episode -> autoreset stack (i.e. around the
-    result of `wrap_for_brax_training`, not inside it) -- see
-    mjx_safety_gym.algorithms.train_ppo.
+    Ported from safe-learning/ss2r/benchmark_suites/wrappers.py:391.
+
+    WRAPS THE RAW ENV, INNERMOST -- *before* `wrap_for_brax_training`, not
+    around its result. Upstream wraps outside the whole stack and this docstring
+    used to say we did too; that arrangement CRASHES here, and did. Saute widens
+    the observation by one, and `CostEpisodeWrapper` carries `state` through its
+    own internal `jax.lax.scan` over `action_repeat`, re-invoking the INNER
+    (un-widened) env each iteration. With Saute outside, the scan's initial
+    carry is already widened while the body's output is not, and the trace dies
+    on step one with `float32[32,83]` vs `float32[32,76]` regardless of
+    action_repeat. Obs width must be final and stable before CostEpisodeWrapper
+    ever sees the env. See train_ppo.train() for the actual wiring and
+    MorphologyDomainRandomizationWrapper's docstring for the same constraint.
 
     `discounting` is accepted only to mirror upstream's constructor; upstream
     stores it and never reads it back, and neither does this port.

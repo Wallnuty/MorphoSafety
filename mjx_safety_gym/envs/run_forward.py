@@ -68,12 +68,28 @@ WHAT IS DELIBERATELY NOT HERE
     not by a frozen one, so a positive weight re-creates the very freeze
     attractor this task was written to escape. It is available as a parameter
     but defaults to 0.0; raise it only once the ant reliably walks.
-  * No "healthy"/alive bonus and no fall termination. Gym's Ant terminates
-    outside a torso-z range of (0.2, 1.0), but that threshold is tuned to a
-    robot whose torso radius is 0.25 m; safety-gymnasium's ant is 4x smaller and
-    settles at z ~= 0.13-0.16, so the same numbers would terminate it on the
-    first step. A flipped ant simply stops making progress, which this reward
-    already handles. Termination is left out rather than guessed at.
+  * No height-based termination. Gym's Ant terminates outside a torso-z range
+    of (0.2, 1.0), but that threshold is tuned to a robot whose torso radius is
+    0.25 m; safety-gymnasium's ant is 4x smaller and settles at z ~= 0.13-0.16,
+    so the same numbers would terminate it on the first step. See the posture
+    section below for what replaced it.
+
+WHAT WAS ADDED LATER, AND WHY (2026-08-12)
+------------------------------------------
+This module originally shipped with NO upright bonus and NO termination, on the
+reasoning that "a flipped ant simply stops making progress, which this reward
+already handles". THAT REASONING WAS WRONG, and measuring it is what unblocked
+the project: over 32 full episodes the ant was inverted for 94.4% of steps
+untrained and 94.1% after 1.5M steps of training. It does not stop making
+progress when flipped -- it crawls on its back, earning enough to have no
+gradient pressure to get up. Training moved uprightness by 0.3 points in 1.5M
+steps because nothing in the reward ever mentioned it.
+
+`healthy_reward` and `terminate_on_flip` (both defaulted ON for ants in
+train_ppo._ROBOT_DEFAULTS, OFF for the point) are the fix. Every working ant in
+safety-gymnasium, CRAX and Gym pairs this morphology with a healthy bonus AND
+termination; we had adopted the morphology alone. See the posture section
+below.
   * The goal body is NOT removed, even though nothing respawns it. It is parked
     once at the far end of the corridor as a fixed beacon. Keeping it holds the
     observation width identical to GoToGoal (76 for the ant), so networks,

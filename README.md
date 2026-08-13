@@ -27,8 +27,28 @@ pip install -e .
 pip install mjx-safety-gym
 ```
 
-## How to Use 
-For now, we have only implemented the simple Go-To-Goal environment. 
+## How to Use
+
+Two tasks and three robots ship here:
+
+| task (`--task`) | reward | notes |
+|---|---|---|
+| `goal` (`GoToGoal`) | shaped progress toward a randomly placed goal, `+1` per goal reached | the original environment |
+| `run` (`RunForward`) | `+x` displacement along an obstacle-strewn corridor | leaving the corridor is charged as **cost**, not walled off |
+
+| robot (`--robot`) | what it is |
+|---|---|
+| `point` | the original 2-DOF planar puck |
+| `ant` | safety-gym's ant: 42 kg, torque/kg 3.5 |
+| `ant_gym` | the standard Gym/Brax ant (0.911 kg, torque/kg 164.7) — `ant.xml` at 4x length scale without the ankle density hack |
+
+**`GoToGoal` is not learnable by the ant, and that is measured, not suspected.**
+Over 16 seeds, a scripted gait that walks several metres earns a return of
++0.078 ± 0.672 — statistically zero — because the goal sits in a uniformly
+random direction, so locomotion by itself is worth nothing and gait and
+steering must be discovered simultaneously. `RunForward` exists to remove that
+trap by making reward linear in position. See the `run_forward.py` module
+docstring for the full derivation.
 
 Most users will want to JIT-compile and vectorize (vmap) the environment’s reset and step functions in their training pipelines, allowing them to scale to thousands of parallel environments on GPU/TPU.  
 
@@ -80,22 +100,59 @@ chmod +x vision_setup.bash
 
 Other users can inspect it to see the dependencies required for vision-based support. Setup requires Linux with an NVIDIA GPU and may take several minutes.
 
+## Testing
+
+```bash
+pip install -e .[dev]
+pytest                 # ~6 minutes, all on the CPU backend
+pytest -m "not slow"   # skips the ant-physics compiles
+```
+
+**The suite runs on CPU deliberately** (`tests/conftest.py` sets
+`JAX_PLATFORMS`), so it never contends with a training run for the GPU — and
+because GPU rollouts here are not bitwise reproducible, since contact chaos
+amplifies float32 association differences.
+
+Every test corresponds to something that has actually gone wrong, and the class
+of bug it guards is the same each time: **silent** — no error, no NaN, no
+crash, just a subtly wrong number that took days to notice. Among them: a
+carried scalar in `state.info` corrupting reward at every episode boundary (a
+1000x outlier once per episode, in both environments); an evaluator that
+ignored `action_repeat` and so measured a quarter of an episode at four times
+the control rate; a relative `--checkpoint_logdir` that orbax rejects only at
+save time, after the training is done; an ant that spent 94% of every episode
+upside down because nothing in the reward mentioned being upright.
+
+Each test's docstring carries the measurement behind it. If one fails, read it
+before changing it.
+
 ## Repository Structure 
 ```
 mjx-safety-gym/
 ├── mjx_safety_gym
-│   ├── __init__.py              # Package entry
-│   ├── collision.py             # Collision handling
-│   ├── envs/
-│   │   ├── go_to_goal.py        # Example environment
-│   │   └── xmls/                # MuJoCo XML models
-│   │       └── point.xml
+│   ├── collision.py             # Contact lookup used by the cost function
 │   ├── lidar.py                 # Lidar sensor simulation
 │   ├── mjx_env.py               # Core MJX environment wrapper
-│   └── world.py                 # World generation
+│   ├── morphology.py            # Batched morphology models (MjSpec editing)
+│   ├── world.py                 # Arena generation (hazards, vases, goal)
+│   ├── envs/
+│   │   ├── go_to_goal.py        # Navigation task + robot configs
+│   │   ├── run_forward.py       # Corridor task (subclasses GoToGoal)
+│   │   └── xmls/                # point.xml, ant.xml, ant_gym.xml
+│   └── algorithms/
+│       ├── train_ppo.py         # CLI entry point, per-robot defaults
+│       ├── penalizers.py        # CRPO / Lagrangian
+│       ├── wrappers.py          # CostEpisodeWrapper, Saute, morphology
+│       └── ppo/                 # Cost-aware PPO (forked from brax)
 ├── scripts/
-│   └── interactive.py           # Interactive viewer (keyboard control)
-├── vision_setup.bash            # Vision-based setup (ETH Euler cluster specific)
+│   ├── interactive.py           # Interactive viewer (keyboard control)
+│   ├── eval_checkpoint.py       # Paired checkpoint-vs-untrained evaluation
+│   ├── evolve.py                # NSGA-II morphology search
+│   ├── train_chain.sh           # Auto-resuming training across crashes
+│   └── verify_contact_capping.py# Adversarial max_geom_pairs check
+├── tests/                       # See "Testing" above
+├── cluster/                     # SLURM sbatch jobs (Wits mscluster)
+├── main.py                      # Replay a checkpoint in the viewer
 ├── pyproject.toml               # Build + metadata
 ├── LICENSE
 └── README.md

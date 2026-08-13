@@ -522,24 +522,36 @@ def validate(args: argparse.Namespace) -> None:
             )
 
 
-def train(args: argparse.Namespace):
+def resolve_checkpoint_logdir(args: argparse.Namespace) -> Optional[Path]:
+    """Absolute checkpoint directory for this run, or None if disabled.
+
+    .resolve() is NOT cosmetic. orbax raises "Checkpoint path should be
+    absolute" from inside the save call, which happens at the FIRST EVAL -- i.e.
+    after all the compilation and, with a small --num_evals, potentially after
+    hours of training. A 1.5M-step run was lost to exactly this: it trained for
+    55 minutes, reported its final eval, and then threw on every checkpoint
+    write, leaving nothing on disk. The default from default_checkpoint_dir()
+    is already absolute; only a user-supplied relative --checkpoint_logdir could
+    trip it, which is the natural thing to type and is what every cluster script
+    here does.
+
+    Split out of `train()` so it is reachable without starting a training run --
+    a failure mode that only appears after the first eval is exactly the kind
+    that needs to be testable in a second. See tests/test_training_config.py.
+    """
     if args.no_checkpoint:
-        checkpoint_logdir = None
-    else:
-        # .resolve() is NOT cosmetic. orbax raises "Checkpoint path should be
-        # absolute" from inside the save call, which happens at the FIRST EVAL
-        # -- i.e. after all the compilation and, with a small --num_evals,
-        # potentially after hours of training. A 1.5M-step run was lost to
-        # exactly this: it trained for 55 minutes, reported its final eval, and
-        # then threw on every checkpoint write, leaving nothing on disk. The
-        # default from default_checkpoint_dir() is already absolute; only a
-        # user-supplied relative --checkpoint_logdir could trip it, which is the
-        # natural thing to type and is what every cluster script here does.
-        checkpoint_logdir = str(
-            Path(args.checkpoint_logdir).resolve()
-            if args.checkpoint_logdir
-            else default_checkpoint_dir(args.robot)
-        )
+        return None
+    return (
+        Path(args.checkpoint_logdir).resolve()
+        if args.checkpoint_logdir
+        else default_checkpoint_dir(args.robot)
+    )
+
+
+def train(args: argparse.Namespace):
+    resolved_logdir = resolve_checkpoint_logdir(args)
+    checkpoint_logdir = None if resolved_logdir is None else str(resolved_logdir)
+    if checkpoint_logdir is not None:
         print(f"Checkpoints: {checkpoint_logdir}")
 
     def build_env():
