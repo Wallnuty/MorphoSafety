@@ -23,7 +23,11 @@
 # or:            pkill -f train_chain.sh; pkill -f train_ppo    (immediate)
 set -u
 
-CHAIN="${1:-$PWD/checkpoints/ant_gym_upright_chain}"
+# Which robot to train. An env var rather than another positional, so existing
+# invocations keep working unchanged: ROBOT=ant scripts/train_chain.sh ...
+ROBOT="${ROBOT:-ant_gym}"
+
+CHAIN="${1:-$PWD/checkpoints/${ROBOT}_upright_chain}"
 SEED_CKPT="${2:-}"
 LOG="${3:-$PWD/logs/ant_gym_upright_chain.log}"
 STEPS_PER_GEN="${4:-5000000}"
@@ -58,13 +62,13 @@ while true; do
   {
     echo
     echo "############################################################"
-    echo "### GEN $gen  $(date)"
+    echo "### GEN $gen  $(date)   robot=$ROBOT"
     echo "### restore : ${restore:-<none, fresh start>}"
     echo "### write   : $outdir"
     echo "############################################################"
   } | tee -a "$LOG"
 
-  args=(--robot ant_gym --task run --penalizer none
+  args=(--robot "$ROBOT" --task run --penalizer none
         --num_timesteps "$STEPS_PER_GEN" --num_evals "$EVALS_PER_GEN"
         --num_eval_envs 8 --num_eval_episodes 2
         --checkpoint_logdir "$outdir")
