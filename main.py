@@ -141,7 +141,16 @@ if policy_fn is None:
     print(f"No checkpoint for '{ROBOT}' -- driving with random actions.")
 else:
     mode = "deterministic" if DETERMINISTIC else "stochastic"
-    print(f"Loaded {mode} policy from {ckpt_path}")
+    # Print the age, not just the path. The default lookup picks the newest
+    # checkpoint across every run directory for this robot, and "newest" is
+    # only meaningful if you can see how old it is -- a five-day-old
+    # checkpoint from a different task loads perfectly happily, since both
+    # tasks share an observation width.
+    age_h = (time.time() - ckpt_path.stat().st_mtime) / 3600
+    age = f"{age_h:.1f} h old" if age_h < 48 else f"{age_h / 24:.1f} days old"
+    print(f"Loaded {mode} policy from {ckpt_path}  ({age})")
+    if _args.checkpoint is None:
+        print("  (newest across all runs for this robot; override with --checkpoint)")
 
 print("Compiling reset/step...")
 start = time.time()

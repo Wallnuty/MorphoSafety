@@ -157,17 +157,68 @@ def default_checkpoint_dir(robot: str) -> Path:
     return CHECKPOINT_ROOT / robot
 
 
-def latest_checkpoint(robot: str) -> Optional[Path]:
-    """Newest checkpoint for `robot`, or None if nothing has been trained.
+def checkpoint_owner(dir_name: str) -> Optional[str]:
+    """Which robot a checkpoint directory belongs to, or None.
 
-    `brax.training.checkpoint.save` writes one zero-padded step directory per
-    eval, so the lexicographic max is also the newest.
+    A directory belongs to `robot` if it is named exactly `robot` or starts
+    with `robot_`. THE LONGEST MATCH WINS, and that is the whole point of this
+    function: `ant` is a prefix of `ant_gym`, so `ant_gym_upright_chain` would
+    otherwise be claimed by BOTH robots. Since the two ants share an
+    observation width (76) and action size (8), a mismatched checkpoint loads
+    without any error and silently replays the wrong robot's policy -- the
+    same silent-wrong-thing failure class as the stale-checkpoint problem this
+    function exists to fix.
+
+    Requiring the separator (not a bare `startswith`) keeps a hypothetical
+    `antelope` from being claimed by `ant`.
     """
-    root = default_checkpoint_dir(robot)
-    if not root.is_dir():
+    owners = [
+        r for r in _ROBOT_XMLS
+        if dir_name == r or dir_name.startswith(f"{r}_")
+    ]
+    return max(owners, key=len) if owners else None
+
+
+def latest_checkpoint(robot: str) -> Optional[Path]:
+    """Newest checkpoint for `robot` anywhere under CHECKPOINT_ROOT, or None.
+
+    Searches EVERY run directory belonging to the robot, not just
+    `checkpoints/<robot>/`. Runs land in per-experiment directories
+    (`ant_run_chain/gen3/`, `ant_gym_upright_5M/`, ...), so the old
+    `checkpoints/<robot>/`-only lookup silently replayed whatever last happened
+    to be written there -- in practice a 573k-step GoToGoal policy from five
+    days before the run the user actually wanted.
+
+    NEWEST IS BY MTIME, NOT BY STEP NUMBER. Every resumed run restarts its own
+    step counter at 0, so a chain's `gen5/000001679360` is *newer* training
+    than `gen4/000005038080` while sorting lower either lexicographically or
+    numerically. `scripts/train_chain.sh` picks its restore point the same way,
+    for the same reason.
+
+    Leaf step directories sit one level down for a plain run
+    (`ant/000000573440`) and two for a chain (`ant_run_chain/gen5/000001679360`),
+    so both depths are searched.
+    """
+    if not CHECKPOINT_ROOT.is_dir():
         return None
-    steps = sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit())
-    return steps[-1] if steps else None
+
+    candidates: list[Path] = []
+    for run_dir in CHECKPOINT_ROOT.iterdir():
+        if not run_dir.is_dir() or checkpoint_owner(run_dir.name) != robot:
+            continue
+        for child in run_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name.isdigit():
+                candidates.append(child)
+            else:  # a generation directory: look one level deeper
+                candidates.extend(
+                    g for g in child.iterdir() if g.is_dir() and g.name.isdigit()
+                )
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def wrap_for_brax_training(

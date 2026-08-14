@@ -148,6 +148,85 @@ def test_no_checkpoint_disables_the_logdir():
     assert train_ppo.resolve_checkpoint_logdir(args) is None
 
 
+# -- checkpoint discovery --------------------------------------------------
+
+
+def _make_ckpt(root, rel, mtime):
+    """Create a checkpoint leaf directory with a controlled mtime."""
+    import os
+
+    p = root / rel
+    p.mkdir(parents=True)
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_checkpoint_owner_prefers_the_longest_robot_name():
+    """`ant` is a prefix of `ant_gym`, and the two are interchangeable to orbax.
+
+    Both ants have observation width 76 and action size 8, so an ant_gym
+    checkpoint loaded as `ant` restores WITHOUT ERROR and silently replays the
+    wrong robot. Longest-match is what prevents it.
+    """
+    assert train_ppo.checkpoint_owner("ant") == "ant"
+    assert train_ppo.checkpoint_owner("ant_run_chain") == "ant"
+    assert train_ppo.checkpoint_owner("ant_573k_backup") == "ant"
+    assert train_ppo.checkpoint_owner("ant_gym") == "ant_gym"
+    assert train_ppo.checkpoint_owner("ant_gym_upright_chain") == "ant_gym"
+    assert train_ppo.checkpoint_owner("point_unconstrained") == "point"
+    # No separator, no match -- guards a future robot whose name extends another.
+    assert train_ppo.checkpoint_owner("antelope") is None
+    assert train_ppo.checkpoint_owner("unrelated") is None
+
+
+def test_latest_checkpoint_picks_newest_by_mtime_not_step_number(tmp_path, monkeypatch):
+    """Step numbers restart at 0 on every resume, so they do not order runs.
+
+    A chain's gen5/000001679360 is NEWER training than gen4/000005038080 while
+    sorting lower both lexicographically and numerically. The original
+    implementation took the lexicographic max within a single directory, which
+    gets this exactly backwards for any resumed run.
+    """
+    monkeypatch.setattr(train_ppo, "CHECKPOINT_ROOT", tmp_path)
+    _make_ckpt(tmp_path, "ant_run_chain/gen4/000005038080", mtime=1000)
+    newest = _make_ckpt(tmp_path, "ant_run_chain/gen5/000001679360", mtime=2000)
+
+    assert train_ppo.latest_checkpoint("ant") == newest
+
+
+def test_latest_checkpoint_searches_every_run_directory(tmp_path, monkeypatch):
+    """Runs land in per-experiment directories, not just checkpoints/<robot>/.
+
+    The old lookup only read `checkpoints/<robot>/`, so it replayed whatever
+    last happened to be written there -- in practice a 573k-step GoToGoal
+    policy five days older than the run actually wanted.
+    """
+    monkeypatch.setattr(train_ppo, "CHECKPOINT_ROOT", tmp_path)
+    _make_ckpt(tmp_path, "ant/000000573440", mtime=1000)
+    newest = _make_ckpt(tmp_path, "ant_run_chain/gen1/000001679360", mtime=2000)
+
+    assert train_ppo.latest_checkpoint("ant") == newest
+
+
+def test_latest_checkpoint_never_crosses_robots(tmp_path, monkeypatch):
+    """A newer ant_gym run must not be returned for `ant`, or vice versa."""
+    monkeypatch.setattr(train_ppo, "CHECKPOINT_ROOT", tmp_path)
+    ant = _make_ckpt(tmp_path, "ant_run_chain/gen1/000001679360", mtime=1000)
+    gym = _make_ckpt(tmp_path, "ant_gym_upright_chain/gen1/000003358720", mtime=9000)
+
+    assert train_ppo.latest_checkpoint("ant") == ant, (
+        "the newer ant_gym checkpoint was returned for --robot ant"
+    )
+    assert train_ppo.latest_checkpoint("ant_gym") == gym
+
+
+def test_latest_checkpoint_is_none_when_untrained(tmp_path, monkeypatch):
+    monkeypatch.setattr(train_ppo, "CHECKPOINT_ROOT", tmp_path)
+    assert train_ppo.latest_checkpoint("ant") is None
+    _make_ckpt(tmp_path, "ant_gym/000000010000", mtime=1000)
+    assert train_ppo.latest_checkpoint("ant") is None
+
+
 # -- action_repeat semantics -----------------------------------------------
 
 
