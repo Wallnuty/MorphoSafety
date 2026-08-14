@@ -86,24 +86,42 @@ def test_ants_get_an_upright_bonus_and_flip_termination():
         assert d["terminate_on_flip"] is True, f"{robot} does not terminate on flip"
 
 
-def test_healthy_bonus_cannot_be_farmed_by_freezing():
+# Best travel a SCRIPTED gait achieves for each robot, measured 2026-08-10 over
+# 50 s while sweeping gait period. This is the ceiling the upright bonus has to
+# stay well under -- and it differs 13x between the ants, because ant_gym has
+# 46x more torque per kg.
+_BEST_SCRIPTED_GAIT_M = {"ant": 3.03, "ant_gym": 40.93}
+
+
+@pytest.mark.parametrize("robot", sorted(_BEST_SCRIPTED_GAIT_M))
+def test_healthy_bonus_cannot_be_farmed_by_freezing(robot):
     """Sizing constraint, not a style preference.
 
-    A zero-action ant_gym was measured to stay upright for 100% of an episode,
-    so the bonus is fully collectable by doing NOTHING -- it re-creates the
-    freeze attractor that RunForward exists to escape if it is large enough to
-    compete with walking. An earlier 0.005/step paid a frozen ant 12.5 over an
-    episode, inside the range an early walking policy earns. Keep the
-    full-episode bonus well under the metres an early gait can travel.
+    A zero-action ant stays upright for 100% of an episode (measured, both
+    ants), so the bonus is fully collectable by doing NOTHING. If it is large
+    relative to what walking earns, it re-creates the very freeze attractor
+    RunForward exists to escape.
+
+    THE BONUS IS PAID PER INNER STEP, so a full episode pays
+    `healthy_reward * episode_length` -- NOT divided by action_repeat.
+    Confirmed exactly: a frozen ant at 0.002 returned 5.000 against
+    episode_length 2500. An earlier version of this test divided by
+    action_repeat, understating the bonus 4x, and consequently PASSED the
+    original ant at 0.002 -- where the bonus was 165% of everything its best
+    scripted gait could earn and a random policy scored 4.789 against a frozen
+    5.000. The threshold is relative to achievable travel for that reason: an
+    absolute cap cannot express "small compared to walking" for two robots
+    whose walking differs 13x.
     """
-    for robot in ("ant", "ant_gym"):
-        d = _ROBOT_DEFAULTS[robot]
-        per_episode = d["healthy_reward"] * d["episode_length"] / d["action_repeat"]
-        assert per_episode <= 5.0, (
-            f"{robot}: a frozen policy farms {per_episode:.1f} reward per episode "
-            "just by standing still. Reward on this task IS metres travelled, so "
-            "this competes directly with learning to walk."
-        )
+    d = _ROBOT_DEFAULTS[robot]
+    per_episode = d["healthy_reward"] * d["episode_length"]
+    ceiling = _BEST_SCRIPTED_GAIT_M[robot]
+    assert per_episode <= 0.25 * ceiling, (
+        f"{robot}: a frozen policy farms {per_episode:.2f} reward per episode, "
+        f"which is {100 * per_episode / ceiling:.0f}% of the {ceiling} m its best "
+        "scripted gait travels. Reward on this task IS metres travelled, so a "
+        "bonus this size competes directly with learning to walk."
+    )
 
 
 # -- checkpoint paths ------------------------------------------------------

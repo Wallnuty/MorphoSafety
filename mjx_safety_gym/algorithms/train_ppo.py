@@ -95,7 +95,25 @@ _ROBOT_DEFAULTS = {
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
-        "healthy_reward": 0.002, "terminate_on_flip": True,
+        # 0.0002, NOT ant_gym's 0.002, and that 10x is measured rather than
+        # taste. The bonus is paid per INNER step, so a full episode pays
+        # healthy_reward * episode_length -- 5.000 at 0.002, confirmed exactly
+        # by rolling out a zero-action policy. Against ant_gym's best scripted
+        # gait (40.93 m) that is 12% of what locomotion can earn. Against THIS
+        # ant's best scripted gait (3.03 m, it has 46x less torque per kg) the
+        # same 0.002 pays 165% of everything walking could ever earn, and a
+        # random policy measured 4.789 against a frozen 5.000 -- i.e. the
+        # reward was almost entirely a constant collected for existing. That is
+        # exactly the freeze attractor RunForward exists to escape.
+        #
+        # 0.0002 pays 0.5/episode = 16% of achievable, matching ant_gym's ratio.
+        #
+        # terminate_on_flip stays ON but is nearly inert here and that is fine:
+        # this ant flipped in 0.0% of zero-action and 12.5% of random-action
+        # seeds, against ant_gym's 94% inversion. The upright problem is
+        # ant_gym's, caused by its torque; this is cheap insurance in case a
+        # trained policy moves fast enough to tip itself.
+        "healthy_reward": 0.0002, "terminate_on_flip": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period and horizon apply.
