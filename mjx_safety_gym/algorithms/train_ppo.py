@@ -116,11 +116,53 @@ _ROBOT_DEFAULTS = {
         "healthy_reward": 0.0002, "terminate_on_flip": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
-    # similar (0.5 s vs 0.4 s), so the same control period and horizon apply.
-    # It travels far more per second, which episode_length does not need to
-    # change for -- 50 s is ~20-40 m for it, matching the 48 m default corridor.
+    # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
+    # far more per second, which episode_length does not need to change for --
+    # 50 s is ~20-40 m for it, matching the 48 m default corridor.
+    #
+    # DISCOUNTING 0.995, NOT THE 0.97 SHARED WITH ant. THIS IS THE FIX FOR
+    # SPRINT-AND-FLIP AND IT IS NOT A REWARD CHANGE.
+    #
+    # Measured: at its best, ant_gym scored episode_reward 8.77 with
+    # avg_episode_length 101.5 out of 2500 -- it terminates at 4% of the
+    # episode. That is 2.0 s of sim, i.e. 4.32 m/s. It is not walking, it is
+    # launching itself and falling over. The bonus is only 0.20 of that 8.77,
+    # so the reward COEFFICIENTS are not what produces this.
+    #
+    # The discount factor is. At 0.97 with a 0.08 s control period the horizon
+    # is 1/(1-g) = 33 decisions = 2.7 s, and the ant survives 25 decisions =
+    # 2.0 s -- its planning horizon barely outlasts its own lifespan, and
+    # reaching the end of the episode is discounted by 0.97^625 = 5.4e-09. The
+    # ~41 m available from staying upright is INVISIBLE to the value function.
+    # Comparing discounted values of the two strategies (sprint 0.338
+    # m/decision for 25 decisions then terminate, vs a sustained 0.066
+    # m/decision for all 625):
+    #
+    #     gamma   horizon    sprint V   walk V   better
+    #     0.970     2.7 s       6.06     2.19   sprint   <- was here
+    #     0.990     8.0 s       7.60     6.55   sprint
+    #     0.995    16.0 s       8.06    12.55   WALK     <- now here
+    #     0.998    40.0 s       8.36    23.41   WALK
+    #
+    # Undiscounted the ordering is never in doubt (8.6 m vs 41.0 m). PPO was
+    # optimising the objective we gave it correctly; the objective was wrong.
+    # 0.995 is the first value that flips the ordering, with margin, without
+    # going to 0.998 where value-function variance gets unpleasant.
+    #
+    # The old 0.97 was chosen so the horizon covered "about seven gait cycles
+    # at the measured 0.4 s best gait period" -- sound for LEARNING A GAIT, and
+    # silent about SURVIVING AN EPISODE. That tradeoff only became visible once
+    # terminate_on_flip existed, which came later.
+    #
+    # ant stays at 0.97 deliberately: it runs 2100-2500 steps, so it is not
+    # dying inside its horizon and this argument does not apply to it. Change
+    # one robot at a time.
+    #
+    # NOT YET VALIDATED. Raising gamma raises return variance and value bias,
+    # so a run may look worse before better. The matched A/B is against the
+    # 8.77 m checkpoint in checkpoints/ant_gym_upright_chain/gen1.
     "ant_gym": {
-        "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
+        "action_repeat": 4, "episode_length": 2500, "discounting": 0.995,
         # 0.002/step is ~5 over a full 2500-step episode. Sized against what a
         # FROZEN policy can farm, not against the best gait: measured, a
         # zero-action ant_gym stays upright 100% of the episode, so the bonus
