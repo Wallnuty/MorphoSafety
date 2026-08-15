@@ -54,6 +54,7 @@ from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms import train_ppo
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.envs.run_forward import RunForward
+from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
 
 
@@ -190,7 +191,7 @@ def summarise(name, out):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--robot", default="ant_gym")
-    ap.add_argument("--task", choices=["run", "goal"], default="run")
+    ap.add_argument("--task", choices=["run", "minefield", "goal"], default="run")
     ap.add_argument("--checkpoint", default="checkpoints/ant_gym_run")
     ap.add_argument("--episodes", type=int, default=128)
     ap.add_argument(
@@ -207,10 +208,8 @@ def main() -> None:
     args = ap.parse_args()
 
     jax_cache.configure()
-    env = (
-        RunForward(robot=args.robot)
-        if args.task == "run"
-        else GoToGoal(robot=args.robot)
+    env = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}[args.task](
+        robot=args.robot
     )
     seeds = np.arange(args.episodes) + 1000  # common random numbers across arms
 

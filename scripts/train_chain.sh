@@ -27,6 +27,12 @@ set -u
 # invocations keep working unchanged: ROBOT=ant scripts/train_chain.sh ...
 ROBOT="${ROBOT:-ant_gym}"
 
+# Which task. Same reasoning as ROBOT. 'minefield' is 'run' with no vases and
+# twice the hazards -- measured 3.1x faster at 256 envs because vases are the
+# only dynamic bodies in the scene (~82% of nq). Use it to iterate:
+#   TASK=minefield ROBOT=ant scripts/train_chain.sh ...
+TASK="${TASK:-run}"
+
 CHAIN="${1:-$PWD/checkpoints/${ROBOT}_upright_chain}"
 SEED_CKPT="${2:-}"
 LOG="${3:-$PWD/logs/ant_gym_upright_chain.log}"
@@ -62,13 +68,13 @@ while true; do
   {
     echo
     echo "############################################################"
-    echo "### GEN $gen  $(date)   robot=$ROBOT"
+    echo "### GEN $gen  $(date)   robot=$ROBOT task=$TASK"
     echo "### restore : ${restore:-<none, fresh start>}"
     echo "### write   : $outdir"
     echo "############################################################"
   } | tee -a "$LOG"
 
-  args=(--robot "$ROBOT" --task run --penalizer none
+  args=(--robot "$ROBOT" --task "$TASK" --penalizer none
         --num_timesteps "$STEPS_PER_GEN" --num_evals "$EVALS_PER_GEN"
         --num_eval_envs 8 --num_eval_episodes 2
         --checkpoint_logdir "$outdir")

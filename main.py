@@ -14,6 +14,7 @@ from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import latest_checkpoint
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
 import mjx_safety_gym.lidar as lidar
 
@@ -24,10 +25,10 @@ _parser = argparse.ArgumentParser(
 _parser.add_argument("--robot", choices=sorted(_ROBOT_XMLS), default="point")
 _parser.add_argument(
     "--task",
-    choices=["goal", "run"],
+    choices=["goal", "run", "minefield"],
     default="goal",
-    help="Must match the task the checkpoint was trained on. Both tasks give "
-    "the same observation width, so a mismatch loads cleanly and replays a "
+    help="Must match the task the checkpoint was trained on. All three tasks "
+    "give the same observation width, so a mismatch loads cleanly and replays a "
     "policy against a world it was never trained in.",
 )
 _parser.add_argument(
@@ -69,7 +70,8 @@ DETERMINISTIC = _args.deterministic
 jax_cache.configure()
 
 # Create environment
-env = RunForward(robot=ROBOT) if _args.task == "run" else GoToGoal(robot=ROBOT)
+_TASKS = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
+env = _TASKS[_args.task](robot=ROBOT)
 rng = jax.random.PRNGKey(_args.seed)
 
 # Reset environment

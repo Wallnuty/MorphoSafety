@@ -59,6 +59,14 @@ def go_to_goal_point():
 
 
 @pytest.fixture(scope="session")
+def minefield_point():
+    """Minefield with the point robot -- RunForward's arena minus the vases."""
+    from mjx_safety_gym.envs.minefield import Minefield
+
+    return Minefield(robot="point")
+
+
+@pytest.fixture(scope="session")
 def run_forward_ant():
     """ant_gym on RunForward -- the configuration actually being trained."""
     from mjx_safety_gym.envs.run_forward import RunForward

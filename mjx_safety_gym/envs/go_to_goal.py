@@ -150,6 +150,8 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         vision_config=None,
         morphology_conditioning: bool = False,
         integrator: str | None = None,
+        num_hazards: int = 10,
+        num_vases: int = 10,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -162,11 +164,19 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # overlapping the obstacles it is supposed to avoid.
         self._arena_scale = float(_ROBOT_CONFIGS[robot]["arena_scale"])
         a = self._arena_scale
+        # Counts are parameters rather than literals so a subclass can drop a
+        # whole obstacle class. That is not cosmetic: vases are the only
+        # DYNAMIC obstacles (one free joint each = 7 qpos / 6 qvel), so at the
+        # default 10 they are ~82% of nq and ~81% of nv for the ant -- the
+        # single largest term in per-step physics cost. Hazards are mocap
+        # bodies with contype=conaffinity=0, contributing no DOFs and no
+        # contacts at all, so they are nearly free by comparison. See
+        # envs/minefield.py, which takes exactly that trade.
         self.spec = {
             "robot": ObjectSpec(0.4 * a, 1),
             "goal": ObjectSpec(0.305 * a, 1),
-            "hazards": ObjectSpec(0.18 * a, 10),
-            "vases": ObjectSpec(0.15 * a, 10),
+            "hazards": ObjectSpec(0.18 * a, int(num_hazards)),
+            "vases": ObjectSpec(0.15 * a, int(num_vases)),
         }
 
         mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
@@ -378,8 +388,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
         # TODO: probably could just use xpos with self._obstacle_body_ids instead of mocap_pos as well - it seems to work
         rng, goal_key = jax.random.split(rng)
-        hazard_pos = data.mocap_pos[jp.array(self._hazard_mocap_id)][:, :2]
-        vases_pos = data.xpos[jp.array(self._vase_body_ids)][:, :2]
+        # `jp.array([])` is float32, and indexing with a float array raises --
+        # so an obstacle class set to 0 (reachable since num_hazards/num_vases
+        # became parameters) has to short-circuit rather than fall through.
+        def _xy(positions, ids):
+            return positions[jp.array(ids)][:, :2] if ids else jp.zeros((0, 2))
+
+        hazard_pos = _xy(data.mocap_pos, self._hazard_mocap_id)
+        vases_pos = _xy(data.xpos, self._vase_body_ids)
         other_xy = jp.vstack([hazard_pos, vases_pos])
 
         hazard_keepout = jp.full((hazard_pos.shape[0],), self.spec["hazards"].keepout)
@@ -423,18 +439,26 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         return radius.astype(jp.float32), half_len.astype(jp.float32)
 
     def get_cost(self, data: mjx.Data) -> jax.Array:
-        # Check if any robot geom collides with any vase or pillar
-        colliding_obstacles = jp.array(
-            [
-                jp.any(
-                    jp.array([
-                        geoms_colliding(data, geom, robot_geom)
-                        for robot_geom in self._robot_collision_geom_ids
-                    ])
-                )
-                for geom in self._collision_obstacle_geoms_ids
-            ]
-        )
+        # Check if any robot geom collides with any vase or pillar.
+        # Skipped entirely when there are no collidable obstacles (see
+        # envs/minefield.py): the comprehension would otherwise emit
+        # `jp.array([])`, which sums to 0.0 correctly but only by accident of
+        # float32 being the default empty dtype. A python-level branch on a
+        # count fixed at __init__ is trace-time, so this costs nothing.
+        if self._collision_obstacle_geoms_ids:
+            collision_cost = jp.sum(
+                jp.array([
+                    jp.any(
+                        jp.array([
+                            geoms_colliding(data, geom, robot_geom)
+                            for robot_geom in self._robot_collision_geom_ids
+                        ])
+                    )
+                    for geom in self._collision_obstacle_geoms_ids
+                ])
+            )
+        else:
+            collision_cost = jp.zeros(())
 
         # Hazard distance, measured from the robot's surface rather than a single
         # torso point (see _post_init) so that limbs entering a hazard are caught.
@@ -460,9 +484,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # jax.debug.print("Hazard distances: {dist}", dist=hazard_distances)
 
         # Compute cost: Add cost for collisions and proximity to hazards
-        cost = jp.sum(colliding_obstacles) + jp.sum(
-            hazard_distances <= self._hazard_radius
-        )
+        cost = collision_cost + jp.sum(hazard_distances <= self._hazard_radius)
 
         return cost.astype(jp.float32)
 

@@ -34,6 +34,7 @@ from mjx_safety_gym.algorithms.wrappers import (
     Saute,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
 
 
@@ -404,7 +405,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--task",
-        choices=["goal", "run"],
+        choices=["goal", "run", "minefield"],
         default="goal",
         help="'goal' is the original navigate-to-a-respawning-goal task. 'run' "
         "is RunForward: start at one end of a corridor and get as far in +x as "
@@ -413,7 +414,24 @@ def build_argparser() -> argparse.ArgumentParser:
         "so undirected motion has negative expected return while freezing scores "
         "0, and the trained ant converged to standing still (0.011 m/episode vs "
         "0.313 m for random actions). 'run' rewards x-displacement, which is "
-        "LINEAR, so exploration is free. See envs/run_forward.py.",
+        "LINEAR, so exploration is free. See envs/run_forward.py. 'minefield' is "
+        "'run' with NO VASES and twice the hazards: same reward, same corridor, "
+        "same observation width, but every dynamic body is gone (vases are ~82%% "
+        "of nq for the ant), which is a large throughput win. Use 'minefield' to "
+        "iterate and 'run' once things work -- see envs/minefield.py for what "
+        "the weaker cost signal gives up.",
+    )
+    parser.add_argument(
+        "--num_hazards",
+        type=int,
+        default=None,
+        help="[--task minefield] Hazards scattered along the corridor. Defaults "
+        "to 20, which keeps the obstacle COUNT equal to 'run' (10 hazards + 10 "
+        "vases) so the corridor is not made emptier by dropping the vases, only "
+        "cheaper. Hazards are mocap bodies with no DOFs and no contacts, so "
+        "raising this is close to free in physics -- it costs one more row in "
+        "get_cost's distance matrix. Placement is rejection-sampled with a "
+        "bounded retry, so very high counts silently start overlapping.",
     )
     parser.add_argument(
         "--corridor_length",
@@ -671,8 +689,8 @@ def train(args: argparse.Namespace):
             morphology_conditioning=bool(args.num_morphologies),
             integrator=args.integrator,
         )
-        if args.task == "run":
-            return RunForward(
+        if args.task in ("run", "minefield"):
+            corridor = dict(
                 corridor_length=args.corridor_length,
                 corridor_half_width=args.corridor_half_width,
                 forward_reward_weight=args.forward_reward_weight,
@@ -682,6 +700,11 @@ def train(args: argparse.Namespace):
                 terminate_on_flip=args.terminate_on_flip,
                 **common,
             )
+            if args.task == "minefield":
+                # None lets Minefield apply its own default rather than this
+                # module deciding the count in two places.
+                return Minefield(num_hazards=args.num_hazards, **corridor)
+            return RunForward(**corridor)
         return GoToGoal(**common)
 
     env = build_env()
