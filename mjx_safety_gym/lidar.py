@@ -81,12 +81,27 @@ def add_lidar_rings(spec: mj.MjSpec):
             )
 
 
-def update_lidar_rings(lidar_values: jax.Array, model: mj.MjModel):
-    obstacle_lidar, goal_lidar, object_lidar = lidar_values
+def update_lidar_rings(lidar_values: jax.Array, model: mj.MjModel, groups=None):
+    """Light up the viewer's lidar rings from an observation slice.
+
+    `groups` names which rings `lidar_values` holds, in order, and must match
+    whatever the env actually put in the observation -- envs no longer
+    necessarily emit all of LIDAR_GROUPS (see GoToGoal's `lidar_groups`). It
+    defaults to all of them for callers that still pass a full stack.
+
+    Note the SITES for every group exist regardless; only the observation
+    shrinks. Sites are visual and collide with nothing, so leaving the unused
+    rings in the model costs nothing and keeps model structure stable across
+    configurations. They simply stay dark.
+    """
+    groups = LIDAR_GROUPS if groups is None else list(groups)
+    if len(lidar_values) != len(groups):
+        raise ValueError(
+            f"got {len(lidar_values)} lidar rings for groups {groups} -- the "
+            f"caller sliced the observation with the wrong ring count"
+        )
     # Update data just for viewer
-    for lidars, category in zip(
-        [obstacle_lidar, goal_lidar, object_lidar], LIDAR_GROUPS
-    ):
+    for lidars, category in zip(lidar_values, groups):
         for i, value in enumerate(lidars):
             lidar_site_id = model.site(f"lidar_{category}_{i}").id
             model.site_rgba[lidar_site_id][3] = min(1.0, value + 0.1)  # Change alpha

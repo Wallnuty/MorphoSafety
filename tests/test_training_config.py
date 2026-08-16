@@ -65,10 +65,18 @@ def test_point_defaults_are_frozen():
     These three values were bit-identical before and after `_ROBOT_DEFAULTS`
     was introduced, deliberately, so that point baselines stayed valid across
     that change. Anything that edits them invalidates comparisons silently.
+
+    goal_reward_weight/goal_observation were added later for the ants, which
+    could not tell which way to run. They are pinned OFF here so the point's
+    reward AND its observation width both stay exactly what its baselines were
+    trained against -- goal_observation is width-changing, so a stray True
+    would invalidate every point checkpoint rather than merely shift its
+    reward.
     """
     assert _ROBOT_DEFAULTS["point"] == {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
+        "goal_reward_weight": 0.0, "goal_observation": False,
     }
 
 
@@ -303,14 +311,57 @@ def test_observation_size_matches_the_actual_observation(robot):
     assert obs.shape == (env.observation_size,)
 
 
-def test_run_forward_keeps_go_to_goal_observation_width():
-    """RunForward parks the goal instead of deleting it, specifically so that
-    obs width matches GoToGoal and checkpoints/networks stay interchangeable.
+def test_corridor_tasks_carry_only_the_obstacle_ring():
+    """The corridor tasks emit ONE lidar ring; GoToGoal still emits three.
+
+    Supersedes an earlier test that asserted RunForward and GoToGoal share a
+    width. That parity was deliberately given up on 2026-08-15: measured over
+    10,000 real observations from a trained ant, RunForward's goal ring was live
+    in ZERO of them (the goal is parked 11 m away against LIDAR_MAX_DIST = 2.0)
+    and the object ring is never populated in any task. Together they were 32
+    constant entries -- 42% of the observation.
+
+    GoToGoal keeps all three because its goal genuinely moves and comes into
+    range, so dropping the ring there would delete real information AND
+    invalidate the only converged baselines this project has.
     """
     from mjx_safety_gym.envs.go_to_goal import GoToGoal
+    from mjx_safety_gym.envs.minefield import Minefield
     from mjx_safety_gym.envs.run_forward import RunForward
+    from mjx_safety_gym import lidar
 
     for robot in ("point", "ant_gym"):
-        assert RunForward(robot=robot).observation_size == GoToGoal(
-            robot=robot
-        ).observation_size
+        run, goal = RunForward(robot=robot), GoToGoal(robot=robot)
+        assert run.lidar_groups == ("obstacle",)
+        assert tuple(goal.lidar_groups) == tuple(lidar.LIDAR_GROUPS)
+        # Exactly two rings' worth narrower, and nothing else moved.
+        assert (
+            goal.observation_size - run.observation_size == 2 * lidar.NUM_LIDAR_BINS
+        )
+        # run and minefield MUST still match: warm-starting run from a
+        # minefield policy is the entire reason minefield exists.
+        assert Minefield(robot=robot).observation_size == run.observation_size
+
+
+def test_dropping_a_lidar_ring_narrows_the_observation_by_one_ring():
+    """observation_size must track lidar_groups, or the network is built at
+    one width and fed another."""
+    from mjx_safety_gym.envs.run_forward import RunForward
+    from mjx_safety_gym import lidar
+
+    one = RunForward(robot="point", lidar_groups=("obstacle",))
+    three = RunForward(robot="point", lidar_groups=lidar.LIDAR_GROUPS)
+    assert three.observation_size - one.observation_size == 2 * lidar.NUM_LIDAR_BINS
+
+    obs = jax.jit(three.reset)(jax.random.PRNGKey(0)).obs
+    assert obs.shape == (three.observation_size,)
+
+
+def test_an_empty_or_unknown_lidar_group_is_rejected():
+    """Silently blind or silently mis-sliced are both worse than a crash."""
+    from mjx_safety_gym.envs.run_forward import RunForward
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        RunForward(robot="point", lidar_groups=())
+    with pytest.raises(ValueError, match="unknown lidar group"):
+        RunForward(robot="point", lidar_groups=("obstacle", "hazards"))

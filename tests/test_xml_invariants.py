@@ -157,3 +157,76 @@ def test_point_physics_is_untouched_by_ant_changes():
     model = _compiled("point")
     assert set(model.geom_condim.tolist()) == {6}
     np.testing.assert_allclose(model.geom_friction[0], [1.0, 0.005, 0.0001])
+
+
+@pytest.mark.parametrize("robot", ANTS)
+def test_leading_legs_are_the_dark_ones(robot):
+    """The dark pair must be the legs at +x, NOT the ones named `front_*`.
+
+    The colour scheme is white torso, gray legs, white feet, with the leading
+    pair darker so the ant's facing direction is readable in the viewer. The
+    trap it guards is a naming one: this XML calls legs 1 and 2
+    `front_left_leg`/`front_right_leg`, inherited from the Gym ant, but that
+    naming refers to +y. The direction this task rewards is +x, so the legs
+    actually at the front are 1 and 4. Colouring by name marks one leading and
+    one trailing leg -- a cue pointing 45 degrees off, with nothing in the
+    render to reveal it.
+
+    So "front" is derived here from the compiled foot positions, the same way
+    the colours were chosen, rather than from any name.
+    """
+    model = _compiled(robot)
+    data = mj.MjData(model)
+    mj.mj_forward(model, data)
+
+    upper = {  # the two gray segments of each leg
+        1: ("aux_1_geom", "left_leg_geom"),
+        2: ("aux_2_geom", "right_leg_geom"),
+        3: ("aux_3_geom", "back_leg_geom"),
+        4: ("aux_4_geom", "rightback_leg_geom"),
+    }
+    feet = {
+        1: "left_ankle_geom", 2: "right_ankle_geom",
+        3: "third_ankle_geom", 4: "fourth_ankle_geom",
+    }
+
+    white = np.array([1.0, 1.0, 1.0])
+    np.testing.assert_allclose(
+        model.geom("torso_geom").rgba[:3], white, atol=1e-6,
+        err_msg=f"{robot}: torso should be white",
+    )
+    for leg, foot in feet.items():
+        np.testing.assert_allclose(
+            model.geom(foot).rgba[:3], white, atol=1e-6,
+            err_msg=f"{robot}: foot of leg {leg} should be white",
+        )
+
+    shade = {}
+    for leg, geoms in upper.items():
+        rgbas = [model.geom(g).rgba for g in geoms]
+        np.testing.assert_allclose(
+            rgbas[1], rgbas[0], atol=1e-6,
+            err_msg=f"{robot}: leg {leg}'s two segments differ",
+        )
+        r, g, b = rgbas[0][:3]
+        assert r == g == b, f"{robot}: leg {leg} is not greyscale"
+        assert 0.0 < r < 1.0, f"{robot}: leg {leg} is not gray (got {r})"
+        shade[leg] = float(r)
+
+    # Which legs lead is read off the model, never off the names.
+    leading = {leg for leg, foot in feet.items()
+               if data.geom_xpos[model.geom(foot).id][0] > 0}
+    assert leading == {1, 4}, (
+        f"{robot}: geometry changed -- the legs at +x are now {sorted(leading)}, "
+        f"so the colour assignment needs revisiting"
+    )
+    trailing = {1, 2, 3, 4} - leading
+
+    assert len({shade[l] for l in leading}) == 1, f"{robot}: leading legs differ"
+    assert len({shade[l] for l in trailing}) == 1, f"{robot}: trailing legs differ"
+    lead_shade, trail_shade = shade[min(leading)], shade[min(trailing)]
+    assert lead_shade < trail_shade, (
+        f"{robot}: the leading legs (at +x) are {lead_shade} and the trailing "
+        f"ones {trail_shade} -- the front is supposed to be the DARKER pair, so "
+        f"the facing cue currently points backwards"
+    )

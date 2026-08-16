@@ -33,6 +33,13 @@ ROBOT="${ROBOT:-ant_gym}"
 #   TASK=minefield ROBOT=ant scripts/train_chain.sh ...
 TASK="${TASK:-run}"
 
+# Stop after this many generations, i.e. after MAX_GENS * STEPS_PER_GEN steps.
+# 0 (the default) means run forever, which is the original behaviour and the
+# right one when you just want it to keep going until you say stop. A finite
+# budget matters when two chains share one GPU: without it the first never
+# yields and the second never starts.
+MAX_GENS="${MAX_GENS:-0}"
+
 CHAIN="${1:-$PWD/checkpoints/${ROBOT}_upright_chain}"
 SEED_CKPT="${2:-}"
 LOG="${3:-$PWD/logs/ant_gym_upright_chain.log}"
@@ -59,6 +66,14 @@ while true; do
   fi
 
   gen=$((gen + 1))
+  # Checked on the generation NUMBER, not on a step counter, because each
+  # generation restarts its own counter at 0 -- there is no cumulative step
+  # count to test against without summing the log.
+  if [ "$MAX_GENS" -gt 0 ] && [ "$gen" -gt "$MAX_GENS" ]; then
+    echo "=== reached MAX_GENS=$MAX_GENS ($((MAX_GENS * STEPS_PER_GEN)) steps), exiting chain ===" | tee -a "$LOG"
+    break
+  fi
+
   outdir="$CHAIN/gen$gen"
   [ -d "$outdir" ] && continue   # already used, skip to a fresh number
 

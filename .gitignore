@@ -189,5 +189,5 @@ checkpoints/
 # NOTE: these are the only record of what a run actually did -- reward curves,
 # episode lengths, crash exit codes -- and being ignored they exist on ONE
 # machine. Copy anything you intend to cite in a writeup somewhere durable.
-logs/
 cluster/download.md
+logs/

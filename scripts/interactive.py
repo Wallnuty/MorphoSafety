@@ -121,10 +121,15 @@ def _main(argv: Sequence[str]) -> None:
                 ctrl = jp.array(VIEWERGLOBAL_STATE["ctrl"])
                 state = step_fn(state, ctrl)
 
-            # Update the lidar rings
+            # Update the lidar rings. Sliced by the env's own ring count, not a
+            # hardcoded 3 -- the corridor tasks emit only the obstacle ring.
+            n_rings = len(task.lidar_groups)
             lidar.update_lidar_rings(
-                state.obs[: 3 * lidar.NUM_LIDAR_BINS].reshape(3, lidar.NUM_LIDAR_BINS),
+                state.obs[: n_rings * lidar.NUM_LIDAR_BINS].reshape(
+                    n_rings, lidar.NUM_LIDAR_BINS
+                ),
                 m,
+                task.lidar_groups,
             )
 
             mjx.get_data_into(d, m, state.data)

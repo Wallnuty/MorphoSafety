@@ -101,21 +101,31 @@ def test_obstacle_counts_are_parameters_not_literals():
 # -- the invariant that makes checkpoints portable -------------------------
 
 
-def test_all_three_tasks_share_an_observation_width(
+def test_minefield_and_run_share_an_observation_width(
     minefield_point, run_forward_point, go_to_goal_point
 ):
     """Lidar is binned by RING, never by object count.
 
-    This is what lets a policy trained on minefield warm-start run without
-    network surgery -- the whole point of iterating on the fast task. It would
-    break the moment anything task-specific were appended to the observation.
+    Minefield has 20 hazards where run has 10 hazards + 10 vases, and both
+    produce the same width, because a ring folds any number of objects into a
+    fixed 16 bins. That is what lets a policy trained on minefield warm-start
+    run without network surgery -- the whole point of iterating on the fast
+    task.
+
+    GoToGoal is NO LONGER in this set. It keeps all three lidar rings while the
+    corridor tasks were narrowed to the obstacle ring alone on 2026-08-15, so
+    it is two rings wider by design. See
+    test_training_config.test_corridor_tasks_carry_only_the_obstacle_ring.
     """
-    widths = {
-        "minefield": minefield_point.observation_size,
-        "run": run_forward_point.observation_size,
-        "goal": go_to_goal_point.observation_size,
-    }
-    assert len(set(widths.values())) == 1, widths
+    assert minefield_point.observation_size == run_forward_point.observation_size
+    assert minefield_point.lidar_groups == run_forward_point.lidar_groups
+
+    from mjx_safety_gym import lidar
+
+    assert (
+        go_to_goal_point.observation_size - minefield_point.observation_size
+        == 2 * lidar.NUM_LIDAR_BINS
+    )
 
     state = jax.jit(minefield_point.reset)(jax.random.PRNGKey(0))
     assert state.obs.shape == (minefield_point.observation_size,)

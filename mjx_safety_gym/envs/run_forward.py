@@ -91,12 +91,34 @@ safety-gymnasium, CRAX and Gym pairs this morphology with a healthy bonus AND
 termination; we had adopted the morphology alone. See the posture section
 below.
   * The goal body is NOT removed, even though nothing respawns it. It is parked
-    once at the far end of the corridor as a fixed beacon. Keeping it holds the
-    observation width identical to GoToGoal (76 for the ant), so networks,
-    checkpoints, morphology-gene conditioning and the eval plumbing all work
-    unchanged -- and its lidar reading degenerates into a useful "how far is
-    left to run" signal rather than a navigation problem, since the direction
-    never changes.
+    once at the far end of the corridor as a fixed beacon.
+
+OBSERVATION NARROWED TO ONE LIDAR RING (2026-08-15)
+---------------------------------------------------
+This task originally emitted all three lidar rings, purely so its observation
+width matched GoToGoal's and checkpoints stayed interchangeable. Both of the
+extra rings turned out to be identically zero here, measured over 10,000 real
+observations from a trained policy:
+
+    obstacle ring   16/16 dims live
+    goal     ring    0/16 -- max 0.0000, in EVERY sample
+    object   ring    0/16 -- `_object_body_ids` is [] and never written
+
+The goal ring is dead because the goal is parked 11 m away (44 m for ant_gym)
+against `LIDAR_MAX_DIST = 2.0`; closest approach measured over the whole run was
+6.81 m. The object ring is safety-gym's Push-task slot, which this repo never
+implements. Together they were 32 of 76 observation entries -- 42% of the input
+was a constant.
+
+`lidar_groups` now defaults to ("obstacle",) here. The goal is still parked at
+the far end, and its DIRECTION is still available -- via `goal_observation`,
+which supplies bearing and range as three numbers rather than as a ring that
+could not see it. GoToGoal keeps all three rings: its goal actually moves and
+comes into range, so there the ring carries information.
+
+CONSEQUENCE: run/minefield checkpoints no longer interchange with goal ones.
+run and minefield still match each other, which is the pairing that matters
+(train fast on minefield, warm-start run).
 """
 
 from __future__ import annotations
@@ -129,6 +151,9 @@ class RunForward(GoToGoal):
         boundary_cost_weight: float = 1.0,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
+        goal_reward_weight: float = 0.0,
+        goal_observation: bool = False,
+        lidar_groups=("obstacle",),
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -151,6 +176,8 @@ class RunForward(GoToGoal):
         self._boundary_cost_weight = float(boundary_cost_weight)
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
+        self._goal_reward_weight = float(goal_reward_weight)
+        self._goal_observation = bool(goal_observation)
 
         # Robots start at -L/2 + margin and run toward +L/2. Obstacles fill the
         # span between the start line and the far end.
@@ -159,7 +186,7 @@ class RunForward(GoToGoal):
         self._obstacle_x_lo = self._start_x + 0.75 * a  # clear runway to get moving
         self._obstacle_x_hi = self._finish_x - 0.25 * a
 
-        super().__init__(robot=robot, **kwargs)
+        super().__init__(robot=robot, lidar_groups=lidar_groups, **kwargs)
 
     # -- arena -------------------------------------------------------------
 
@@ -254,6 +281,81 @@ class RunForward(GoToGoal):
         layout["goal"] = [(0, jp.array([self._finish_x, 0.0]))]
         return layout, rng
 
+    # -- goal sensing ------------------------------------------------------
+    #
+    # MEASURED 2026-08-15, and the reason this exists. Rolling the 1.68M-step
+    # checkpoint for 16 episodes:
+    #
+    #     cost is 99.1% BOUNDARY, 0.8% hazard, 0.1% vase
+    #     first leaves the corridor at decision 34 of 625 (~1 m of travel)
+    #     |y| reaches a median of 11.6 m against a half-width of 1.0
+    #     net +x median +1.6 m, range -7.8 to +11.9 -- half go BACKWARDS
+    #
+    # It walks; it just walks in an arbitrary direction. Two causes: nothing in
+    # the observation correlated with where it was (the sensor block is
+    # bit-identical at y=0, y=0.99 and y=3.0), and forward progress is
+    # `speed * cos(theta)`, whose derivative at theta=0 is ZERO -- a gait 20
+    # degrees off axis still earns 94%. The goal lidar ring that would have
+    # supplied a heading was dead in all 10,000 observations sampled, because
+    # the goal sits 11 m away against LIDAR_MAX_DIST = 2.0.
+    #
+    # So the direction to the goal is handed to the policy directly. This is
+    # deliberately NOT a realisable sensor -- it is privileged state, and that
+    # is a considered trade: sim-to-real is not this project's question, and a
+    # policy that cannot tell which way to run cannot produce a meaningful
+    # safety measurement either.
+    #
+    # WHY A DISTANCE-DELTA REWARD IS SAFE HERE, given it is exactly the reward
+    # that made GoToGoal unlearnable: distance-to-a-point is convex with
+    # curvature 1/d, so the penalty it puts on undirected motion scales with
+    # 1/d. Measured, as a fraction of what a working gait earns per decision:
+    #
+    #     goal 0.8 m away (GoToGoal)     15.3%    <- exploration really is punished
+    #     goal 11 m away (here)           0.02%   <- negligible
+    #
+    # At 11 m the distance function is locally almost linear, so this behaves
+    # like the +x reward it supplements rather than like GoToGoal's trap. Do
+    # NOT carry that conclusion over to a goal placed close to the robot.
+
+    def _goal_xy(self, data: mjx.Data) -> jax.Array:
+        # mocap_pos, never xpos: _reset_goal writes mocap_pos without re-running
+        # forward kinematics, so xpos lags by a step. RunForward never respawns
+        # its goal, but the habit is what keeps that class of bug out.
+        return data.mocap_pos[self._goal_mocap_id][:2]
+
+    def goal_distance(self, data: mjx.Data) -> jax.Array:
+        return jp.linalg.norm(self._goal_xy(data) - data.site_xpos[self._robot_site_id][:2])
+
+    def task_observations(self, data: mjx.Data) -> jax.Array | None:
+        """[cos, sin] of the goal's bearing in the robot's frame, plus range.
+
+        Bearing is taken from the torso's YAW ALONE rather than by rotating
+        through the full orientation matrix, which is what `lidar.ego_xy`
+        does. That matters: the lidar path leaves the robot's own height in the
+        vector it rotates, so when the torso tilts the vertical component
+        bleeds into the horizontal reading -- measured at 60 degrees of pitch,
+        a target 2.00 m away registers as 1.58 m. Yaw-only is immune to that,
+        and a heading signal that degrades exactly when the ant is falling over
+        would be worst where it is needed most.
+        """
+        if not self._goal_observation:
+            return None
+        delta = self._goal_xy(data) - data.site_xpos[self._robot_site_id][:2]
+        mat = data.xmat[self._robot_body_id].reshape(3, 3)
+        yaw = jp.arctan2(mat[1, 0], mat[0, 0])
+        rel = jp.arctan2(delta[1], delta[0]) - yaw
+        # Range is normalised by the corridor length so it stays O(1) --
+        # observations are NOT normalised anywhere in this stack
+        # (normalize_observations=False in ppo/train.py), so raw metres would
+        # enter the first layer an order of magnitude above every other input.
+        return jp.array([
+            jp.cos(rel), jp.sin(rel),
+            jp.linalg.norm(delta) / self._corridor_length,
+        ])
+
+    def task_observation_size(self) -> int:
+        return 3 if self._goal_observation else 0
+
     # -- reward / cost -----------------------------------------------------
 
     def get_reward(self, data, prev_data) -> jax.Array:
@@ -289,6 +391,16 @@ class RunForward(GoToGoal):
         x_prev = prev_data.site_xpos[self._robot_site_id][0]
         x_new = data.site_xpos[self._robot_site_id][0]
         reward = (x_new - x_prev) * self._forward_reward_weight
+        if self._goal_reward_weight:
+            # Telescopes to (d_initial - d_final), i.e. "how much closer did it
+            # get". Unlike the +x term this charges for lateral motion, which
+            # is the point -- +x alone is flat in y, so going straight was never
+            # preferred over drifting. Differenced against prev_data for the
+            # same reason the +x term is: nothing position-like may live in
+            # state.info, or every episode boundary pays a spurious reward.
+            reward = reward + self._goal_reward_weight * (
+                self.goal_distance(prev_data) - self.goal_distance(data)
+            )
         if self._healthy_reward:
             reward = reward + self._healthy_reward * self.is_upright(data)
         return reward

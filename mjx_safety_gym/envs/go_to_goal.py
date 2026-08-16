@@ -1,4 +1,4 @@
-from typing import Mapping, Union
+from typing import Mapping, Optional, Sequence, Union
 import warnings
 
 import jax
@@ -152,6 +152,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         integrator: str | None = None,
         num_hazards: int = 10,
         num_vases: int = 10,
+        lidar_groups: Optional[Sequence[str]] = None,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -159,6 +160,31 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             )
         self._robot = robot
         self._xml_path = _XML_DIR / _ROBOT_XMLS[robot]
+
+        # Which lidar rings actually enter the observation. Each is
+        # NUM_LIDAR_BINS wide, so dropping one narrows the observation by 16.
+        #
+        # Defaults to all three here, which keeps GoToGoal byte-identical --
+        # its goal genuinely moves and comes into lidar range, so its goal ring
+        # carries information. RunForward narrows it (see that file): MEASURED
+        # over 10,000 real observations, its goal ring was live in 0 of them,
+        # because the goal is parked 11 m away (44 m for ant_gym) against
+        # LIDAR_MAX_DIST = 2.0.
+        #
+        # The `object` ring is dead in EVERY task -- `_object_body_ids` is
+        # assigned `[]` in _post_init and never written to. It is the slot
+        # safety-gym uses for the Push task's box, which this repo does not
+        # implement. It is kept in the default only so the goal task's width,
+        # and therefore its checkpoints, do not move.
+        groups = list(lidar.LIDAR_GROUPS if lidar_groups is None else lidar_groups)
+        unknown = [g for g in groups if g not in lidar.LIDAR_GROUPS]
+        if unknown:
+            raise ValueError(
+                f"unknown lidar group(s) {unknown}; available: {lidar.LIDAR_GROUPS}"
+            )
+        if not groups:
+            raise ValueError("lidar_groups cannot be empty -- the robot would be blind")
+        self._lidar_groups = tuple(groups)
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
@@ -495,23 +521,22 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
         # Vectorized obstacle position retrieval -- note we can use xpos even for mocap positions after they have been updated
         # These values seem to be equal; TODO: using mocap_pos is maybe more correct
-        obstacle_positions = data.xpos[jp.array(self._obstacle_body_ids)]
-        goal_positions = data.mocap_pos[jp.array([self._goal_mocap_id])]
-        object_positions = (
-            data.xpos[jp.array(self._object_body_ids)]
-            if self._object_body_ids
-            else jp.zeros((0, 3))
-        )
-
-        lidar_readings = jp.array(
-            [
-                lidar.compute_lidar(robot_body_pos, robot_body_mat, obstacle_positions),
-                lidar.compute_lidar(robot_body_pos, robot_body_mat, goal_positions),
-                lidar.compute_lidar(robot_body_pos, robot_body_mat, object_positions),
-            ]
-        )
-
-        return lidar_readings
+        targets = {
+            "obstacle": lambda: data.xpos[jp.array(self._obstacle_body_ids)],
+            "goal": lambda: data.mocap_pos[jp.array([self._goal_mocap_id])],
+            "object": lambda: (
+                data.xpos[jp.array(self._object_body_ids)]
+                if self._object_body_ids
+                else jp.zeros((0, 3))
+            ),
+        }
+        # Only the configured rings are computed, so a dropped ring costs
+        # nothing at trace time either -- it is a python-level loop over a tuple
+        # fixed at __init__.
+        return jp.array([
+            lidar.compute_lidar(robot_body_pos, robot_body_mat, targets[group]())
+            for group in self._lidar_groups
+        ])
 
     def sensor_observations(self, data: mjx.Data) -> jax.Array:
         vals = []
@@ -519,13 +544,32 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             vals.append(get_sensor_data(self.mj_model, data, sensor))
         return jp.hstack(vals)
 
+    def task_observations(self, data: mjx.Data) -> Optional[jax.Array]:
+        """Extra task-specific observation entries, or None.
+
+        A hook so a subclass can widen the observation WITHOUT displacing the
+        morphology genes, which must stay the last `NUM_GENES` entries:
+        MorphologyDomainRandomizationWrapper writes them per-lane and
+        tests/test_morphology.py asserts they land in the obs tail. Anything
+        appended here goes before them.
+        """
+        return None
+
+    def task_observation_size(self) -> int:
+        """Width of `task_observations`. Must agree with it or the policy's
+        input shape and the env's reported shape silently disagree."""
+        return 0
+
     def get_obs(self, data: mjx.Data) -> jax.Array:
         lidar = self.lidar_observations(data)
         other_sensors = self.sensor_observations(data)
-        obs = jp.hstack([lidar.flatten(), other_sensors])
+        parts = [lidar.flatten(), other_sensors]
+        task = self.task_observations(data)
+        if task is not None:
+            parts.append(task)
         if self._morphology_conditioning:
-            obs = jp.hstack([obs, self._morphology_genes])
-        return obs
+            parts.append(self._morphology_genes)
+        return jp.hstack(parts)
 
     def update_positions(
         self,
@@ -727,8 +771,20 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         return self._mjx_model
 
     @property
+    def lidar_groups(self) -> tuple[str, ...]:
+        """Which lidar rings this env puts in the observation, in order.
+
+        Public because the viewer has to slice the observation by it --
+        main.py and scripts/interactive.py both read the leading
+        `len(lidar_groups) * NUM_LIDAR_BINS` entries back out to light up the
+        rings, and hardcoding 3 there silently mis-slices a narrowed env.
+        """
+        return self._lidar_groups
+
+    @property
     def observation_size(self) -> int:
-        size = 3 * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
+        size = len(self._lidar_groups) * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
+        size += self.task_observation_size()
         if self._morphology_conditioning:
             size += NUM_GENES
         return size

@@ -208,9 +208,35 @@ def main() -> None:
     args = ap.parse_args()
 
     jax_cache.configure()
-    env = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}[args.task](
-        robot=args.robot
-    )
+    # Corridor tasks are built with the same per-robot settings training uses,
+    # AND reconciled against the checkpoint's own observation width:
+    # goal_observation moves that width by 3, so a pre-2026-08-15 ant
+    # checkpoint wants 76 where today's defaults give 79. Without this the
+    # script dies inside flax with a shape error that names neither the flag
+    # nor the checkpoint.
+    _tasks = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
+    if args.task == "goal":
+        env = GoToGoal(robot=args.robot)
+    else:
+        ckpt_root = Path(args.checkpoint) if args.checkpoint else None
+        want = None
+        if ckpt_root is not None and ckpt_root.is_dir():
+            steps = sorted(
+                p for p in ckpt_root.iterdir() if p.is_dir() and p.name.isdigit()
+            )
+            leaf = steps[-1] if steps else ckpt_root
+            probe = ocp.PyTreeCheckpointer().restore(str(leaf.resolve()))
+            want = train_ppo.checkpoint_obs_width(probe[1]["policy"])
+        env, _kw, default_width = train_ppo.build_env_for_checkpoint(
+            lambda **kw: _tasks[args.task](robot=args.robot, **kw), args.robot, want
+        )
+        if default_width is not None:
+            print(
+                f"  checkpoint wants obs width {want} (defaults give "
+                f"{default_width}); built env with "
+                f"goal_observation={_kw['goal_observation']}, "
+                f"goal_reward_weight={_kw['goal_reward_weight']}"
+            )
     seeds = np.arange(args.episodes) + 1000  # common random numbers across arms
 
     defaults = train_ppo._ROBOT_DEFAULTS[args.robot]

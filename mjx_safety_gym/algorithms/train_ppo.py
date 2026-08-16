@@ -93,6 +93,7 @@ _ROBOT_DEFAULTS = {
     "point": {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
+        "goal_reward_weight": 0.0, "goal_observation": False,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -115,6 +116,22 @@ _ROBOT_DEFAULTS = {
         # ant_gym's, caused by its torque; this is cheap insurance in case a
         # trained policy moves fast enough to tip itself.
         "healthy_reward": 0.0002, "terminate_on_flip": True,
+        #
+        # GOAL SENSING ON BY DEFAULT (2026-08-15). Measured on the 1.68M-step
+        # checkpoint over 16 episodes: net +x median +1.6 m with a range of
+        # -7.8 to +11.9, i.e. HALF THE EPISODES END BEHIND THE START LINE. It
+        # walks fine; it has no idea which way to walk. 99.1% of its cost was
+        # the corridor boundary, first crossed at decision 34 of 625.
+        #
+        # Nothing in the observation could have told it: the sensor block is
+        # bit-identical at y=0, y=0.99 and y=3.0, and the goal lidar ring read
+        # exactly zero in all 10,000 observations sampled (goal 11 m away,
+        # LIDAR_MAX_DIST 2.0). See envs/run_forward.py's goal-sensing section.
+        #
+        # NOTE THIS CHANGES OBSERVATION WIDTH, 76 -> 79 for the ants. Older ant
+        # checkpoints will not load against it; pass --goal_observation false to
+        # reproduce a pre-2026-08-15 run.
+        "goal_reward_weight": 1.0, "goal_observation": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -175,6 +192,11 @@ _ROBOT_DEFAULTS = {
         # to escape, and the ~40 m figure it was sized against is a best-case
         # SCRIPTED gait, not something a policy reaches early.
         "healthy_reward": 0.002, "terminate_on_flip": True,
+        # Same reasoning as ant's, above. ant_gym's corridor is 48 m and its
+        # goal sits 44 m from the start line, so its goal lidar ring is even
+        # further out of range than ant's -- it has never had a heading signal
+        # either. Observation width 76 -> 79.
+        "goal_reward_weight": 1.0, "goal_observation": True,
     },
 }
 
@@ -193,6 +215,123 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
             resolved.append(f"{name}={value}")
     if resolved:
         print(f"[{args.robot}] robot defaults applied: {', '.join(resolved)}")
+
+
+# Which _ROBOT_DEFAULTS keys are constructor arguments of the corridor envs.
+# The rest (action_repeat, episode_length, discounting) are training knobs and
+# are not accepted by the env.
+_ENV_DEFAULT_KEYS = (
+    "healthy_reward", "terminate_on_flip", "goal_reward_weight",
+    "goal_observation",
+)
+
+
+def robot_env_kwargs(robot: str) -> dict:
+    """Corridor-env constructor kwargs matching what training uses for `robot`.
+
+    Replay and evaluation must build their env through this rather than with
+    bare defaults. `goal_observation` changes the observation WIDTH (76 -> 79
+    for the ants), so a script that constructs `RunForward(robot=...)` plainly
+    gets a 76-wide env and then loads a 79-wide checkpoint into it -- which
+    fails loudly if you are lucky and silently mis-shapes the policy if you are
+    not. The non-width flags matter too: replaying without `terminate_on_flip`
+    shows episodes that training would have ended.
+    """
+    defaults = _ROBOT_DEFAULTS[robot]
+    return {k: defaults[k] for k in _ENV_DEFAULT_KEYS if k in defaults}
+
+
+def checkpoint_obs_width(policy_params) -> Optional[int]:
+    """Observation width the saved policy's first layer was built for.
+
+    Read off the WEIGHTS, not from a saved config: training writes an empty
+    ConfigDict, so a checkpoint records nothing at all about the env it came
+    from. `hidden_0` is brax's name for the first Dense layer of an MLP and its
+    kernel is (obs_width, hidden_width), so the width survives in the shape
+    even though nobody wrote it down.
+
+    None if the layout is not what we expect, which callers treat as "cannot
+    tell" and proceed.
+    """
+    try:
+        return int(policy_params["params"]["hidden_0"]["kernel"].shape[0])
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+
+# The full lidar stack the corridor tasks used before 2026-08-15. Kept only so
+# older checkpoints can still be replayed -- see build_env_for_checkpoint.
+_LEGACY_LIDAR_GROUPS = ("obstacle", "goal", "object")
+
+
+def _env_kwarg_candidates(robot: str) -> list[dict]:
+    """Env configurations to try against a checkpoint, current first.
+
+    TWO separate changes have moved the corridor observation width, and a
+    checkpoint records only the total, so reconciliation is a small search
+    rather than a single flag flip:
+
+        goal_observation   +3   (2026-08-15, ON by default for the ants)
+        lidar_groups      +32   (2026-08-15, narrowed to the obstacle ring)
+
+    For the ant that makes 44 (current), 47 (current + goal sensing), 76
+    (legacy) and 79 (legacy + goal sensing) all reachable, and every ant
+    checkpoint in the repo predates both changes at 76.
+    """
+    current = robot_env_kwargs(robot)
+    legacy_reward = {**current, "goal_observation": False, "goal_reward_weight": 0.0}
+    return [
+        current,
+        {**current, "goal_observation": not current.get("goal_observation", False),
+         "goal_reward_weight": (
+             0.0 if current.get("goal_observation") else current["goal_reward_weight"]
+         )},
+        {**legacy_reward, "lidar_groups": _LEGACY_LIDAR_GROUPS},
+        {**current, "lidar_groups": _LEGACY_LIDAR_GROUPS},
+    ]
+
+
+def build_env_for_checkpoint(build, robot: str, want_width: Optional[int]):
+    """Build a corridor env whose observation width matches a checkpoint's.
+
+    `build` is called with env kwargs and returns the env.
+
+    Exists because loading a checkpoint into a differently-shaped env raises
+    deep inside flax:
+
+        ScopeParamShapeError: Initializer expected to generate shape (76, 32)
+        but got shape (79, 32) ... for parameter "kernel" in "/hidden_0"
+
+    which names neither the flag responsible nor the checkpoint. The goal
+    OBSERVATION and the goal REWARD always move together here, because a
+    checkpoint from before one is from before the other, and replaying with a
+    reward the policy never trained against would misreport its return.
+
+    Returns (env, kwargs, default_width): `default_width` is None when the
+    defaults already fitted, else the width they would have produced. It is
+    returned rather than left for the caller to derive -- deriving it by
+    re-applying a delta against the flag's new value is easy to get backwards
+    (it was, and printed "73" for a 79-wide default).
+    """
+    default_width = None
+    for i, kwargs in enumerate(_env_kwarg_candidates(robot)):
+        env = build(**kwargs)
+        if i == 0:
+            default_width = env.observation_size
+            if want_width is None or default_width == want_width:
+                return env, kwargs, None
+        if env.observation_size == want_width:
+            return env, kwargs, default_width
+
+    raise SystemExit(
+        f"Cannot load this checkpoint against --robot {robot}.\n"
+        f"  the checkpoint's policy expects an observation of width {want_width}\n"
+        f"  this robot/task produces {default_width}\n"
+        f"No combination of goal_observation and lidar_groups reaches "
+        f"{want_width}, so the checkpoint was most likely trained on a "
+        f"different robot (observation width also depends on the robot's "
+        f"sensor count)."
+    )
 
 
 def default_checkpoint_dir(robot: str) -> Path:
@@ -501,6 +640,33 @@ def build_argparser() -> argparse.ArgumentParser:
         "goes over at step 50 still contributes 2450 further transitions from "
         "a state where forward reward is unobtainable.",
     )
+    parser.add_argument(
+        "--goal_reward_weight",
+        type=float,
+        default=None,
+        help="[--task run/minefield] Weight on how much CLOSER to the goal the "
+        "robot got this step. Telescopes over an episode to (d_initial - "
+        "d_final). Unlike --forward_reward_weight this charges for lateral "
+        "motion, which is the point: +x progress is flat in y, so nothing ever "
+        "preferred going straight over drifting -- measured, half of all "
+        "episodes ended BEHIND the start line. Resolves per robot (1.0 for the "
+        "ants, 0 for the point). Scale is close to cosmetic since "
+        "normalize_advantage is on; what matters is the ratio to "
+        "--healthy_reward.",
+    )
+    parser.add_argument(
+        "--goal_observation",
+        type=lambda v: v.lower() not in ("0", "false", "no"),
+        default=None,
+        help="[--task run/minefield] Put the goal's bearing and range straight "
+        "into the observation as 3 numbers (cos, sin of relative bearing, and "
+        "normalised distance). DELIBERATELY PRIVILEGED STATE -- not a sensor "
+        "any real robot has. The goal lidar ring that would have carried this "
+        "reads exactly zero for entire episodes (the goal is 11 m away for "
+        "ant, 44 m for ant_gym, against LIDAR_MAX_DIST = 2.0). "
+        "CHANGES OBSERVATION WIDTH 76 -> 79 for the ants, so checkpoints do "
+        "not transfer across this flag.",
+    )
     parser.add_argument("--num_timesteps", type=int, default=5_000_000)
     parser.add_argument(
         "--num_envs",
@@ -698,6 +864,8 @@ def train(args: argparse.Namespace):
                 boundary_cost_weight=args.boundary_cost_weight,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,
+                goal_reward_weight=args.goal_reward_weight,
+                goal_observation=args.goal_observation,
                 **common,
             )
             if args.task == "minefield":

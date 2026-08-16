@@ -1,6 +1,7 @@
 import argparse
 import time
 from pathlib import Path
+from typing import Optional
 import jax
 import numpy as np
 import mujoco
@@ -12,7 +13,11 @@ from brax.training.acme import running_statistics
 
 from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
-from mjx_safety_gym.algorithms.train_ppo import latest_checkpoint
+from mjx_safety_gym.algorithms.train_ppo import (
+    build_env_for_checkpoint,
+    checkpoint_obs_width,
+    latest_checkpoint,
+)
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
@@ -69,9 +74,56 @@ DETERMINISTIC = _args.deterministic
 # Compile once, and every later run loads the cached kernel from disk
 jax_cache.configure()
 
-# Create environment
+def resolve_checkpoint(robot: str) -> Optional[Path]:
+    """The checkpoint directory to replay, or None if nothing is trained."""
+    if _args.checkpoint is None:
+        return latest_checkpoint(robot)
+    # Must be absolute: orbax rejects relative paths ("Checkpoint path
+    # should be absolute"). latest_checkpoint() already returns absolute.
+    ckpt = Path(_args.checkpoint).resolve()
+    if not ckpt.is_dir():
+        raise SystemExit(f"--checkpoint path does not exist: {ckpt}")
+    # Accept a run directory as well as a leaf step directory.
+    steps = sorted(p for p in ckpt.iterdir() if p.is_dir() and p.name.isdigit())
+    return steps[-1] if steps else ckpt
+
+
+# THE CHECKPOINT IS RESOLVED BEFORE THE ENV IS BUILT, and that ordering is the
+# fix for a real crash rather than a preference. A checkpoint hard-codes the
+# observation width its first layer accepts, and `goal_observation` (added
+# 2026-08-15, ON by default for the ants) changes that width by +3, so every
+# ant checkpoint trained before that date wants 76 where the defaults give 79.
+# See train_ppo.build_env_for_checkpoint for the reconciliation.
+ckpt_path = resolve_checkpoint(ROBOT)
+# Restore through orbax directly, NOT brax's checkpoint.load: that helper
+# builds restore_args with a blanket tree_map over the metadata, which blows up
+# on the optimizer-state subtree we also save ("different types at key path ...
+# list vs RestoreArgs").
+# Saved layout is (normalizer, SafePPONetworkParams, penalizer, optimizer);
+# orbax hands each dataclass back as a plain dict of its fields.
+_loaded = None if ckpt_path is None else ocp.PyTreeCheckpointer().restore(str(ckpt_path))
+
 _TASKS = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
-env = _TASKS[_args.task](robot=ROBOT)
+_want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
+if _args.task == "goal":
+    # GoToGoal has no goal-sensing flags to reconcile -- its goal already moves
+    # and is already in lidar range.
+    env = GoToGoal(robot=ROBOT)
+else:
+    env, _task_kwargs, _default_width = build_env_for_checkpoint(
+        lambda **kw: _TASKS[_args.task](robot=ROBOT, **kw), ROBOT, _want
+    )
+    if _default_width is not None:
+        print(
+            f"Checkpoint expects an observation of width {_want}; this robot's "
+            f"defaults give {_default_width}."
+        )
+        print(
+            f"  -> built the env with goal_observation="
+            f"{_task_kwargs['goal_observation']}, goal_reward_weight="
+            f"{_task_kwargs['goal_reward_weight']} to match it"
+        )
+
 rng = jax.random.PRNGKey(_args.seed)
 
 # Reset environment
@@ -95,34 +147,16 @@ def sample_action(rng):
     return action, rng
 
 
-def load_policy(robot: str, obs, action_size: int):
-    """Build an action fn from the newest checkpoint, or None if untrained.
+def build_policy(loaded, obs, action_size: int):
+    """Build an action fn from already-restored params, or None if untrained.
 
     Rebuilds the network from the env's own shapes rather than from a saved
     config: the training code writes an empty ConfigDict, so brax's
     `checkpoint.load_policy` helper cannot reconstruct the network, and its
     vanilla PPONetworks has no cost-value head anyway.
     """
-    if _args.checkpoint is None:
-        ckpt = latest_checkpoint(robot)
-    else:
-        # Must be absolute: orbax rejects relative paths ("Checkpoint path
-        # should be absolute"). latest_checkpoint() already returns absolute.
-        ckpt = Path(_args.checkpoint).resolve()
-        if not ckpt.is_dir():
-            raise SystemExit(f"--checkpoint path does not exist: {ckpt}")
-        # Accept a run directory as well as a leaf step directory.
-        steps = sorted(p for p in ckpt.iterdir() if p.is_dir() and p.name.isdigit())
-        ckpt = steps[-1] if steps else ckpt
-    if ckpt is None:
-        return None, None
-    # Restore through orbax directly, NOT brax's checkpoint.load: that helper
-    # builds restore_args with a blanket tree_map over the metadata, which
-    # blows up on the optimizer-state subtree we also save
-    # ("different types at key path ... list vs RestoreArgs").
-    loaded = ocp.PyTreeCheckpointer().restore(str(ckpt))
-    # Saved layout is (normalizer, SafePPONetworkParams, penalizer, optimizer);
-    # orbax hands each dataclass back as a plain dict of its fields.
+    if loaded is None:
+        return None
     normalizer = running_statistics.RunningStatisticsState(**loaded[0])
     policy_params, value_params = loaded[1]["policy"], loaded[1]["value"]
     # normalize_observations defaults to False in ppo.train, so the
@@ -136,9 +170,10 @@ def load_policy(robot: str, obs, action_size: int):
     policy = ppo_networks.make_inference_fn(network)(
         (normalizer, policy_params, value_params), deterministic=DETERMINISTIC
     )
-    return jax.jit(lambda o, k: policy(o, k)[0]), ckpt
+    return jax.jit(lambda o, k: policy(o, k)[0])
 
-policy_fn, ckpt_path = load_policy(ROBOT, state.obs, env.action_size)
+
+policy_fn = build_policy(_loaded, state.obs, env.action_size)
 if policy_fn is None:
     print(f"No checkpoint for '{ROBOT}' -- driving with random actions.")
 else:
@@ -191,10 +226,14 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         # Keep the lidar rings + mocap bodies (goal, hazards) visually in sync.
         # Pull the lidar slice to host once (single transfer) so update_lidar_rings
         # iterates over NumPy floats instead of forcing ~48 tiny device->host syncs.
+        # Sliced by the env's OWN ring count, not a hardcoded 3: RunForward and
+        # Minefield emit only the obstacle ring, so a fixed 3 would read 32
+        # proprioception entries as though they were lidar.
+        n_rings = len(env.lidar_groups)
         lidar_vals = np.asarray(
-            state.obs[: 3 * lidar.NUM_LIDAR_BINS]
-        ).reshape(3, lidar.NUM_LIDAR_BINS)
-        lidar.update_lidar_rings(lidar_vals, m)
+            state.obs[: n_rings * lidar.NUM_LIDAR_BINS]
+        ).reshape(n_rings, lidar.NUM_LIDAR_BINS)
+        lidar.update_lidar_rings(lidar_vals, m, env.lidar_groups)
         mjx.get_data_into(d, m, state.data)
         mujoco.mj_forward(m, d)
         viewer.sync()
