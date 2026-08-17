@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 from importlib.resources import files
-from typing import Sequence
+from typing import Callable, Sequence
 
 import jax
 import jax.numpy as jp
@@ -133,6 +133,14 @@ _BATCHED_FIELDS: tuple[str, ...] = (
     "geom_pos",
     "actuator_acc0",
     "light_poscom0",
+    # ADDED 2026-08-16, when rescale_actuators made gear morphology-dependent.
+    # Was NOT in the original 13-field list because gear was a constant 150 in
+    # the XML and therefore genuinely identical across models. Omitting it now
+    # would leave every lane sharing the BASE morphology's gear while stepping
+    # its own geometry -- silently simulating bodies that were never built, and
+    # the search would rank morphologies it never actually evaluated. This is
+    # the exact failure mode batch_models' docstring warns about.
+    "actuator_gear",
 )
 _STATIC_PINNED_FIELDS: tuple[str, ...] = ("geom_aabb", "geom_rbound_hfield")
 
@@ -169,31 +177,24 @@ class MorphologySpec:
         return dict(zip(GENE_NAMES, s.tolist()))
 
 
-def build_mj_model(
-    spec: MorphologySpec,
-    arena_spec: dict[str, ObjectSpec] | None = None,
-    integrator: str | None = None,
-    robot: str = "ant",
-) -> mj.MjModel:
-    """Compile a single ant with the given morphology, arena included.
+def apply_morphology(mjSpec: mj.MjSpec, spec: MorphologySpec) -> None:
+    """Scale the robot's segments on an UNCOMPILED MjSpec, in place.
 
-    Mirrors GoToGoal.__init__'s own compile path (envs/go_to_goal.py) so a
-    model built here has identical topology to (and is thus batchable with)
-    what the env normally produces. `integrator` must therefore be threaded
-    through to match whatever the env was built with -- under morphology
-    randomization these models REPLACE the env's `_mjx_model`, so if only
-    GoToGoal honoured the override the randomized run would silently step
-    different physics from the nominal one.
+    Split out of `build_mj_model` so the arena is somebody else's problem. The
+    caller decides which arena to build around the scaled robot, which is the
+    whole point: `_build_arena` is polymorphic across tasks (GoToGoal's
+    scattered hazards+vases, RunForward's corridor, Minefield's corridor with
+    no vases), and a module that hardcodes one of them silently produces the
+    wrong physics for the other two. See `GoToGoal.build_morphology_model`.
+
+    Geom *type* and count are untouched -- only capsule endpoints, radii and
+    the child-body offsets that hang off a segment's tip -- so every model
+    produced from the same spec-and-arena path shares topology and is
+    batchable.
     """
-    cfg = _MORPH_ROBOTS[robot]
-    if arena_spec is None:
-        arena_spec = _arena_spec_for(robot)
     scales = spec.scales
-
-    s = mj.MjSpec.from_file(str(_XML_DIR / cfg["xml"]))
-    apply_integrator(s, integrator)
-    geoms = {g.name: g for g in s.geoms}
-    bodies = {b.name: b for b in s.bodies}
+    geoms = {g.name: g for g in mjSpec.geoms}
+    bodies = {b.name: b for b in mjSpec.bodies}
 
     for segment, geom_names in _SEGMENT_GEOMS.items():
         len_scale = scales[f"{segment}_len"]
@@ -210,6 +211,30 @@ def build_mj_model(
     torso = geoms["torso_geom"]
     torso.size = np.array([torso.size[0] * scales["torso_rad"], 0.0, 0.0])
 
+
+def build_mj_model(
+    spec: MorphologySpec,
+    arena_spec: dict[str, ObjectSpec] | None = None,
+    integrator: str | None = None,
+    robot: str = "ant",
+    scale_actuators: bool = True,
+) -> mj.MjModel:
+    """Compile a single ant with the given morphology, in GOTOGOAL's arena.
+
+    NOTE ON SCOPE. This builds GoToGoal's arena specifically. It is fine for
+    standalone analysis (mass bands, contact-capping checks, the batched-vs-
+    individual physics regression) but it is NOT what training should use --
+    a corridor task needs a corridor, and `randomization_fn` now takes a
+    model-builder from the env instead of calling this. Kept because several
+    scripts and checks legitimately just want "an ant of this shape".
+    """
+    cfg = _MORPH_ROBOTS[robot]
+    if arena_spec is None:
+        arena_spec = _arena_spec_for(robot)
+
+    s = mj.MjSpec.from_file(str(_XML_DIR / cfg["xml"]))
+    apply_integrator(s, integrator)
+    apply_morphology(s, spec)
     build_arena(
         s,
         objects=arena_spec,
@@ -217,7 +242,68 @@ def build_mj_model(
         obstacle_scale=cfg["arena_scale"],
         vase_mass=cfg["vase_mass"],
     )
-    return s.compile()
+    model = s.compile()
+    if scale_actuators:
+        rescale_actuators(model, robot)
+    return model
+
+
+# Cache of the nominal robot's gravitational-torque proxy, per robot. Computed
+# lazily because it costs a compile, and reused for every morphology in a run.
+_NOMINAL_TORQUE_PROXY: dict[str, float] = {}
+
+
+def _gravity_torque_proxy(mj_model: mj.MjModel) -> float:
+    """`mass * reach` -- what a hip actuator must fight to hold the leg up.
+
+    A whole-robot scalar rather than a per-joint torque. Per-joint would be
+    more exact, but this tracks the quantity that actually varied (measured
+    2026-08-16: gear/gravity ranged 0.94 to 3.82 across sampled morphologies,
+    a 4.1x spread around the nominal 1.71) and it cannot divide by zero at a
+    pose where a joint happens to be balanced.
+    """
+    d = mj.MjData(mj_model)
+    mj.mj_forward(mj_model, d)
+    torso = mj_model.body("robot").id
+    mass = float(mj_model.body_subtreemass[torso])
+    reach = float(
+        np.linalg.norm(
+            d.geom_xpos[mj_model.geom("left_ankle_geom").id] - d.xpos[torso]
+        )
+    )
+    return mass * reach
+
+
+def rescale_actuators(mj_model: mj.MjModel, robot: str = "ant") -> float:
+    """Scale every actuator's gear so torque margin is INVARIANT to morphology.
+
+    WHY THIS IS NOT OPTIONAL. `gear` is fixed at 150 in the XML while the
+    gravitational torque a joint must hold scales with mass x limb length --
+    and mass swings ~12.7x across the gene box. Measured over 10 sampled
+    morphologies inside MASS_BAND, gear/gravity ran 0.94 to 3.82. **A ratio
+    below 1.0 means the hip cannot statically hold its own leg against
+    gravity**, i.e. that body cannot walk no matter what the policy does.
+    Training a shared conditioned policy across such a population measures the
+    actuator mismatch, not the policy.
+
+    Returns the factor applied, for logging/tests.
+
+    RESEARCH CONSEQUENCE, stated so it is a choice and not an accident: this
+    removes the size-vs-strength tradeoff from the search. Without it, "bigger"
+    implicitly means "weaker" and the Pareto front partly reflects a fixed
+    motor rather than the geometry. With it, the search is about SHAPE at
+    constant torque margin. The latter is what the morphology-conditioning
+    hypothesis needs; the former is a different (also valid) experiment, and is
+    what `scale_actuators=False` preserves.
+    """
+    if robot not in _NOMINAL_TORQUE_PROXY:
+        nominal = build_mj_model(
+            MorphologySpec.nominal(), robot=robot, scale_actuators=False
+        )
+        _NOMINAL_TORQUE_PROXY[robot] = _gravity_torque_proxy(nominal)
+    factor = _gravity_torque_proxy(mj_model) / _NOMINAL_TORQUE_PROXY[robot]
+    mj_model.actuator_gear[:, 0] *= factor
+    return factor
 
 
 def total_mass(mj_model: mj.MjModel) -> float:
@@ -283,6 +369,7 @@ def build_batch(
     arena_spec: dict[str, ObjectSpec] | None = None,
     integrator: str | None = None,
     robot: str = "ant",
+    model_builder: Callable[[MorphologySpec], mj.MjModel] | None = None,
 ) -> tuple[mjx.Model, mjx.Model]:
     """Compile every spec and stack them into one batched model.
 
@@ -291,10 +378,19 @@ def build_batch(
     IDENTICALLY except for morphology -- a mismatched integrator or robot XML
     changes topology, and `batch_models` would then either fail to stack or
     silently produce a batch whose lanes are not comparable.
+
+    `model_builder`, when given, replaces the whole compile path -- it is how
+    the ENV supplies its own task-correct arena (see
+    `GoToGoal.build_morphology_model`). Without it this falls back to
+    `build_mj_model`, i.e. GoToGoal's arena, which is wrong for the corridor
+    tasks.
     """
-    mj_models = [
-        build_mj_model(spec, arena_spec, integrator, robot) for spec in specs
-    ]
+    if model_builder is None:
+        mj_models = [
+            build_mj_model(spec, arena_spec, integrator, robot) for spec in specs
+        ]
+    else:
+        mj_models = [model_builder(spec) for spec in specs]
     return batch_models(mj_models)
 
 
@@ -306,6 +402,8 @@ def randomization_fn(
     arena_spec: dict[str, ObjectSpec] | None = None,
     integrator: str | None = None,
     robot: str = "ant",
+    model_builder: Callable[[MorphologySpec], mj.MjModel] | None = None,
+    include_nominal: bool = True,
 ) -> tuple[mjx.Model, mjx.Model, jax.Array]:
     """Sample `num_morphologies` ant bodies and repeat each to fill `num_envs`.
 
@@ -321,8 +419,17 @@ def randomization_fn(
     from them.
 
     `mjx_model` (the env's own nominal model) is accepted only to match that
-    calling convention; every morphology here is rebuilt from scratch via
-    `build_mj_model`, so its value is unused.
+    calling convention; every morphology here is rebuilt from scratch, so its
+    value is unused.
+
+    **PASS `model_builder`.** Without it this falls back to `build_mj_model`,
+    which hardcodes GOTOGOAL's arena -- 10 hazards plus 10 free-jointed vases.
+    On a corridor task that is silently the wrong model: measured 2026-08-16,
+    Minefield is nq=15/nv=14 against GoToGoal's nq=85/nv=74, yet nbody and
+    ngeom coincidentally MATCH at 38/35 (20 hazards versus 10 hazards + 10
+    vases), so the mismatch does not reliably raise -- it just steps physics
+    the env's cached geom ids do not describe. `GoToGoal.build_morphology_model`
+    is the correct builder and reuses the task's own `_build_arena`.
 
     `num_envs` must be a multiple of `num_morphologies`; each sampled body is
     replicated `num_envs // num_morphologies` times so every field's leading
@@ -341,7 +448,21 @@ def randomization_fn(
     seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
     np_rng = np.random.default_rng(seed)
     specs = [MorphologySpec.sample(np_rng) for _ in range(num_morphologies)]
-    batched, in_axes = build_batch(specs, arena_spec, integrator, robot)
+    if include_nominal and num_morphologies > 0:
+        # Genes are sampled uniformly from [0,1]^7, so the nominal body (all
+        # 0.5) has measure ZERO and would never appear. That makes every
+        # comparison against a single-body specialist a generalization test to
+        # an unseen morphology, when the intended question is usually "does the
+        # conditioned policy match a specialist ON THE SAME BODY". Pinning
+        # lane 0 to nominal buys that comparison for one morphology's worth of
+        # diversity, and gives every run a fixed reference body whose numbers
+        # are directly comparable across runs and against
+        # checkpoints/ant_minefield_chain (episode_reward 22.1 of a ~22.5
+        # ceiling, 2026-08-16).
+        specs[0] = MorphologySpec.nominal()
+    batched, in_axes = build_batch(
+        specs, arena_spec, integrator, robot, model_builder=model_builder
+    )
     genes = np.stack([s.genes for s in specs])  # (num_morphologies, NUM_GENES)
 
     batched = batched.tree_replace(

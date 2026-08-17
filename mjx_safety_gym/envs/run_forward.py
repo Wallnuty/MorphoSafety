@@ -151,6 +151,8 @@ class RunForward(GoToGoal):
         boundary_cost_weight: float = 1.0,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
+        terminate_on_goal: bool = False,
+        goal_radius: float | None = None,
         goal_reward_weight: float = 0.0,
         goal_observation: bool = False,
         lidar_groups=("obstacle",),
@@ -176,6 +178,14 @@ class RunForward(GoToGoal):
         self._boundary_cost_weight = float(boundary_cost_weight)
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
+        self._terminate_on_goal = bool(terminate_on_goal)
+        # Matches world.build_arena's goal cylinder, 0.3 * obstacle_scale, so
+        # the capture radius is the thing you can actually see in the viewer.
+        self._goal_radius = (
+            0.3 * float(_ROBOT_CONFIGS[robot]["arena_scale"])
+            if goal_radius is None
+            else float(goal_radius)
+        )
         self._goal_reward_weight = float(goal_reward_weight)
         self._goal_observation = bool(goal_observation)
 
@@ -325,6 +335,17 @@ class RunForward(GoToGoal):
 
     def goal_distance(self, data: mjx.Data) -> jax.Array:
         return jp.linalg.norm(self._goal_xy(data) - data.site_xpos[self._robot_site_id][:2])
+
+    def at_goal(self, data: mjx.Data) -> jax.Array:
+        """Has the robot reached the goal? 1.0/0.0, usable as a `done` term.
+
+        The radius matches the goal cylinder actually DRAWN in the arena
+        (`0.3 * obstacle_scale` in world.build_arena), so "arrived" means what
+        it looks like in the viewer rather than some invisible threshold. Not a
+        knife edge either: the trained conditioned policy closed to within
+        0.01-0.09 m of the centre on all eight bodies.
+        """
+        return (self.goal_distance(data) <= self._goal_radius).astype(jp.float32)
 
     def task_observations(self, data: mjx.Data) -> jax.Array | None:
         """[cos, sin] of the goal's bearing in the robot's frame, plus range.
@@ -498,6 +519,23 @@ class RunForward(GoToGoal):
         # of every batch was that (see is_upright's note).
         if self._terminate_on_flip:
             done = jp.maximum(done, self.is_flipped(data))
+
+        # Arrival termination. OFF by default, so every result recorded before
+        # 2026-08-17 stays reproducible.
+        #
+        # WHY IT IS WORTH TURNING ON. Measured on the 50M conditioned run: the
+        # ants reach the goal at decision 248 of 625 on average, so 60% of every
+        # episode is spent milling around a goal that pays nothing further --
+        # the reward telescopes, so once the distance is closed there is no more
+        # to earn. Terminating there is ~2.5x more useful experience per
+        # env-step.
+        #
+        # NOT paired with an arrival bonus, deliberately: a bonus would break
+        # the telescoping property that makes episode return readable directly
+        # as metres travelled, which is the one thing that has made this reward
+        # debuggable.
+        if self._terminate_on_goal:
+            done = jp.maximum(done, self.at_goal(data))
 
         state.info["cost"] = cost
         state.info["upright"] = self.is_upright(data)

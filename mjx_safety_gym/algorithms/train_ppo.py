@@ -94,6 +94,7 @@ _ROBOT_DEFAULTS = {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
+        "terminate_on_goal": False,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -132,6 +133,12 @@ _ROBOT_DEFAULTS = {
         # checkpoints will not load against it; pass --goal_observation false to
         # reproduce a pre-2026-08-15 run.
         "goal_reward_weight": 1.0, "goal_observation": True,
+        # terminate_on_goal OFF (2026-08-17). Measured worth: the ants reach
+        # the goal at decision 248 of 625, so 60% of every episode is
+        # post-arrival dead time and turning this on is ~2.5x more useful
+        # experience per env-step. Left off by default only so results recorded
+        # before that date stay reproducible; turn it on for new work.
+        "terminate_on_goal": False,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -197,6 +204,12 @@ _ROBOT_DEFAULTS = {
         # further out of range than ant's -- it has never had a heading signal
         # either. Observation width 76 -> 79.
         "goal_reward_weight": 1.0, "goal_observation": True,
+        # terminate_on_goal OFF (2026-08-17). Measured worth: the ants reach
+        # the goal at decision 248 of 625, so 60% of every episode is
+        # post-arrival dead time and turning this on is ~2.5x more useful
+        # experience per env-step. Left off by default only so results recorded
+        # before that date stay reproducible; turn it on for new work.
+        "terminate_on_goal": False,
     },
 }
 
@@ -222,7 +235,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 # are not accepted by the env.
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
-    "goal_observation",
+    "goal_observation", "terminate_on_goal",
 )
 
 
@@ -255,6 +268,31 @@ def checkpoint_obs_width(policy_params) -> Optional[int]:
     """
     try:
         return int(policy_params["params"]["hidden_0"]["kernel"].shape[0])
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+
+def checkpoint_policy_layers(policy_params) -> Optional[tuple[int, ...]]:
+    """Hidden layer WIDTHS the saved policy was built with.
+
+    Same trick and same reason as checkpoint_obs_width above: the checkpoint
+    records nothing about its network, so the parameter shapes are the only
+    surviving evidence. Needed because --policy_hidden_layer_sizes is not the
+    default for morphology-conditioned runs -- those use (256,)*4, since the
+    (32,)*4 default is 8x narrower than the value nets and has to produce a
+    different gait per body. Rebuilding such a checkpoint with the default
+    raises a flax shape error rather than loading.
+
+    The trailing Dense is the output head (2 * action_size), not a hidden
+    layer, so it is dropped. None if the layout is unrecognised.
+    """
+    try:
+        params = policy_params["params"]
+        sizes, i = [], 0
+        while f"hidden_{i}" in params:
+            sizes.append(int(params[f"hidden_{i}"]["kernel"].shape[1]))
+            i += 1
+        return tuple(sizes[:-1]) if len(sizes) > 1 else None
     except (KeyError, IndexError, TypeError, AttributeError):
         return None
 
@@ -671,11 +709,29 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=256,
-        help="Deviates from the reference's 2048: on a 6 GiB laptop GPU, "
-        "throughput saturates near 256 (2.1x over 64 envs, vs 2.8x at 1024 "
-        "for 5.5x the compile time), and 2048 gets OOM-killed host-side "
-        "during XLA compilation. Raise it on a cluster.",
+        default=512,
+        help="512 is where a 6 GiB laptop GPU saturates. Measured 2026-08-16, "
+        "ant on minefield, compile-corrected training/sps: 1155 at 128 envs, "
+        "3593 at 256 (3.11x -- small batches are kernel-launch-bound, not "
+        "physics-bound), 4747 at 512 (1.32x), 4900 at 1024 (1.03x), 4735 at "
+        "2048 (a net LOSS). "
+        "512 is also the largest value that needs no other change: validate() "
+        "requires num_envs to divide batch_size * num_minibatches (default "
+        "32*16 = 512), so 128/256/512 share an identical learning config while "
+        "1024+ forces the gradient batch up, halving the updates per env-step "
+        "for 3%% more throughput. "
+        "Raising this is otherwise free rather than a tradeoff: brax computes "
+        "env_step_per_training_step as batch_size * unroll_length * "
+        "num_minibatches * action_repeat, with NO num_envs term, so 256 -> 512 "
+        "changes neither the data per gradient update nor the number of "
+        "updates -- only whether it is gathered as 512 envs x 10 steps once or "
+        "256 envs x 10 steps twice. "
+        "VRAM is not the constraint at any of these sizes (flat ~3913 MiB from "
+        "128 to 2048; that is JAX's preallocated arena, not demand) -- which "
+        "only became true once --task minefield dropped the vases. The older "
+        "note that 2048 gets OOM-killed host-side is STALE: it predates the "
+        "WSL RAM bump to 10 GB and the 79 -> 47 observation narrowing, and "
+        "2048 now runs clean. Re-measure before raising it on a cluster.",
     )
     parser.add_argument(
         "--num_eval_envs",
@@ -725,6 +781,23 @@ def build_argparser() -> argparse.ArgumentParser:
         "If per-morphology eval returns come out near-identical under "
         "morphology randomization, widen this first.",
     )
+    parser.add_argument(
+        "--terminate_on_goal",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="End the episode when the robot reaches the goal. OFF by default "
+        "so every result before 2026-08-17 stays reproducible. Measured on the "
+        "50M morphology run: the ants arrive at decision 248 of 625 on average, "
+        "so 60%% of every episode is spent next to a goal that pays nothing "
+        "more (the reward telescopes -- once the distance is closed there is "
+        "nothing left to earn). Turning this on is ~2.5x more useful "
+        "experience per env-step. "
+        "CAVEAT: healthy_reward is paid per step, so terminating early means a "
+        "FAST arrival collects less of it than a slow one -- a backwards "
+        "incentive worth ~0.30 of a ~22.5 return (1.3%%). The discount "
+        "(0.97/decision) dominates it by far, but set --healthy_reward 0 if you "
+        "want the objective clean.",
+    )
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--entropy_cost", type=float, default=1e-4)
     parser.add_argument(
@@ -749,7 +822,9 @@ def build_argparser() -> argparse.ArgumentParser:
         "`safety_budget` only binds on the stochastic policy. Evaluating "
         "deterministically measures something the constraint never targeted -- "
         "measured 2026-08-02, constraint-implied cost matched stochastic eval "
-        "to 0.8% at the feasibility crossing but was off by 36% against "
+        # %% not %: argparse runs every help string through `help % params`, so
+        # a literal percent sign raises TypeError and takes ALL of --help down.
+        "to 0.8%% at the feasibility crossing but was off by 36%% against "
         "deterministic eval at the same point, and by ~2.5x early in "
         "training (an untrained policy has mean action ~0, so the "
         "deterministic policy barely moves and looks spuriously safe). Also "
@@ -864,6 +939,7 @@ def train(args: argparse.Namespace):
                 boundary_cost_weight=args.boundary_cost_weight,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,
+                terminate_on_goal=args.terminate_on_goal,
                 goal_reward_weight=args.goal_reward_weight,
                 goal_observation=args.goal_observation,
                 **common,
@@ -910,12 +986,17 @@ def train(args: argparse.Namespace):
         # different width -- see the num_eval_envs check in validate().
         rng = jax.random.PRNGKey(args.seed)
         train_rng, eval_rng = jax.random.split(rng)
+        # model_builder is what makes this task-correct. Without it
+        # randomization_fn falls back to morphology.build_mj_model, which
+        # hardcodes GoToGoal's arena -- silently wrong physics on --task
+        # run/minefield. See GoToGoal.build_morphology_model.
         train_batched, train_in_axes, train_genes = morphology_lib.randomization_fn(
             env.mjx_model,
             train_rng,
             args.num_morphologies,
             args.num_envs,
             integrator=args.integrator,
+            model_builder=env.build_morphology_model,
         )
         env = MorphologyDomainRandomizationWrapper(
             env, train_batched, train_in_axes, train_genes
@@ -926,6 +1007,7 @@ def train(args: argparse.Namespace):
             args.num_morphologies,
             args.num_eval_envs,
             integrator=args.integrator,
+            model_builder=eval_env.build_morphology_model,
         )
         eval_env = MorphologyDomainRandomizationWrapper(
             eval_env, eval_batched, eval_in_axes, eval_genes

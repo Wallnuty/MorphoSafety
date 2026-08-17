@@ -40,6 +40,9 @@ TASK="${TASK:-run}"
 # yields and the second never starts.
 MAX_GENS="${MAX_GENS:-0}"
 
+# Extra flags appended verbatim to every generation. See the args= array below.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
 CHAIN="${1:-$PWD/checkpoints/${ROBOT}_upright_chain}"
 SEED_CKPT="${2:-}"
 LOG="${3:-$PWD/logs/ant_gym_upright_chain.log}"
@@ -89,10 +92,17 @@ while true; do
     echo "############################################################"
   } | tee -a "$LOG"
 
+  # EXTRA_ARGS is word-split ON PURPOSE (unquoted $EXTRA_ARGS): it carries a
+  # whole flag list, e.g.
+  #   EXTRA_ARGS="--num_morphologies 8 --policy_hidden_layer_sizes 256 256 256 256"
+  # Every generation must pass the IDENTICAL string, or a resumed run silently
+  # trains a different network or a different morphology population from the
+  # checkpoint it restored -- and the only symptom would be a flat learning
+  # curve across a generation boundary.
   args=(--robot "$ROBOT" --task "$TASK" --penalizer none
         --num_timesteps "$STEPS_PER_GEN" --num_evals "$EVALS_PER_GEN"
         --num_eval_envs 8 --num_eval_episodes 2
-        --checkpoint_logdir "$outdir")
+        --checkpoint_logdir "$outdir" $EXTRA_ARGS)
   [ -n "$restore" ] && args+=(--restore_checkpoint_path "$restore")
 
   python -u -m mjx_safety_gym.algorithms.train_ppo "${args[@]}" >> "$LOG" 2>&1

@@ -16,6 +16,7 @@ from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import (
     build_env_for_checkpoint,
     checkpoint_obs_width,
+    checkpoint_policy_layers,
     latest_checkpoint,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
@@ -64,6 +65,25 @@ _parser.add_argument(
     "step directory. Note the ENV is still built from --robot, so this must be "
     "a checkpoint trained on the same robot.",
 )
+_parser.add_argument(
+    "--num_morphologies",
+    type=int,
+    default=0,
+    help="Replay a MORPHOLOGY-CONDITIONED checkpoint. Must match the value the "
+    "checkpoint was trained with, together with --seed, or the population "
+    "reconstructed here is not the population it was trained on (bodies are "
+    "sampled host-side from the seed, not stored in the checkpoint). 0 (the "
+    "default) replays an ordinary single-body checkpoint.",
+)
+_parser.add_argument(
+    "--morphology",
+    type=int,
+    default=0,
+    help="Which body from that population to watch, 0-indexed. Body 0 is the "
+    "NOMINAL ant by construction (morphology.randomization_fn's "
+    "include_nominal), so --morphology 0 shows the unmodified robot and is the "
+    "one directly comparable to a single-body checkpoint.",
+)
 _args = _parser.parse_args()
 
 DURATION_SECONDS = _args.duration
@@ -105,7 +125,62 @@ _loaded = None if ckpt_path is None else ocp.PyTreeCheckpointer().restore(str(ck
 
 _TASKS = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
 _want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
-if _args.task == "goal":
+if _args.num_morphologies:
+    # Morphology-conditioned checkpoints are NUM_GENES wider than the task obs
+    # (47 -> 54 for the ant on minefield), which the width reconciliation in
+    # build_env_for_checkpoint cannot produce -- it only flips goal_observation,
+    # worth +-3. So build the env directly with conditioning on rather than
+    # letting the search fail with "most likely a different robot".
+    from mjx_safety_gym import morphology as _morph
+    from mjx_safety_gym.algorithms.train_ppo import robot_env_kwargs
+
+    if _args.task == "goal":
+        env = GoToGoal(robot=ROBOT, morphology_conditioning=True)
+    else:
+        env = _TASKS[_args.task](
+            robot=ROBOT, morphology_conditioning=True, **robot_env_kwargs(ROBOT)
+        )
+
+    # Reproduce randomization_fn's population EXACTLY: same PRNGKey -> same
+    # host-side numpy seed -> same draws, with lane 0 pinned to nominal. The
+    # genes are not stored in the checkpoint (they cannot be recovered from a
+    # compiled mjx.Model), so --seed and --num_morphologies are what identify
+    # which bodies these are.
+    _seed = int(jax.random.randint(jax.random.PRNGKey(_args.seed), (), 0, 2**31 - 1))
+    _rng = np.random.default_rng(_seed)
+    _specs = [_morph.MorphologySpec.sample(_rng) for _ in range(_args.num_morphologies)]
+    _specs[0] = _morph.MorphologySpec.nominal()
+    if not 0 <= _args.morphology < _args.num_morphologies:
+        raise SystemExit(
+            f"--morphology {_args.morphology} out of range for "
+            f"--num_morphologies {_args.num_morphologies}"
+        )
+    _spec = _specs[_args.morphology]
+
+    # Install the body. This is exactly what MorphologyDomainRandomizationWrapper
+    # does per lane, minus the vmap -- the viewer runs a single env, so the
+    # attributes can just be set. BOTH models must be swapped: _mjx_model drives
+    # the physics, _mj_model drives the renderer, and showing one body while
+    # simulating another is the kind of thing that would look like a physics bug.
+    # Topology is identical across morphologies, so the geom/body ids cached in
+    # _post_init stay valid.
+    _mj = env.build_morphology_model(_spec)
+    env._mj_model = _mj
+    env._mjx_model = mjx.put_model(_mj)
+    env._morphology_genes = jax.numpy.asarray(_spec.genes, dtype=jax.numpy.float32)
+
+    _mass = float(_mj.body_subtreemass[_mj.body("robot").id])
+    _scales = _spec.scales
+    print(
+        f"Morphology {_args.morphology}/{_args.num_morphologies - 1}"
+        f"{' (NOMINAL)' if _args.morphology == 0 else ''}: "
+        f"mass {_mass:.1f} kg, gear {_mj.actuator_gear[0, 0]:.0f}"
+    )
+    print(
+        "  scales  "
+        + "  ".join(f"{k}={v:.2f}" for k, v in _scales.items())
+    )
+elif _args.task == "goal":
     # GoToGoal has no goal-sensing flags to reconcile -- its goal already moves
     # and is already in lidar range.
     env = GoToGoal(robot=ROBOT)
@@ -162,10 +237,20 @@ def build_policy(loaded, obs, action_size: int):
     # normalize_observations defaults to False in ppo.train, so the
     # preprocessor is the identity -- must match training or the obs scale
     # the policy sees is wrong.
+    # Layer widths come from the WEIGHTS, not from a default. A
+    # morphology-conditioned run uses --policy_hidden_layer_sizes 256 256 256
+    # 256, and rebuilding it with make_ppo_networks' (32,)*4 default raises a
+    # flax shape error instead of loading -- the same class of failure as the
+    # observation-width mismatch this file already handles above.
+    layers = checkpoint_policy_layers(policy_params)
+    extra = {} if layers is None else {"policy_hidden_layer_sizes": layers}
+    if layers is not None and tuple(layers) != (32,) * 4:
+        print(f"  checkpoint policy hidden layers: {tuple(layers)}")
     network = ppo_networks.make_ppo_networks(
         obs.shape,
         action_size,
         preprocess_observations_fn=lambda x, _: x,
+        **extra,
     )
     policy = ppo_networks.make_inference_fn(network)(
         (normalizer, policy_params, value_params), deterministic=DETERMINISTIC

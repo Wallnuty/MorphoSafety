@@ -191,3 +191,5 @@ checkpoints/
 # machine. Copy anything you intend to cite in a writeup somewhere durable.
 cluster/download.md
 logs/
+# Vast.ai instance id (per-rental, machine-local)
+cluster/vast/.instance

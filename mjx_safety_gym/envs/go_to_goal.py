@@ -205,6 +205,12 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             "vases": ObjectSpec(0.15 * a, int(num_vases)),
         }
 
+        # Stored, not just used: build_morphology_model has to replay this
+        # exact compile path, and a morphology built under a different
+        # integrator would silently step different physics from the nominal env
+        # while being stacked into the same batch.
+        self._integrator = integrator
+
         mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
         apply_integrator(mjSpec, integrator)
         self._build_arena(mjSpec)
@@ -263,6 +269,38 @@ class GoToGoal(playground_mjx_env.MjxEnv):
                 use_rasterizer=self._vision_config.use_rasterizer,
                 viz_gpu_hdls=None,
             )
+
+    def build_morphology_model(self, spec) -> mj.MjModel:
+        """Compile THIS task's arena around a morphology-scaled robot.
+
+        Replays __init__'s own compile path with one extra step, so the model
+        differs from what this env normally builds in the robot's geometry and
+        NOTHING else -- same XML, same integrator, same `_build_arena`, so same
+        topology and therefore batchable across morphologies.
+
+        This exists because `morphology.build_mj_model` hardcodes GoToGoal's
+        arena (10 hazards + 10 free-jointed vases). Under `--task minefield`
+        that is silently the wrong model: Minefield is nq=15/nv=14 against
+        GoToGoal's nq=85/nv=74, yet nbody and ngeom happen to MATCH at 38/35
+        (20 hazards versus 10 hazards + 10 vases), so the mismatch does not
+        reliably raise -- it just steps physics whose bodies the env's cached
+        geom ids do not describe. Dispatching through the env instead means any
+        task that overrides `_build_arena` gets the right arena for free.
+
+        `spec` is a `morphology.MorphologySpec`; typed loosely to avoid a
+        circular import (morphology imports NUM_GENES from this module).
+        """
+        from mjx_safety_gym import morphology as morphology_lib
+
+        mjSpec: mj.MjSpec = mj.MjSpec.from_file(
+            filename=str(self._xml_path), assets={}
+        )
+        apply_integrator(mjSpec, self._integrator)
+        morphology_lib.apply_morphology(mjSpec, spec)
+        self._build_arena(mjSpec)
+        model = mjSpec.compile()
+        morphology_lib.rescale_actuators(model, self._robot)
+        return model
 
     def _build_arena(self, mjSpec: mj.MjSpec) -> None:
         """Add obstacles/goal/lidar rings to the spec, before it is compiled.

@@ -102,29 +102,35 @@ Other users can inspect it to see the dependencies required for vision-based sup
 
 ## Testing
 
+**There is no test suite.** It was removed 2026-08-16, deliberately.
+
+The reasoning, from an audit of its own history: in six commits and 81 tests,
+it never once found a bug before a human did. Every real defect in this project
+was found by running something, measuring something, or watching the ant on
+screen -- the `NameError` that made all morphology randomization dead was
+committed *with* its tests, and its own message explains why nothing caught it
+("nothing exercises the batched-morphology path"). Roughly a third of the tests
+cited a specific past incident; all were written after the fact.
+
+The failures that actually cost this project time are not the kind a unit test
+catches: an ant that ran 94% of every episode upside down, a cost signal that
+was 99% corridor boundary, a reward that was direction-blind, a discount
+horizon shorter than the episode. Those are research-design errors, found only
+by measuring the thing you assumed.
+
+What the suite did do, twice, was catch *changes* that would have silently
+invalidated comparisons. That capability is gone. If a change might invalidate
+existing results, that is now on you to notice.
+
+The suite is not lost -- it is in git history and can be restored in full:
+
 ```bash
-pip install -e .[dev]
-pytest                 # ~6 minutes, all on the CPU backend
-pytest -m "not slow"   # skips the ant-physics compiles
+git checkout 3c91dbf -- tests/     # last commit that contained it
+pip install "pytest>=8.0"
 ```
 
-**The suite runs on CPU deliberately** (`tests/conftest.py` sets
-`JAX_PLATFORMS`), so it never contends with a training run for the GPU — and
-because GPU rollouts here are not bitwise reproducible, since contact chaos
-amplifies float32 association differences.
-
-Every test corresponds to something that has actually gone wrong, and the class
-of bug it guards is the same each time: **silent** — no error, no NaN, no
-crash, just a subtly wrong number that took days to notice. Among them: a
-carried scalar in `state.info` corrupting reward at every episode boundary (a
-1000x outlier once per episode, in both environments); an evaluator that
-ignored `action_repeat` and so measured a quarter of an episode at four times
-the control rate; a relative `--checkpoint_logdir` that orbax rejects only at
-save time, after the training is done; an ant that spent 94% of every episode
-upside down because nothing in the reward mentioned being upright.
-
-Each test's docstring carries the measurement behind it. If one fails, read it
-before changing it.
+Its docstrings carry the measurement behind each guard and remain the best
+written record of several incidents.
 
 ## Repository Structure 
 ```
@@ -150,7 +156,6 @@ mjx-safety-gym/
 │   ├── evolve.py                # NSGA-II morphology search
 │   ├── train_chain.sh           # Auto-resuming training across crashes
 │   └── verify_contact_capping.py# Adversarial max_geom_pairs check
-├── tests/                       # See "Testing" above
 ├── cluster/                     # SLURM sbatch jobs (Wits mscluster)
 ├── main.py                      # Replay a checkpoint in the viewer
 ├── pyproject.toml               # Build + metadata
