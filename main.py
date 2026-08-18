@@ -14,6 +14,7 @@ from brax.training.acme import running_statistics
 from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import (
+    _ROBOT_DEFAULTS,
     build_env_for_checkpoint,
     checkpoint_obs_width,
     checkpoint_policy_layers,
@@ -284,9 +285,26 @@ print(f"Compiled in {time.time() - start:.1f}s")
 
 sim_dt = m.opt.timestep * 2  # env.step() runs 2 physics substeps internally
 num_steps = int(DURATION_SECONDS / sim_dt)
-print(f"Running {num_steps} steps (~{DURATION_SECONDS}s)")
+
+# HOLD EACH ACTION FOR action_repeat STEPS. Training queries the policy once
+# per DECISION and CostEpisodeWrapper holds that action across `action_repeat`
+# env.steps -- but that wrapper is not in the replay path, so querying every
+# step ran the policy at 4x the control period it was trained at (0.02 s vs
+# 0.08 s for the ants). That is the same defect that invalidated
+# eval_checkpoint.py on 2026-08-11, and this plan's own sweep measured control
+# period as worth up to 2.7x in achievable gait travel -- it does not cancel
+# out as a cosmetic difference. Sim duration is unchanged; only the rate at
+# which the policy is re-queried is corrected.
+ACTION_REPEAT = int(_ROBOT_DEFAULTS[ROBOT]["action_repeat"])
+CTRL_DT = sim_dt * ACTION_REPEAT
+print(f"Running {num_steps} steps (~{DURATION_SECONDS}s), "
+      f"action_repeat={ACTION_REPEAT} -> {num_steps // ACTION_REPEAT} decisions "
+      f"at {CTRL_DT:.3f}s control period")
 
 total_cost = 0.0
+decisions = 0        # decisions in the CURRENT episode -- comparable to the
+                     # arrival numbers eval_morphology.py reports
+episode = 1
 with mujoco.viewer.launch_passive(m, d) as viewer:
     for i in range(num_steps):
         if not viewer.is_running():
@@ -294,10 +312,11 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         step_start = time.time()
 
         if policy_fn is not None:
-            # A trained policy is queried every step; ACTION_HOLD only exists
-            # to keep *random* actions from looking like jitter.
-            rng, rng_action = jax.random.split(rng)
-            action = policy_fn(state.obs, rng_action)
+            # Re-queried once per DECISION, then held -- see ACTION_REPEAT.
+            if i % ACTION_REPEAT == 0:
+                rng, rng_action = jax.random.split(rng)
+                action = policy_fn(state.obs, rng_action)
+                decisions += 1
         elif i % ACTION_HOLD == 0:
             action, rng = sample_fn(rng)
         state = step_fn(state, action)
@@ -322,6 +341,24 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         mjx.get_data_into(d, m, state.data)
         mujoco.mj_forward(m, d)
         viewer.sync()
+
+        # ACT ON `done`. The env computes it (terminate_on_goal has been the
+        # default since 2026-08-18, terminate_on_flip for longer), but this
+        # loop used to discard it -- so a robot that reached the goal or went
+        # over on its back just kept being stepped, showing states training
+        # would never have continued from. Reset instead, so one viewer session
+        # shows successive episodes on fresh layouts.
+        if float(state.done) > 0:
+            why = "done"
+            if hasattr(env, "at_goal") and float(env.at_goal(state.data)) > 0:
+                why = f"REACHED GOAL in {decisions} decisions ({decisions * CTRL_DT:.1f}s)"
+            elif hasattr(env, "is_flipped") and float(env.is_flipped(state.data)) > 0:
+                why = f"flipped over after {decisions} decisions"
+            print(f"  episode {episode}: {why}")
+            rng, rng_ep = jax.random.split(rng)
+            state = reset_fn(rng_ep)
+            decisions = 0
+            episode += 1
 
         elapsed = time.time() - step_start
         if elapsed < sim_dt:
