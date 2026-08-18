@@ -94,7 +94,7 @@ _ROBOT_DEFAULTS = {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
-        "terminate_on_goal": False,
+        "terminate_on_goal": True,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -133,12 +133,13 @@ _ROBOT_DEFAULTS = {
         # checkpoints will not load against it; pass --goal_observation false to
         # reproduce a pre-2026-08-15 run.
         "goal_reward_weight": 1.0, "goal_observation": True,
-        # terminate_on_goal OFF (2026-08-17). Measured worth: the ants reach
-        # the goal at decision 248 of 625, so 60% of every episode is
-        # post-arrival dead time and turning this on is ~2.5x more useful
-        # experience per env-step. Left off by default only so results recorded
-        # before that date stay reproducible; turn it on for new work.
-        "terminate_on_goal": False,
+        # terminate_on_goal ON (default since 2026-08-18). The ants reached
+        # the goal at decision 248 of 625, so 60% of every episode was
+        # post-arrival dead time. Measured effect of switching it on: a 30M run
+        # plateaued at 166 decisions by ~17M, where the 50M run without it was
+        # still improving at 256 when it stopped. Pass --no-terminate_on_goal
+        # to reproduce anything recorded before this date.
+        "terminate_on_goal": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -204,12 +205,13 @@ _ROBOT_DEFAULTS = {
         # further out of range than ant's -- it has never had a heading signal
         # either. Observation width 76 -> 79.
         "goal_reward_weight": 1.0, "goal_observation": True,
-        # terminate_on_goal OFF (2026-08-17). Measured worth: the ants reach
-        # the goal at decision 248 of 625, so 60% of every episode is
-        # post-arrival dead time and turning this on is ~2.5x more useful
-        # experience per env-step. Left off by default only so results recorded
-        # before that date stay reproducible; turn it on for new work.
-        "terminate_on_goal": False,
+        # terminate_on_goal ON (default since 2026-08-18). The ants reached
+        # the goal at decision 248 of 625, so 60% of every episode was
+        # post-arrival dead time. Measured effect of switching it on: a 30M run
+        # plateaued at 166 decisions by ~17M, where the 50M run without it was
+        # still improving at 256 when it stopped. Pass --no-terminate_on_goal
+        # to reproduce anything recorded before this date.
+        "terminate_on_goal": True,
     },
 }
 
@@ -785,13 +787,16 @@ def build_argparser() -> argparse.ArgumentParser:
         "--terminate_on_goal",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="End the episode when the robot reaches the goal. OFF by default "
-        "so every result before 2026-08-17 stays reproducible. Measured on the "
+        help="End the episode when the robot reaches the goal. ON by default "
+        "since 2026-08-18; pass --no-terminate_on_goal to reproduce an older "
+        "run. Measured on the "
         "50M morphology run: the ants arrive at decision 248 of 625 on average, "
         "so 60%% of every episode is spent next to a goal that pays nothing "
         "more (the reward telescopes -- once the distance is closed there is "
         "nothing left to earn). Turning this on is ~2.5x more useful "
-        "experience per env-step. "
+        "experience per env-step -- a 30M run with it plateaued at 166 "
+        "decisions by ~17M, where 50M without it was still improving at "
+        "256 when it stopped. "
         "CAVEAT: healthy_reward is paid per step, so terminating early means a "
         "FAST arrival collects less of it than a slow one -- a backwards "
         "incentive worth ~0.30 of a ~22.5 return (1.3%%). The discount "

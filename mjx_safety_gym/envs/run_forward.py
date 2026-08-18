@@ -151,7 +151,7 @@ class RunForward(GoToGoal):
         boundary_cost_weight: float = 1.0,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
-        terminate_on_goal: bool = False,
+        terminate_on_goal: bool = True,
         goal_radius: float | None = None,
         goal_reward_weight: float = 0.0,
         goal_observation: bool = False,
@@ -520,10 +520,11 @@ class RunForward(GoToGoal):
         if self._terminate_on_flip:
             done = jp.maximum(done, self.is_flipped(data))
 
-        # Arrival termination. OFF by default, so every result recorded before
-        # 2026-08-17 stays reproducible.
+        # Arrival termination. ON by default since 2026-08-18. Pass
+        # terminate_on_goal=False (CLI: --no-terminate_on_goal) to reproduce
+        # any result recorded before that date.
         #
-        # WHY IT IS WORTH TURNING ON. Measured on the 50M conditioned run: the
+        # WHY IT IS THE DEFAULT. Measured on the 50M conditioned run: the
         # ants reach the goal at decision 248 of 625 on average, so 60% of every
         # episode is spent milling around a goal that pays nothing further --
         # the reward telescopes, so once the distance is closed there is no more
