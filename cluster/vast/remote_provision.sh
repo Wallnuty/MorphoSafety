@@ -105,10 +105,18 @@ echo "=== skipping the mujoco_menagerie clone ==="
 # environments, and MorphoSafety ships its own XMLs in mjx_safety_gym/envs/xmls.
 # If some future code path did want one, it fails loudly on a missing file
 # rather than silently doing the wrong thing.
+# MUST NOT `import mujoco_playground` HERE. The import is itself what fires
+# ensure_menagerie_exists(), so importing to find the path starts the very
+# clone this block exists to prevent -- the makedirs then runs far too late.
+# Observed 2026-08-17: this printed "skipping the mujoco_menagerie clone" and
+# immediately cloned anyway, twice, at ~3 min and ~26 min of billed time.
+# find_spec locates an installed package WITHOUT executing it.
 python - <<'PY'
-import os, mujoco_playground
-p = os.path.join(os.path.dirname(mujoco_playground.__file__),
-                 "external_deps", "mujoco_menagerie")
+import importlib.util, os
+spec = importlib.util.find_spec("mujoco_playground")
+if spec is None or not spec.origin:
+    raise SystemExit("mujoco_playground not importable -- install failed?")
+p = os.path.join(os.path.dirname(spec.origin), "external_deps", "mujoco_menagerie")
 os.makedirs(p, exist_ok=True)
 print("  menagerie stub at", p)
 PY

@@ -7,6 +7,8 @@
 #   bash cluster/vast/vast.sh provision       # sync code + build the env (in tmux)
 #   bash cluster/vast/vast.sh provision-log   # re-attach to a running provision
 #   bash cluster/vast/vast.sh smoke           # measure this card: num_envs sweep
+#   bash cluster/vast/vast.sh throughput      # full hyperparameter sweep (~90 min)
+#   bash cluster/vast/vast.sh throughput-log  # follow the sweep
 #   bash cluster/vast/vast.sh train <args>    # real run, detached in tmux
 #   bash cluster/vast/vast.sh logs            # follow the remote log
 #   bash cluster/vast/vast.sh pull            # bring checkpoints/logs home
@@ -90,26 +92,33 @@ search)
   # wasted rental: jax[cuda12] needs a driver new enough for CUDA 12, and a
   # low-reliability host can vanish mid-run. verified=true keeps it to hosts
   # Vast has actually tested.
-  # gpu_ram>=12, NOT >=24. The laptop sweep (2026-08-16) measured VRAM flat at
-  # ~3913 MiB across num_envs from 128 to 2048 -- and that figure is JAX's
-  # PREALLOCATED arena on a 6 GiB card, so true demand is under 4 GiB even at
-  # the largest batch worth running. This workload is compute-bound, not
-  # memory-bound, once minefield drops the vases. Filtering on 24 GB excludes
-  # cheaper cards for headroom nothing uses. Sort by DLP-per-dollar rather than
-  # raw price: the cheapest offer is usually an old slow card, and wall-clock
-  # is what actually costs money on an hourly rental.
+  # PIN THE CARD TO THE RTX 3090 (user's standing rule, 2026-08-17), because
+  # it is what mscluster's `bigbatch` partition has. Every throughput number
+  # measured here then transfers to the cluster directly instead of needing a
+  # per-card re-measurement -- and the knee is genuinely card-dependent: the
+  # laptop saturated at num_envs 512 while a 4070 Ti SUPER kept scaling to
+  # 2048 (2026-08-16). A rental that does not match the target hardware
+  # measures the wrong machine.
+  #
+  # SORT BY RAW PRICE, not dlperf_usd. Perf-per-dollar is the right sort when
+  # the card is free to vary -- the cheapest offer is then usually an old slow
+  # card and wall-clock is what costs money. Once the model is pinned, every
+  # offer has near-identical compute, so cheapest IS best value.
+  #
   # reliability>0.99, NOT >0.98. The first rental ever attempted here scored
   # 0.983 -- the LOWEST in its result set -- and its host could not pull a
   # docker image at all. Reliability is Vast's own measure of how often a
   # host's rentals actually work; the few cents saved by dropping the floor
   # are worth far less than one dead boot.
-  echo "Single-GPU offers, >=12GB VRAM, CUDA 12+, best performance-per-dollar first:"
+  GPU="${GPU:-RTX_3090}"
+  echo "Cheapest $GPU, reliability>0.99, CUDA 12+, verified:"
   $VASTAI search offers \
-    'num_gpus=1 gpu_ram>=12 cuda_max_good>=12.0 reliability>0.99 verified=true
-     disk_space>50 inet_down>100 rentable=true' \
-    -o 'dlperf_usd-' --limit "${LIMIT:-15}"
+    "num_gpus=1 gpu_name=$GPU cuda_max_good>=12.0 reliability>0.99
+     verified=true disk_space>50 inet_down>100 rentable=true" \
+    -o 'dph_total' --limit "${LIMIT:-15}"
   echo
-  echo "Then: $0 up <ID>"
+  echo "Then: $0 up <ID>   (cheapest = top row)"
+  echo "Override the card with: GPU=RTX_4090 $0 search"
   ;;
 
 up)
@@ -181,7 +190,24 @@ print("|".join([str(row.get("actual_status")),
     intended="${rest%%|*}"; msg="${rest#*|}"
     echo "[$(date +%H:%M:%S)] $state ${msg:+| $msg}"
     case "$state" in
-      running) echo "READY. Next: $0 provision"; exit 0 ;;
+      running)
+        # Vast reports `running` when the CONTAINER is up, but sshd inside it
+        # starts accepting a few seconds later. Observed 2026-08-17: `wait`
+        # printed READY and the provision immediately after it died with
+        # "Connection closed" on both the rsync and the tmux launch, burning a
+        # whole provision cycle of billed time on a box that was fine. Poll
+        # the thing actually needed -- a working ssh -- not the thing vast
+        # reports.
+        ssh_parts
+        for j in $(seq 1 24); do
+          if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+               -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" true 2>/dev/null; then
+            echo "READY (ssh up). Next: $0 provision"; exit 0
+          fi
+          [ "$j" = 1 ] && echo "         container up; waiting for sshd"
+          sleep 5
+        done
+        die "container is running but sshd never accepted after ~2 min" ;;
       GONE)    die "instance $id no longer exists" ;;
     esac
     # `create instance` can leave the box with intended_status=stopped and NO
@@ -221,7 +247,8 @@ sync)
     --exclude '.git' --exclude 'checkpoints' --exclude 'logs' \
     --exclude '__pycache__' --exclude '*.pyc' --exclude '.pytest_cache' \
     --exclude 'cluster/vast/.instance' \
-    -e "$(rsh)" "$ROOT/" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+    -e "$(rsh)" "$ROOT/" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/" \
+    || die "rsync failed -- the remote does NOT have your code. Do not train."
   echo "code synced to $SSH_HOST:$REMOTE_DIR"
   ;;
 
@@ -259,6 +286,23 @@ smoke)
   # Two stages, cheapest first, mirroring the mscluster discipline in the plan:
   # prove the GPU is real before spending any compute on it.
   rexec "bash $REMOTE_DIR/cluster/vast/remote_smoke.sh"
+  ;;
+
+throughput)
+  ssh_parts
+  # ~60-90 min, so tmux: an SSH drop mid-sweep would otherwise waste the whole
+  # rental. Poll it with `$0 throughput-log`.
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t tput 2>/dev/null; \
+         tmux new-session -d -s tput \
+         'bash cluster/vast/remote_throughput.sh 2>&1 | tee logs/throughput.log' && \
+         echo 'launched in tmux session: tput'"
+  echo "Follow it with: $0 throughput-log"
+  ;;
+
+throughput-log)
+  ssh_parts
+  rexec "tail -n ${LINES:-40} -f $REMOTE_DIR/logs/throughput.log"
   ;;
 
 train)
