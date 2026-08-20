@@ -201,6 +201,15 @@ def main() -> None:
     args = ap.parse_args()
 
     kwargs = train_ppo.robot_env_kwargs(args.robot)
+    # MEASUREMENT ENV MUST NOT TERMINATE ON THE GOAL, even though training now
+    # does by default (2026-08-18). BraxAutoResetWrapper replaces `data` with
+    # `first_state` on the very step `done` fires, so `at_goal(nxt.data)` in
+    # rollout() would be evaluating the RESET pose and never see the arrival it
+    # exists to detect -- every body silently reads 0% arrived, which is what
+    # happened the first time this ran after the default flipped. Arrival is
+    # latched here explicitly, so a fixed full-length horizon is both correct
+    # and comparable with every number recorded before the flip.
+    kwargs["terminate_on_goal"] = False
     env = _TASKS[args.task](
         robot=args.robot, morphology_conditioning=True, **kwargs
     )
