@@ -24,12 +24,15 @@ from brax.envs.wrappers import training as brax_training
 from mujoco_playground import wrapper as playground_wrapper
 
 from mjx_safety_gym import jax_cache
+from mjx_safety_gym import design as design_lib
 from mjx_safety_gym import morphology as morphology_lib
 from mjx_safety_gym.algorithms.penalizers import get_penalizer
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.ppo import train as ppo_train
 from mjx_safety_gym.algorithms.wrappers import (
     CostEpisodeWrapper,
+    EpisodeReturnWrapper,
+    MorphologyDesignWrapper,
     MorphologyDomainRandomizationWrapper,
     Saute,
 )
@@ -448,6 +451,7 @@ def wrap_for_brax_training(
     episode_length: int,
     action_repeat: int = 1,
     already_batched: bool = False,
+    track_episode_return: bool = False,
 ):
     """Vmap + cost-aware episode wrapper + mujoco_playground's auto-reset.
 
@@ -471,6 +475,13 @@ def wrap_for_brax_training(
         env = brax_training.VmapWrapper(env)
     env = CostEpisodeWrapper(env, episode_length, action_repeat)
     env = playground_wrapper.BraxAutoResetWrapper(env)
+    if track_episode_return:
+        # OUTSIDE auto-reset on purpose: it needs the per-decision reward and
+        # the `done` that CostEpisodeWrapper sets, and auto-reset only swaps
+        # `data`/`obs` -- the accumulator lives in `info` and survives. Only
+        # attached for design optimization, so no existing run's info pytree
+        # changes shape.
+        env = EpisodeReturnWrapper(env)
     return env
 
 
@@ -851,6 +862,72 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Disable checkpointing entirely (throwaway/debug runs).",
     )
     parser.add_argument(
+        "--design_optimization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train the DESIGN DISTRIBUTION as well as the policy -- Schaff et "
+        "al., ICRA 2019 (arXiv 1801.01432). Requires --num_morphologies. "
+        "Without it, --num_morphologies samples bodies from a FIXED uniform "
+        "distribution that never improves, which is only half that method: the "
+        "policy is conditioned on the genes but nothing makes the genes better. "
+        "With it, a Gaussian mixture over designs is updated by REINFORCE on "
+        "normalized episode return, so the population the policy trains on and "
+        "the population being searched are the same thing. Measured 2026-08-18, "
+        "that coupling is what the decoupled pipeline lacked: 51%% of candidate "
+        "bodies fell outside the trained mass range and 29%% of unseen bodies "
+        "were unreliable.",
+    )
+    parser.add_argument(
+        "--design_lr", type=float, default=1e-3,
+        help="Adam lr for the design distribution (upstream robot_lr). Scaled "
+        "by a linear 1 - t/num_timesteps decay, as upstream does.",
+    )
+    parser.add_argument(
+        "--design_momentum", type=float, default=0.9,
+        help="beta1 for the design optimizer (upstream robot_momentum).",
+    )
+    parser.add_argument(
+        "--design_components", type=int, default=8,
+        help="GMM components over the design space. Mixture weights are NEVER "
+        "trained (upstream creates them with trainable=False); the mixture "
+        "collapses by chopping instead -- see --chop_freq.",
+    )
+    parser.add_argument(
+        "--design_std_init", type=float, default=0.577,
+        help="Initial per-dimension std of each component, in [-1,1] design "
+        "space. Upstream's value.",
+    )
+    parser.add_argument(
+        "--design_updates_per_eval", type=int, default=8,
+        help="Design iterations between evals. ONE ITERATION IS ONE EPOCH, so "
+        "this also divides the epoch length: the design can only be resampled "
+        "at a Python boundary, because bodies are compiled host-side by MuJoCo "
+        "(82.8 ms each, measured). Each iteration must be long enough for an "
+        "episode to FINISH in every lane or the return that scores a design is "
+        "stale -- watch design/episodes_per_design, which should be >= 1.",
+    )
+    parser.add_argument(
+        "--steps_before_design_update", type=int, default=0,
+        help="Policy-only burn-in: designs are sampled and the policy learns to "
+        "condition on them, but the distribution is frozen. Upstream's "
+        "steps_before_robot_update. Without it the design gradient is driven by "
+        "a policy that cannot control anything yet, so it ranks bodies by how "
+        "well an untrained controller happens to handle them.",
+    )
+    parser.add_argument(
+        "--steps_after_design_update", type=int, default=0,
+        help="Final phase: freeze the design at the distribution's MODE and "
+        "sample it deterministically, so the policy fine-tunes on the single "
+        "body that will be reported. Upstream's steps_after_robot_update.",
+    )
+    parser.add_argument(
+        "--chop_freq", type=int, default=0,
+        help="Env steps between GMM chops (0 = never). A chop retires the worst "
+        "HALF of the surviving components and resets the design optimizer, so "
+        "8 -> 4 -> 2 -> 1. This is the only thing that makes the distribution "
+        "commit to one design, since the mixture weights are frozen.",
+    )
+    parser.add_argument(
         "--restore_checkpoint_path",
         type=str,
         default=None,
@@ -874,6 +951,13 @@ def validate(args: argparse.Namespace) -> None:
             f"action_repeat ({args.action_repeat}); evaluation unrolls for "
             f"episode_length // action_repeat steps and would otherwise cut "
             f"episodes short."
+        )
+    if args.design_optimization and not args.num_morphologies:
+        raise SystemExit(
+            "--design_optimization needs --num_morphologies > 0: the design "
+            "distribution is sampled once per training iteration and each "
+            "sample becomes one body in the batch, so a population size is "
+            "required. Try --num_morphologies 16."
         )
     if args.num_morphologies:
         if args.robot not in morphology_lib._MORPH_ROBOTS:
@@ -985,7 +1069,65 @@ def train(args: argparse.Namespace):
             eval_env, args.safety_discounting, args.safety_budget, 0.0, False
         )
 
-    if args.num_morphologies:
+    design_loop = None
+    if args.design_optimization:
+        # SCHAFF CO-DESIGN PATH. The train env's population is resampled every
+        # iteration from a GMM that is itself trained, so it cannot use
+        # MorphologyDomainRandomizationWrapper (which bakes the population in
+        # as a traced constant). See MorphologyDesignWrapper.
+        base_env = env
+        gmm = design_lib.GmmDesignDistribution(
+            n_params=morphology_lib.NUM_GENES,
+            n_components=args.design_components,
+            std_init=args.design_std_init,
+            lr=args.design_lr,
+            momentum=args.design_momentum,
+            seed=args.seed,
+        )
+        replicas = args.num_envs // args.num_morphologies
+        init_params, _ = gmm.sample(args.num_morphologies)
+        init_specs = [
+            morphology_lib.MorphologySpec(genes=g)
+            for g in gmm.to_genes(init_params)
+        ]
+        init_base, init_fields, init_genes = morphology_lib.build_design_batch(
+            init_specs, replicas, model_builder=base_env.build_morphology_model
+        )
+        design_wrapper = MorphologyDesignWrapper(
+            base_env, init_base, init_fields, init_genes
+        )
+        env = design_wrapper
+        design_loop = design_lib.DesignLoop(
+            gmm=gmm,
+            spec_factory=lambda g: morphology_lib.MorphologySpec(genes=g),
+            batch_builder=lambda specs, reps: morphology_lib.build_design_batch(
+                specs, reps, model_builder=base_env.build_morphology_model
+            ),
+            wrapper=design_wrapper,
+            num_morphologies=args.num_morphologies,
+            num_envs=args.num_envs,
+            tmax=args.num_timesteps,
+            steps_before_update=args.steps_before_design_update,
+            steps_after_update=args.steps_after_design_update,
+            chop_freq=args.chop_freq or None,
+        )
+        # EVAL KEEPS A FIXED, INDEPENDENTLY-SAMPLED POPULATION on purpose, so
+        # `episode_reward` stays a stable held-out reference while the training
+        # distribution narrows. The signal for the search itself comes from the
+        # TRAINING rollouts (design/score_mean), not from eval.
+        eval_rng = jax.random.split(jax.random.PRNGKey(args.seed))[1]
+        eval_batched, eval_in_axes, eval_genes = morphology_lib.randomization_fn(
+            eval_env.mjx_model,
+            eval_rng,
+            args.num_morphologies,
+            args.num_eval_envs,
+            integrator=args.integrator,
+            model_builder=eval_env.build_morphology_model,
+        )
+        eval_env = MorphologyDomainRandomizationWrapper(
+            eval_env, eval_batched, eval_in_axes, eval_genes
+        )
+    elif args.num_morphologies:
         # Eval reuses the SAME sampled population as training (so evaluation
         # measures the bodies actually trained on), just replicated to a
         # different width -- see the num_eval_envs check in validate().
@@ -1023,6 +1165,7 @@ def train(args: argparse.Namespace):
         episode_length=args.episode_length,
         action_repeat=args.action_repeat,
         already_batched=bool(args.num_morphologies),
+        track_episode_return=bool(design_loop),
     )
     eval_env = wrap_for_brax_training(
         eval_env,
@@ -1077,6 +1220,15 @@ def train(args: argparse.Namespace):
         progress_fn=progress_fn,
         checkpoint_logdir=checkpoint_logdir,
         restore_checkpoint_path=args.restore_checkpoint_path,
+        design_loop=design_loop,
+        design_updates_per_eval=args.design_updates_per_eval,
+        # Gated on the co-design path only. It is the faithful behaviour for any
+        # gene-conditioned run, but switching it on for the existing path would
+        # silently change what every prior morphology checkpoint was trained
+        # against (checkpoints/vast/vast_morph30M among them).
+        unnormalized_obs_tail=(
+            morphology_lib.NUM_GENES if design_loop is not None else 0
+        ),
     )
     return make_policy, params, metrics
 

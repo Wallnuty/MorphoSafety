@@ -245,3 +245,119 @@ class MorphologyDomainRandomizationWrapper(Wrapper):
         return jax.vmap(step, in_axes=(self._in_axes, 0, 0, 0))(
             self._mjx_model_v, self._genes_v, state, action
         )
+
+
+class MorphologyDesignWrapper(Wrapper):
+    """Per-lane morphology carried in `state.info`, so designs can be swapped.
+
+    The co-design half of Schaff et al. (ICRA 2019) resamples the design every
+    PPO iteration. `MorphologyDomainRandomizationWrapper` cannot support that:
+    it closes over the batched model and the gene array as Python attributes,
+    which JAX traces as CONSTANTS, so changing them retraces the whole training
+    graph -- ~58 s measured against ~4 s per training step.
+
+    This variant instead reads the per-lane model fields and genes out of
+    `state.info`, which lives inside `env_state`, which is ALREADY an argument
+    to `training_epoch`. Swapping designs is then a pure value change at
+    identical shapes and dtypes, and nothing recompiles.
+
+    Two consequences worth knowing:
+
+      * `in_axes` disappears. Once the fields live in the (already batched)
+        state, the vmap over lanes is plain `in_axes=0` -- no pytree of axis
+        specs to keep in sync with `_BATCHED_FIELDS`.
+      * `reset` needs the design BEFORE a state exists, so the real entry point
+        is `reset_with_design(rng, fields, genes)`. Plain `reset(rng)` replays
+        whatever design was installed last, which is what brax's own
+        `reset_fn` path needs.
+
+    Everything the sibling wrapper's docstring says about ORDERING still holds:
+    this must wrap the RAW env, before `CostEpisodeWrapper`, because it makes
+    the observation gene-widened from the first `reset()` and that scan's carry
+    type is fixed by whatever arrives from the previous step.
+    """
+
+    def __init__(self, env: Env, base_model, fields, genes: jax.Array) -> None:
+        super().__init__(env)
+        self._base_model = base_model
+        self._fields = fields  # only the initial design; steps read from state
+        self._genes = genes
+
+    def _env_fn(self, fields, genes) -> Env:
+        env = self.env
+        env.unwrapped._mjx_model = self._base_model.tree_replace(fields)
+        env.unwrapped._morphology_genes = genes
+        return env
+
+    def reset_with_design(self, rng: jax.Array, fields, genes: jax.Array) -> State:
+        """Reset every lane onto a NEW design. `fields`/`genes` lead with num_envs.
+
+        Schaff resets the runner whenever the design changes
+        (`algorithm.py:sample_robot`), and it matters more here than there:
+        `BraxAutoResetWrapper` captures `first_state` at reset and restores it
+        on every subsequent `done`, so without a fresh reset a new body would
+        keep being respawned into the OLD body's initial pose -- wrong drop
+        height, possibly interpenetrating the floor.
+        """
+
+        def reset(fields, genes, rng):
+            state = self._env_fn(fields, genes).reset(rng)
+            state.info["morph_fields"] = fields
+            state.info["morph_genes"] = genes
+            return state
+
+        return jax.vmap(reset)(fields, genes, rng)
+
+    def reset(self, rng: jax.Array) -> State:
+        return self.reset_with_design(rng, self._fields, self._genes)
+
+    def step(self, state: State, action: jax.Array) -> State:
+        def step(s, a):
+            env = self._env_fn(s.info["morph_fields"], s.info["morph_genes"])
+            return env.step(s, a)
+
+        return jax.vmap(step)(state, action)
+
+
+class EpisodeReturnWrapper(Wrapper):
+    """Track per-lane episode return, for the design-distribution update.
+
+    Schaff's REINFORCE step scores each sampled design by its episode return
+    (`algorithm.py:_update_robot_dist` reads `env.reward_buffer[-1]`). Nothing
+    in this repo recorded that: `CostEpisodeWrapper` accumulates cost and step
+    count but not return, and `episode_reward` only ever appears in EVAL
+    metrics, which are computed on a different env with different designs.
+
+    Sits OUTSIDE `CostEpisodeWrapper` and INSIDE `BraxAutoResetWrapper`, so it
+    sees the reward already summed over `action_repeat` and the `done` that
+    wrapper sets, but runs before auto-reset swaps the data out.
+
+    `ep_return_last` latches the most recently COMPLETED episode rather than
+    the running total, because a partially-finished episode is not a fitness
+    signal -- an unfinished traverse looks identical to a failed one. Callers
+    must therefore give each design enough steps for at least one episode to
+    finish per lane, and should check `ep_count` before trusting the value.
+
+    Both keys are written in `reset` as well as `step`: a key present in only
+    one is a pytree structure mismatch for the auto-reset wrapper (the same
+    trap `CostEpisodeWrapper` documents for its own info keys).
+    """
+
+    def reset(self, rng: jax.Array) -> State:
+        state = self.env.reset(rng)
+        zero = jp.zeros_like(state.reward)
+        state.info["ep_return"] = zero
+        state.info["ep_return_last"] = zero
+        state.info["ep_count"] = zero
+        return state
+
+    def step(self, state: State, action: jax.Array) -> State:
+        state = self.env.step(state, action)
+        running = state.info["ep_return"] + state.reward
+        done = state.done
+        state.info["ep_return_last"] = jp.where(
+            done > 0, running, state.info["ep_return_last"]
+        )
+        state.info["ep_count"] = state.info["ep_count"] + done
+        state.info["ep_return"] = jp.where(done > 0, jp.zeros_like(running), running)
+        return state

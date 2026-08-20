@@ -146,6 +146,9 @@ def train(
     safe: bool = False,
     use_disagreement: bool = False,
     normalize_budget: bool = True,
+    design_loop=None,
+    design_updates_per_eval: int = 1,
+    unnormalized_obs_tail: int = 0,
 ):
     assert batch_size * num_minibatches % num_envs == 0
     if not safe:
@@ -193,12 +196,21 @@ def train(
     # The number of training_step calls per training_epoch call.
     # equals to ceil(num_timesteps / (num_evals * env_step_per_training_step *
     #                                 num_resets_per_eval))
+    # With design optimization on, ONE EPOCH IS ONE DESIGN ITERATION: the
+    # design can only be resampled at a Python boundary (the models are
+    # compiled host-side by MuJoCo), and `training_epoch` is the only such
+    # boundary. Dividing the epoch length by design_updates_per_eval keeps the
+    # total step budget identical while giving the distribution that many
+    # REINFORCE updates per eval. Schaff resamples every PPO iteration; this is
+    # the closest equivalent that does not pay a host round-trip per minibatch.
+    design_iters_per_eval = design_updates_per_eval if design_loop is not None else 1
     num_training_steps_per_epoch = np.ceil(
         num_timesteps
         / (
             num_evals_after_init
             * env_step_per_training_step
             * max(num_resets_per_eval, 1)
+            * design_iters_per_eval
         )
     ).astype(int)
 
@@ -215,6 +227,22 @@ def train(
     env = environment
     env = TrackOnlineCosts(env)
     reset_fn = jax.jit(jax.vmap(env.reset))
+    # Design-aware reset. `install` assigns the incoming arrays onto the
+    # MorphologyDesignWrapper DURING TRACING, so they are compiled in as real
+    # arguments rather than baked-in constants -- the same trick the
+    # randomization wrappers already use when they mutate `_mjx_model` inside a
+    # vmapped function. Measured: swapping to an entirely different population
+    # costs 0.04 s with the compile cache unchanged, against ~57 s if the graph
+    # retraced. That is the single thing that makes per-iteration design
+    # resampling affordable here.
+    design_reset_fn = None
+    if design_loop is not None:
+
+        def _reset_with_design(rng, fields, genes):
+            design_loop.install(fields, genes)
+            return env.reset(rng)
+
+        design_reset_fn = jax.jit(jax.vmap(_reset_with_design))
     key_envs = jax.random.split(key_env, num_envs // process_count)
     key_envs = jnp.reshape(
         key_envs,
@@ -224,7 +252,26 @@ def train(
     obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
     normalize = lambda x, y: x
     if normalize_observations:
-        normalize = running_statistics.normalize
+        if unnormalized_obs_tail:
+            # SCHAFF EXCLUDES DESIGN PARAMS FROM OBSERVATION NORMALISATION
+            # (`model.py:RunningObsNorm`, which slices them off before
+            # delegating). It matters more here than it looks: the genes are a
+            # fixed encoding of the body, but running statistics would whiten
+            # them against a batch whose design distribution is MOVING -- so
+            # the same body would present differently to the policy as the
+            # search narrows, which is a moving target on top of a moving
+            # target. The tail is pasted back raw; its statistics are still
+            # accumulated but never used, which is harmless.
+            _tail = int(unnormalized_obs_tail)
+
+            def normalize(x, params):
+                normed = running_statistics.normalize(x, params)
+                return jnp.concatenate(
+                    [normed[..., :-_tail], x[..., -_tail:]], axis=-1
+                )
+
+        else:
+            normalize = running_statistics.normalize
     ppo_network = network_factory(
         obs_shape, env.action_size, preprocess_observations_fn=normalize
     )
@@ -475,7 +522,23 @@ def train(
     for it in range(num_evals_after_init):
         logging.info("starting iteration %s %s", it, time.time() - xt)
 
-        for _ in range(max(num_resets_per_eval, 1)):
+        for _ in range(max(num_resets_per_eval, 1) * design_iters_per_eval):
+            if design_loop is not None:
+                # Sample a fresh population, compile it host-side, and RESET
+                # onto it. The reset is not optional: BraxAutoResetWrapper
+                # captures `first_state` at reset and replays it on every
+                # subsequent `done`, so a new body would otherwise keep being
+                # respawned into the previous body's initial pose.
+                fields, genes = design_loop.sample(
+                    local_devices_to_use, num_envs // process_count
+                )
+                key_env, design_key = jax.random.split(key_env)
+                design_keys = jnp.reshape(
+                    jax.random.split(design_key, num_envs // process_count),
+                    (local_devices_to_use, -1, 2),
+                )
+                env_state = design_reset_fn(design_keys, fields, genes)
+
             # optimization
             epoch_key, local_key = jax.random.split(local_key)
             epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
@@ -483,6 +546,11 @@ def train(
                 training_state, env_state, epoch_keys
             )
             current_step = int(_unpmap(training_state.env_steps))
+            if design_loop is not None:
+                training_metrics = dict(training_metrics)
+                training_metrics.update(
+                    design_loop.finish_iteration(env_state, current_step)
+                )
             key_env, tmp_key = jax.random.split(key_env)
             key_envs = jax.random.split(tmp_key, num_envs // process_count)
             key_envs = jnp.reshape(

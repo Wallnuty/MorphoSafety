@@ -394,6 +394,62 @@ def build_batch(
     return batch_models(mj_models)
 
 
+def build_design_batch(
+    specs: Sequence[MorphologySpec],
+    replicas: int,
+    model_builder: Callable[[MorphologySpec], mj.MjModel] | None = None,
+    arena_spec: dict[str, ObjectSpec] | None = None,
+    integrator: str | None = None,
+    robot: str = "ant",
+) -> tuple[mjx.Model, dict[str, jax.Array], jax.Array]:
+    """Like `randomization_fn`, but returns the varying fields SEPARATELY.
+
+    Returns `(base_model, fields, genes)` where `base_model` is a single
+    UNBATCHED `mjx.Model` (static fields already pinned) and `fields` maps each
+    name in `_BATCHED_FIELDS` to an array with a leading `num_envs` axis.
+
+    WHY THIS EXISTS RATHER THAN REUSING `randomization_fn`. That function hands
+    the batched model to `MorphologyDomainRandomizationWrapper`, which closes
+    over it as a Python attribute -- so it is traced as a CONSTANT, and
+    swapping designs retraces the whole training graph (~58 s measured, against
+    ~4 s per training step). Schaff's method resamples designs every iteration,
+    which that arrangement makes impossible.
+
+    Splitting the model into "base + per-lane field arrays" lets the fields
+    travel inside `state.info`, i.e. inside `env_state`, which is ALREADY an
+    argument to `training_epoch`. Swapping designs then changes array values at
+    identical shapes and dtypes, so nothing retraces. It also removes the need
+    for `in_axes`: once the fields live in the (already batched) state, the
+    vmap over lanes is plain `in_axes=0`.
+
+    `randomization_fn` is deliberately left untouched -- every existing call
+    site and `scripts/eval_morphology.py` still depend on it.
+    """
+    if model_builder is None:
+        mj_models = [
+            build_mj_model(spec, arena_spec, integrator, robot) for spec in specs
+        ]
+    else:
+        mj_models = [model_builder(spec) for spec in specs]
+
+    mjx_models = [mjx.put_model(m) for m in mj_models]
+    base = mjx_models[0]
+    pinned = {
+        f: np.maximum.reduce([np.asarray(getattr(m, f)) for m in mjx_models])
+        for f in _STATIC_PINNED_FIELDS
+    }
+    base = base.tree_replace(pinned)
+
+    fields = {
+        f: jp.repeat(
+            jp.stack([getattr(m, f) for m in mjx_models]), replicas, axis=0
+        )
+        for f in _BATCHED_FIELDS
+    }
+    genes = np.repeat(np.stack([s.genes for s in specs]), replicas, axis=0)
+    return base, fields, jp.asarray(genes, dtype=jp.float32)
+
+
 def randomization_fn(
     mjx_model: mjx.Model,
     rng: jax.Array,
