@@ -167,7 +167,7 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
     return jax.jit(jax.vmap(one))(jp.asarray(seeds))
 
 
-def summarise(name, out):
+def summarise(name, out, boundary_weight: float = 1.0):
     r, c, oob, goals, dist, path, dy, steps = (np.asarray(x) for x in out)
     n = len(r)
     return {
@@ -178,8 +178,14 @@ def summarise(name, out):
         "distance_se": dist.std(ddof=1) / np.sqrt(n),
         "cost": c.mean(),
         "cost_se": c.std(ddof=1) / np.sqrt(n),
-        "boundary": oob.mean(),
-        "hazard": c.mean() - oob.mean(),
+        # `oob` is the RAW 0/1 out-of-bounds indicator, but `cost` contains it
+        # already SCALED by boundary_cost_weight -- so subtracting the raw count
+        # only recovers hazard when that weight is exactly 1.0. It is not, on any
+        # run using --corridor_walls (where 0.0 keeps cost as pure hazard), and
+        # the un-scaled version would then under-report hazard by the number of
+        # out-of-bounds steps.
+        "boundary": oob.mean() * boundary_weight,
+        "hazard": c.mean() - oob.mean() * boundary_weight,
         "path": path.mean(),
         "lateral": np.abs(dy).mean(),
         "raw": dist,
@@ -249,12 +255,14 @@ def main() -> None:
         f" env steps ({n_decisions} decisions x action_repeat {action_repeat})"
     )
     print("untrained control:")
+    bw = float(getattr(env.unwrapped, "_boundary_cost_weight", 1.0))
     untrained = summarise(
         "untrained",
         rollout_many(
             env, build_policy(None, env, args.deterministic, 0), seeds,
             n_decisions, action_repeat,
         ),
+        bw,
     )
     ckpt = Path(args.checkpoint)
     trained = None
@@ -266,16 +274,26 @@ def main() -> None:
                 env, build_policy(ckpt, env, args.deterministic, 0), seeds,
                 n_decisions, action_repeat,
             ),
+            bw,
         )
     else:
         print(f"  (no checkpoint at {ckpt}, control only)")
 
     goal_task = args.task == "goal"
+    # "net +x IS the return" holds only while forward progress is the ONLY
+    # reward term. `goal_reward_weight` (ON by default for both ants since
+    # 2026-08-15) adds a distance-delta that telescopes to the same magnitude
+    # again, so on a corridor run the return is ~2x the displacement. Labelling
+    # it "net +x m" produced a reading of "the ant travelled 21.2 m" down an
+    # 11 m corridor -- the number was right, the unit was not.
+    shaped_return = goal_task or bool(
+        getattr(env.unwrapped, "_goal_reward_weight", 0.0)
+    )
     # On RunForward the return IS net +x displacement in metres. On GoToGoal it
     # is shaped progress plus +1 per goal, so calling it a distance would be a
     # lie -- goals/ep is the readable number there (the point's unconstrained
     # ceiling was 3.94).
-    ret_label = "return" if goal_task else "net +x m"
+    ret_label = "return" if shaped_return else "net +x m"
     header = f"{'policy':<11}{ret_label:>13}"
     if goal_task:
         header += f"{'goals/ep':>10}"
@@ -297,16 +315,21 @@ def main() -> None:
     print()
     print("`path` is total distance travelled by the torso site (thrashing in "
           "place shows\nup here and nowhere else); `|dy|` is net lateral travel."
-          + ("" if goal_task else
-             " On the run task, net +x\nIS the episode return, and `boundary` is"
-             " the part of cost from leaving the\ncorridor."))
+          + (" `boundary` is the part of cost from\nleaving the corridor."
+             if shaped_return else
+             " On the run task with goal shaping off,\nnet +x IS the episode"
+             " return, and `boundary` is the part of cost from\nleaving the"
+             " corridor."))
 
     if trained is not None:
         # paired differences: same arena seed in both arms, so the per-episode
         # difference cancels layout variance instead of averaging over it
         print()
         for label, key, unit in (
-            ("net +x  ", "raw", "m"),
+            # Same relabelling as the table above: with goal shaping on this is
+            # the episode return, not a distance.
+            ("return  " if shaped_return else "net +x  ", "raw",
+             "" if shaped_return else "m"),
             ("path    ", "raw_path", "m"),
             ("cost    ", "raw_cost", ""),
         ):
