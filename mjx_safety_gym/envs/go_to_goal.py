@@ -153,7 +153,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         num_hazards: int = 10,
         num_vases: int = 10,
         lidar_groups: Optional[Sequence[str]] = None,
-        hazard_size: float = 0.14,
+        hazard_size: float = 0.18,
         hazard_step_on: bool = True,
         ground_contact_eps: float | None = None,
     ):
@@ -205,11 +205,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # asks for a GAIT matched to the obstacle pitch rather than for
         # long-range route planning. See RunForward's `lidar_groups` default.
         self._lidar_groups = tuple(groups)
-        # HAZARD RADIUS before arena scaling. 0.14 since 2026-08-22 (user's
-        # call), down from safety-gym's 0.2 -- 0.7x. Smaller discs make the
+        # HAZARD RADIUS before arena scaling. 0.18 since 2026-08-22 (user's
+        # call), i.e. 0.9x safety-gym's 0.2 -- it went to 0.14 (0.7x) earlier
+        # the same day and was raised again. Slightly smaller discs make the
         # corridor a field to be threaded by foot placement rather than a wall
-        # to be routed around. Every cost number measured at 0.2 is on a
-        # different scale; pass hazard_size=0.2 to reproduce them.
+        # to be routed around, but 0.14 left more free width than intended: at
+        # 20 hazards it blocked 56% of the corridor to a straight-line path.
+        # Every cost number measured at a different radius is on a different
+        # scale; pass hazard_size=0.2 to reproduce safety-gym's.
         self._hazard_size = float(hazard_size)
         # DEFAULT ON since 2026-08-22 (user's call). Hazard cost is charged only
         # while a robot geom is ON THE GROUND inside the hazard disc. The old

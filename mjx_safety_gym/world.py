@@ -137,7 +137,7 @@ def build_arena(
             name=f"hazard_{i}_geom",
             type=mj.mjtGeom.mjGEOM_CYLINDER,
             # `hazard_size` is the RADIUS before arena scaling. 0.2 is
-            # safety-gym's original; GoToGoal now defaults to 0.14 (0.7x) --
+            # safety-gym's original; GoToGoal now defaults to 0.18 (0.9x) --
             # see its constructor. _post_init reads the radius back off this
             # geom, so the cost threshold follows automatically and cannot
             # drift from the disc that is drawn.

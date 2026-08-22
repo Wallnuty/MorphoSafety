@@ -678,11 +678,12 @@ def build_argparser() -> argparse.ArgumentParser:
         "boundary, so this is no longer the dominant term it once was.",
     )
     parser.add_argument(
-        "--hazard_size", type=float, default=0.14,
-        help="Hazard RADIUS before arena scaling. 0.14 since 2026-08-22, down "
-        "from safety-gym's 0.2 (0.7x): smaller discs make the corridor a field "
-        "to be threaded by foot placement rather than a wall to be routed "
-        "around. Every cost number measured at 0.2 is on a different scale. "
+        "--hazard_size", type=float, default=0.18,
+        help="Hazard RADIUS before arena scaling. 0.18 since 2026-08-22, i.e. "
+        "0.9x safety-gym's 0.2: slightly smaller discs make the corridor a "
+        "field to be threaded by foot placement rather than a wall to be routed "
+        "around. Every cost number measured at a different radius is on a "
+        "different scale. "
         "The cost threshold is read back off the compiled geom, so it follows "
         "this automatically and cannot drift from the disc that is drawn.",
     )
