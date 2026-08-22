@@ -31,7 +31,23 @@ ROOT="$PWD"
 STATE="$ROOT/cluster/vast/.instance"      # gitignored; holds the instance id
 REMOTE_DIR="/root/MorphoSafety"
 IMAGE="${IMAGE:-pytorch/pytorch}"
-DISK="${DISK:-40}"
+# 20, down from 40 (2026-08-22). Vast bills ALLOCATED disk, not used, so the
+# only change that reduces the storage line is this number -- deleting files
+# on the box saves nothing by itself.
+#
+# What actually has to fit, measured rather than guessed:
+#   pytorch/pytorch:latest   ~8-9 GB on disk (3.66 GB compressed on Docker Hub)
+#   the `morpho` conda env    ~6.1 GB, of which 4.4 GB is the nvidia-*-cu12
+#                             wheels jax requires -- irreducible
+#   repo + checkpoints        ~0.1 GB (a checkpoint is 6.4 MB; 10 of them)
+#
+# NOT 12. 12 is the right number only once IMAGE is a slim base; against
+# pytorch/pytorch the image plus the env is ~15 GB and provisioning would die
+# partway through the wheel install, which costs a whole rental cycle to
+# discover. 20 also stays safe under either answer to a thing never actually
+# measured here: whether Vast counts the docker image against this allocation.
+# Run `df -h /` on the next rental and shrink it further if it does not.
+DISK="${DISK:-20}"
 
 # vastai lives in conda base, not in mjx-safety-gym -- deliberately, so a CLI
 # dependency can never perturb the training environment.

@@ -70,8 +70,22 @@ echo "=== project + CUDA jax (~3 GB of nvidia wheels, a few minutes) ==="
 # on 2026-08-16 along with the test suite; pip only WARNS on an unknown extra
 # rather than failing, so asking for it here would have gone unnoticed while
 # quietly meaning nothing.
-pip install -q --upgrade pip
-pip install -q -e ".[cuda]"
+#
+# --no-cache-dir throughout. pip otherwise keeps every wheel it downloaded,
+# and this install pulls ~3 GB of nvidia-*-cu12 wheels -- so the cache is ~3 GB
+# of a 20 GB allocation, held for the life of the instance, to speed up a
+# reinstall that never happens (the box is destroyed when the run ends; see
+# vast.sh's note that storage costs ~17x more per day than reprovisioning once).
+pip install -q --no-cache-dir --upgrade pip
+pip install -q --no-cache-dir -e ".[cuda]"
+
+# conda's own package cache is a separate ~1 GB, kept for the same never-used
+# reason. `|| true` because a clean failure must not fail a provision that has
+# already done all the real work.
+echo "  reclaiming caches..."
+conda clean -a -y >/dev/null 2>&1 || true
+pip cache purge >/dev/null 2>&1 || true
+df -h / | awk 'NR==1 || /\/$/ {print "  " $0}'
 
 echo
 echo "=== GPU PREFLIGHT ==="
