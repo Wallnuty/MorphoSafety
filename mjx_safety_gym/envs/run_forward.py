@@ -149,6 +149,7 @@ class RunForward(GoToGoal):
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.0,
         boundary_cost_weight: float = 1.0,
+        corridor_walls: bool = True,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
         terminate_on_goal: bool = True,
@@ -176,6 +177,7 @@ class RunForward(GoToGoal):
         self._forward_reward_weight = float(forward_reward_weight)
         self._ctrl_cost_weight = float(ctrl_cost_weight)
         self._boundary_cost_weight = float(boundary_cost_weight)
+        self._corridor_walls = bool(corridor_walls)
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
         self._terminate_on_goal = bool(terminate_on_goal)
@@ -214,8 +216,69 @@ class RunForward(GoToGoal):
                 self._corridor_half_width + 1.5 * self._arena_scale,
             ),
             obstacle_scale=self._arena_scale,
+            lidar_groups=self._lidar_groups,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
+        if self._corridor_walls:
+            self._add_corridor_walls(mjSpec)
+
+    def _add_corridor_walls(self, spec: mj.MjSpec) -> None:
+        """Two static boxes that make the corridor PHYSICAL rather than a cost.
+
+        ON BY DEFAULT since 2026-08-22. Pass corridor_walls=False (CLI:
+        --no-corridor_walls) to reproduce anything measured before that date.
+
+        WHY THIS REPLACES THE BOUNDARY COST. Leaving a corridor is a task-scope
+        violation, not a safety violation, and charging it as `cost` put it in
+        the same signal as hazard proximity -- so a constrained run optimised
+        "stay in your lane" rather than "avoid the mines". It was also an
+        unobservable constraint for most of this project's history. Worse, with
+        the boundary cost simply removed, the constrained optimum becomes a ~4%
+        longer path bowing out to |y| ~ 1.4 where no hazard is ever sampled
+        (hazards are drawn uniformly in |y| <= corridor_half_width). A wall
+        makes that exploit IMPOSSIBLE rather than merely expensive, and leaves
+        `cost` as pure hazard proximity.
+
+        BOXES, NOT VERTICAL PLANES, and that is the load-bearing choice.
+        `max_geom_pairs=16` caps the broad phase PER COLLISION-TYPE GROUP. The
+        ant's geoms against the floor already are the capsule-vs-plane group,
+        and it is already truncated -- so wall planes would compete with the
+        FLOOR for those 16 slots and could evict foot contacts whenever the
+        robot came near a wall, i.e. sink it through the ground exactly when it
+        is against a wall. Boxes land in the separate capsule-vs-box group,
+        which on `minefield` is completely empty (no vases), so the walls
+        cannot displace a single floor contact. Verify with
+        `scripts/verify_contact_capping.py` rather than trusting this note.
+
+        Static geoms on the worldbody: no joints, so `nq`/`nv` are unchanged
+        and minefield keeps its speed (vases were expensive because they were
+        FREE BODIES, not because they collided). Not added to any lidar group,
+        so the observation width does not change and every existing checkpoint
+        still loads.
+        """
+        a = self._arena_scale
+        # Half-length matches the floor's own x half-extent, so there is no gap
+        # to round the end of a wall through.
+        half_len = 0.5 * self._corridor_length + 1.0 * a
+        half_thick = 0.05 * a
+        # Tall enough that the ant cannot climb or ballistically clear it: the
+        # ant's torso stands at ~0.33 m at arena_scale 1, ant_gym's at ~0.67.
+        half_height = 0.5 * a
+        for sign, side in ((1.0, "left"), (-1.0, "right")):
+            spec.worldbody.add_geom(
+                name=f"corridor_wall_{side}",
+                type=mj.mjtGeom.mjGEOM_BOX,
+                size=[half_len, half_thick, half_height],
+                # Inner FACE sits exactly on +-corridor_half_width, so the wall
+                # stands where the boundary cost used to be charged rather than
+                # a wall-thickness away from it.
+                pos=[
+                    0.0,
+                    sign * (self._corridor_half_width + half_thick),
+                    half_height,
+                ],
+                rgba=[0.35, 0.35, 0.40, 0.6],
+            )
 
     def _sample_corridor_layout(
         self, rng: jax.Array
@@ -496,6 +559,24 @@ class RunForward(GoToGoal):
             # auto-reset wrapper, so both must list all of them.
             "out_of_bounds": jp.zeros(()),
             "upright": self.is_upright(data),
+            # ARRIVAL LATCH, and it has to live in the env rather than be read
+            # off `state.data` afterwards, for two independent reasons:
+            #
+            #   1. `BraxAutoResetWrapper` swaps `data` for the reset pose on the
+            #      very step `done` is set, so anything calling `at_goal()` after
+            #      the fact inspects the START pose and reads 0% arrived. That
+            #      exact mistake void-ed a whole eval pass of
+            #      scripts/eval_morphology.py, which now has to pin
+            #      terminate_on_goal=False to work around it.
+            #   2. `CostEpisodeWrapper` scans `action_repeat` inner steps and
+            #      does NOT break on `done`, so a single post-scan reading can
+            #      miss an arrival that happened two inner steps earlier. A
+            #      running `jp.maximum` cannot.
+            #
+            # Cleared by `EpisodeStatsWrapper` on the done step -- nothing else
+            # clears it, because auto-reset leaves `info` untouched. Anyone
+            # adding another consumer must not clear it a second time.
+            "arrived": jp.zeros(()),
         }
         return State(data, self.get_obs(data), jp.zeros(()), jp.zeros(()), {}, info)
 
@@ -535,9 +616,14 @@ class RunForward(GoToGoal):
         # the telescoping property that makes episode return readable directly
         # as metres travelled, which is the one thing that has made this reward
         # debuggable.
+        at_goal = self.at_goal(data)
         if self._terminate_on_goal:
-            done = jp.maximum(done, self.at_goal(data))
+            done = jp.maximum(done, at_goal)
 
+        # Latched unconditionally, including when terminate_on_goal is off, so
+        # "did this episode ever reach the goal" is answerable either way. One
+        # extra float per lane; the distance it needs was already computed.
+        state.info["arrived"] = jp.maximum(state.info["arrived"], at_goal)
         state.info["cost"] = cost
         state.info["upright"] = self.is_upright(data)
         state.info["out_of_bounds"] = (

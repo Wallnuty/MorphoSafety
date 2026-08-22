@@ -109,4 +109,12 @@ class Minefield(RunForward):
                 self._corridor_half_width + 1.5 * self._arena_scale,
             ),
             obstacle_scale=self._arena_scale,
+            lidar_groups=self._lidar_groups,
         )
+        # MUST be repeated here. This method OVERRIDES RunForward's, so the
+        # identical call at the end of that one does not run for Minefield --
+        # which is exactly how the walls silently failed to appear on their
+        # first test (ngeom 35 with and without them). Any future _build_arena
+        # override on a corridor task has to end with this line too.
+        if self._corridor_walls:
+            self._add_corridor_walls(mjSpec)

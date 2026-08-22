@@ -363,9 +363,10 @@ class DesignLoop:
     DEVIATION, stated plainly: upstream scores a component for chopping by
     drawing 100 designs from it and rolling each out under the current policy
     (`component_chopper.py`). Here each component's score is an exponential
-    moving average of the returns its own samples already earned during
-    training. The DECISION RULE is unchanged -- kill the worst half, 8 -> 4 ->
-    2 -> 1, reset Adam -- but the estimate costs no extra rollouts and is
+    moving average of the scores its own samples already earned during
+    training (see `scores_from` -- time-to-goal by default, not return). The
+    DECISION RULE is unchanged -- kill the worst half, 8 -> 4 -> 2 -> 1, reset
+    Adam -- but the estimate costs no extra rollouts and is
     pooled over far more samples than 100. It is lagged, though: the average
     spans a window over which both the component and the policy moved, where
     upstream's is computed fresh at the moment of the chop.
@@ -384,6 +385,10 @@ class DesignLoop:
         steps_after_update: int = 0,
         chop_freq: int | None = None,
         ema: float = 0.9,
+        objective: str = "time",
+        action_repeat: int = 1,
+        max_decisions: int | None = None,
+        return_ceiling: float | None = None,
     ) -> None:
         self.gmm = gmm
         self._spec_factory = spec_factory  # genes array -> MorphologySpec
@@ -396,6 +401,21 @@ class DesignLoop:
         self.steps_after_update = int(steps_after_update)
         self.chop_freq = chop_freq
         self.ema = float(ema)
+        if objective not in ("time", "return"):
+            raise ValueError(f"unknown design objective {objective!r}")
+        self.objective = objective
+        self.action_repeat = int(action_repeat)
+        if objective == "time":
+            if not max_decisions or not return_ceiling:
+                raise ValueError(
+                    "objective='time' needs max_decisions and return_ceiling"
+                )
+            self.max_decisions = int(max_decisions)
+            self.return_ceiling = float(return_ceiling)
+        else:
+            self.max_decisions = max_decisions
+            self.return_ceiling = return_ceiling
+        self._aux: dict[str, float] = {}
 
         self._pending = None  # (params, comps) awaiting a score
         self._comp_scores: dict[int, float] = {}
@@ -451,17 +471,82 @@ class DesignLoop:
         return fields, genes
 
     def scores_from(self, env_state) -> tuple[np.ndarray, np.ndarray]:
-        """Mean completed-episode return per design, and episodes counted.
+        """Mean score per design (HIGHER IS BETTER), and episodes counted.
 
         Lanes are BLOCKED, not interleaved -- `build_design_batch` repeats each
         spec `replicas` times contiguously -- so a flat reshape recovers the
         per-design grouping.
+
+        TWO OBJECTIVES, and the default is NOT the upstream one:
+
+        `objective="time"` (default) scores a design by how long it takes to
+        reach the goal, negated so that higher is better. This is the same
+        scalar `scripts/eval_morphology.time_fitness` computes, so a design's
+        training score and its offline evaluation are the same quantity:
+
+            arrived      -> the arrival decision
+            did not      -> max_decisions * (1 + shortfall)
+
+        with `shortfall = clip(1 - return/ceiling, 0, 1)`. Every arrival
+        outranks every non-arrival, and non-arrivals are ordered by how far
+        short they fell.
+
+        IT DEGRADES GRACEFULLY EARLY IN TRAINING, which is the reason it is safe
+        to switch on from step 0. Before any design arrives, every fitness is
+        `max_decisions * (1 + shortfall)`, which is monotone in return -- so the
+        ranking is EXACTLY the one `objective="return"` would give, i.e. "how far
+        did it get". Only once bodies start arriving does the objective start
+        discriminating on speed, which is precisely when return stops being able
+        to. No burn-in is needed to keep the signal alive.
+
+        `objective="return"` is Schaff's own score (`algorithm.py` reads
+        `env.reward_buffer[-1]`) and is kept for the faithful baseline. IT IS
+        NEARLY BLIND ON THIS TASK, which is why it is not the default. The
+        reward telescopes to `dx + (d_start - d_end) + healthy`, so a full
+        traverse scores the goal distance twice NO MATTER HOW LONG IT TOOK --
+        measured on the 50M conditioned run, arrival times spanned 175-328
+        decisions (1.87x) while returns spanned 22.49-22.51 (std 0.003). Worse,
+        the only speed-dependent term left points the WRONG WAY: `healthy` is
+        paid per inner step, so under terminate_on_goal a slower body that also
+        arrives collects MORE of it (~0.24 vs ~0.13 for the ant, on a base of
+        22). Under `objective="return"` REINFORCE can therefore separate
+        "arrives" from "does not arrive" and essentially nothing else.
+
+        With `objective="time"` arrival time IS the episode length, because
+        terminate_on_goal ends the episode on contact with the goal --
+        `train_ppo.validate()` refuses the combination without it, since
+        otherwise every arriving body reads the truncation cap and the
+        objective silently degenerates to a constant.
         """
-        ret = np.asarray(env_state.info["ep_return_last"]).reshape(-1)
-        cnt = np.asarray(env_state.info["ep_count"]).reshape(-1)
-        ret = ret.reshape(self.num_morphologies, -1)
-        cnt = cnt.reshape(self.num_morphologies, -1)
-        return ret.mean(axis=1), cnt.sum(axis=1)
+        info = env_state.info
+        shape = (self.num_morphologies, -1)
+        cnt = np.asarray(info["ep_count"]).reshape(shape)
+        ret = np.asarray(info["ep_return_last"]).reshape(shape)
+        counts = cnt.sum(axis=1)
+
+        if self.objective == "return":
+            self._aux = {}
+            return ret.mean(axis=1), counts
+
+        arrived = np.asarray(info["ep_arrived_last"]).reshape(shape) > 0
+        decisions = (
+            np.asarray(info["ep_len_last"]).reshape(shape) / self.action_repeat
+        )
+        shortfall = np.clip(1.0 - ret / self.return_ceiling, 0.0, 1.0)
+        fitness = np.where(
+            arrived, decisions, self.max_decisions * (1.0 + shortfall)
+        )
+        # Reported in the natural units as well as the negated score, because
+        # "design/score_mean = -212" is not a number anyone can sanity-check
+        # against a rollout, and 212 decisions is.
+        self._aux = {
+            "design/fitness_decisions": float(fitness.mean()),
+            "design/arrival_rate": float(arrived.mean()),
+            "design/arrival_decisions": (
+                float(decisions[arrived].mean()) if arrived.any() else float("nan")
+            ),
+        }
+        return -fitness.mean(axis=1), counts
 
     def finish_iteration(self, env_state, step: int) -> dict:
         """Score the population, take one REINFORCE step, chop on schedule."""
@@ -473,6 +558,7 @@ class DesignLoop:
             "design/episodes_per_design": float(counts.mean()),
             "design/components": float(self.gmm.components_left()),
         }
+        metrics.update(self._aux)
 
         # A DESIGN WITH NO COMPLETED EPISODE MUST NOT ENTER THE UPDATE. Its
         # `ep_return_last` is still the reset value (0.0), which after

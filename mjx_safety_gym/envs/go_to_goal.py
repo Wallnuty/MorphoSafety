@@ -153,6 +153,8 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         num_hazards: int = 10,
         num_vases: int = 10,
         lidar_groups: Optional[Sequence[str]] = None,
+        hazard_step_on: bool = True,
+        ground_contact_eps: float | None = None,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -174,9 +176,21 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # The `object` ring is dead in EVERY task -- `_object_body_ids` is
         # assigned `[]` in _post_init and never written to. It is the slot
         # safety-gym uses for the Push task's box, which this repo does not
-        # implement. It is kept in the default only so the goal task's width,
-        # and therefore its checkpoints, do not move.
-        groups = list(lidar.LIDAR_GROUPS if lidar_groups is None else lidar_groups)
+        # implement. It USED to be kept in the default purely so the goal task's
+        # width did not move; DROPPED 2026-08-22 on the user's call, after an
+        # audit measured it at 0/16 live dims (max value 0.0000) over ~7,700
+        # observations while obstacle and goal both read 16/16.
+        #
+        # THIS NARROWS THE GOAL TASK BY 16 (ant 76 -> 60, point 60 -> 44) and so
+        # invalidates every pre-2026-08-22 goal-task checkpoint. They remain
+        # loadable by passing lidar_groups=("obstacle","goal","object")
+        # explicitly -- which is what train_ppo._LEGACY_LIDAR_GROUPS is, and it
+        # is already one of the configurations build_env_for_checkpoint tries.
+        # run/minefield are UNAFFECTED: they pass ("obstacle",) explicitly and
+        # dropped both other rings back on 2026-08-15.
+        groups = list(
+            lidar.DEFAULT_LIDAR_GROUPS if lidar_groups is None else lidar_groups
+        )
         unknown = [g for g in groups if g not in lidar.LIDAR_GROUPS]
         if unknown:
             raise ValueError(
@@ -185,10 +199,38 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         if not groups:
             raise ValueError("lidar_groups cannot be empty -- the robot would be blind")
         self._lidar_groups = tuple(groups)
+        # DEFAULT ON since 2026-08-22 (user's call). Hazard cost is charged only
+        # while a robot geom is ON THE GROUND inside the hazard disc. The old
+        # test was purely 2D, so a foot swung THROUGH THE AIR over a mine cost
+        # exactly as much as standing on it -- it charged the ant for its gait
+        # rather than for where it put its weight.
+        #
+        # THIS CHANGES WHAT `cost` MEANS, so every cost number measured before
+        # this date is on a different scale. Measured on the 50M unconstrained
+        # policy, 128 episodes, both tests evaluated along the SAME trajectory:
+        # 465.2 (2D) vs 335.1 (step-on), paired difference -130.1 +- 4.4, i.e.
+        # **28% of the old cost was pass-over**. Superseded by this flip:
+        # the 452.5 hazard baseline and the --safety_budget 250 derived from it.
+        # New reference: 1.127 cost/decision unconstrained, so a 25% target is
+        # --safety_budget 176.
+        #
+        # Pass hazard_step_on=False (CLI: --no-hazard_step_on) to reproduce
+        # anything measured before this date.
+        self._hazard_step_on = bool(hazard_step_on)
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
         self._arena_scale = float(_ROBOT_CONFIGS[robot]["arena_scale"])
+        # How far a geom's lowest point may sit above the floor and still count
+        # as "on the ground", for --hazard_step_on. Scales with the robot,
+        # because a tolerance that is generous for the 0.06 m-radius ant foot is
+        # invisible against ant_gym's 4x geometry. Assigned AFTER _arena_scale,
+        # which it depends on.
+        self._ground_contact_eps = (
+            0.02 * self._arena_scale
+            if ground_contact_eps is None
+            else float(ground_contact_eps)
+        )
         a = self._arena_scale
         # Counts are parameters rather than literals so a subclass can drop a
         # whole obstacle class. That is not cosmetic: vases are the only
@@ -315,6 +357,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         build_arena(
             mjSpec, objects=self.spec, visualize=True,
             obstacle_scale=self._arena_scale,
+            lidar_groups=self._lidar_groups,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
 
@@ -544,6 +587,33 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # nearest geom: (H, G) -> (H,)
         surface_distances = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
         surface_distances -= robot_geom_radius[None, :]
+
+        if self._hazard_step_on:
+            # STEP-ON SEMANTICS: a geom only triggers a hazard while it is on the
+            # ground. Without this the test above is purely 2D, so a foot swung
+            # THROUGH THE AIR over a mine is charged exactly as much as standing
+            # on it -- which is not what a minefield means, and it charges the
+            # ant for a gait rather than for where it puts its weight.
+            #
+            # Gate on the geom's LOWEST POINT rather than on mjx contacts. A
+            # capsule's lowest point is centre_z - |axis_z| * half_len - radius
+            # (spheres are the half_len == 0 case, and _robot_geom_extent already
+            # returns them that way). Contacts would be the more literal test but
+            # go through the broad phase, which `max_geom_pairs=16` truncates --
+            # so a foot genuinely on the ground could be missing from
+            # `data.contact` and silently escape its cost. Geometry cannot be
+            # truncated.
+            lowest_z = (
+                geom_pos[:, 2]
+                - jp.abs(geom_axis[:, 2]) * robot_geom_half_len
+                - robot_geom_radius
+            )
+            grounded = lowest_z <= self._ground_contact_eps  # (G,)
+            # A large finite sentinel, not jp.inf: an all-airborne robot would
+            # otherwise reduce to inf and any later arithmetic on it produces
+            # NaN rather than a clean "no hazard".
+            surface_distances = jp.where(grounded[None, :], surface_distances, 1e6)
+
         hazard_distances = jp.min(surface_distances, axis=1)
         # jax.debug.print("Hazard distances: {dist}", dist=hazard_distances)
 

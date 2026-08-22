@@ -72,6 +72,7 @@ def build_arena(
     floor_half_size: tuple[float, float] | None = None,
     obstacle_scale: float = 1.0,
     vase_mass: float | None = None,
+    lidar_groups=None,
 ):
     """Build the arena (currently, just adds Lidar rings). Future: dynamically add obstacles, hazards, objects, goal here
 
@@ -151,9 +152,11 @@ def build_arena(
         conaffinity=jp.zeros(()),
     )
 
-    # Visualize lidar rings
+    # Visualize lidar rings -- ONLY the ones the env actually emits. Passing
+    # None draws all of LIDAR_GROUPS, which leaves faint ghost rings (alpha 0.1)
+    # hovering over a robot that does not have them.
     if visualize:
-        lidar.add_lidar_rings(spec)
+        lidar.add_lidar_rings(spec, lidar_groups)
 
 
 def placement_not_valid(xy, object_keepout, other_xy, other_keepout):

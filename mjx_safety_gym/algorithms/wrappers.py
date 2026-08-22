@@ -319,28 +319,32 @@ class MorphologyDesignWrapper(Wrapper):
         return jax.vmap(step)(state, action)
 
 
-class EpisodeReturnWrapper(Wrapper):
-    """Track per-lane episode return, for the design-distribution update.
+class EpisodeStatsWrapper(Wrapper):
+    """Latch per-lane episode statistics, for the design-distribution update.
 
-    Schaff's REINFORCE step scores each sampled design by its episode return
-    (`algorithm.py:_update_robot_dist` reads `env.reward_buffer[-1]`). Nothing
-    in this repo recorded that: `CostEpisodeWrapper` accumulates cost and step
-    count but not return, and `episode_reward` only ever appears in EVAL
-    metrics, which are computed on a different env with different designs.
+    Records, per lane, the RETURN, the LENGTH and whether the goal was reached
+    for the most recently COMPLETED episode. Nothing in this repo recorded any
+    of it: `CostEpisodeWrapper` accumulates cost and step count but not return,
+    and `episode_reward` only ever appears in EVAL metrics, which are computed
+    on a different env with different designs.
 
-    Sits OUTSIDE `CostEpisodeWrapper` and INSIDE `BraxAutoResetWrapper`, so it
-    sees the reward already summed over `action_repeat` and the `done` that
-    wrapper sets, but runs before auto-reset swaps the data out.
+    Sits OUTSIDE `BraxAutoResetWrapper`, so it sees the reward already summed
+    over `action_repeat` and the `done` that wrapper sets. Note that `data` and
+    `obs` have ALREADY been swapped for the reset pose by the time this runs --
+    which is precisely why arrival cannot be detected here and is latched by the
+    env instead (see `RunForward.reset`'s note on `info["arrived"]`). `info` is
+    left alone by auto-reset, so latches carried there survive; this wrapper
+    owns clearing `arrived`.
 
-    `ep_return_last` latches the most recently COMPLETED episode rather than
-    the running total, because a partially-finished episode is not a fitness
-    signal -- an unfinished traverse looks identical to a failed one. Callers
-    must therefore give each design enough steps for at least one episode to
-    finish per lane, and should check `ep_count` before trusting the value.
+    `*_last` latches the most recently COMPLETED episode rather than the running
+    total, because a partially-finished episode is not a fitness signal -- an
+    unfinished traverse looks identical to a failed one. Callers must therefore
+    give each design enough steps for at least one episode to finish per lane,
+    and should check `ep_count` before trusting the values.
 
-    Both keys are written in `reset` as well as `step`: a key present in only
-    one is a pytree structure mismatch for the auto-reset wrapper (the same
-    trap `CostEpisodeWrapper` documents for its own info keys).
+    Every key is written in `reset` as well as `step`: a key present in only one
+    is a pytree structure mismatch for the auto-reset wrapper (the same trap
+    `CostEpisodeWrapper` documents for its own info keys).
     """
 
     def reset(self, rng: jax.Array) -> State:
@@ -348,6 +352,8 @@ class EpisodeReturnWrapper(Wrapper):
         zero = jp.zeros_like(state.reward)
         state.info["ep_return"] = zero
         state.info["ep_return_last"] = zero
+        state.info["ep_len_last"] = zero
+        state.info["ep_arrived_last"] = zero
         state.info["ep_count"] = zero
         return state
 
@@ -355,9 +361,38 @@ class EpisodeReturnWrapper(Wrapper):
         state = self.env.step(state, action)
         running = state.info["ep_return"] + state.reward
         done = state.done
+        finished = done > 0
         state.info["ep_return_last"] = jp.where(
-            done > 0, running, state.info["ep_return_last"]
+            finished, running, state.info["ep_return_last"]
         )
+
+        # `steps` is CostEpisodeWrapper's INNER-step counter (it grows by
+        # action_repeat, not by 1), and BraxAutoResetWrapper zeroes it at the
+        # START of the step AFTER a done -- so on the done step it still holds
+        # the completed episode's full length. Divide by action_repeat for
+        # decisions.
+        length = state.info["steps"].astype(running.dtype)
+        state.info["ep_len_last"] = jp.where(
+            finished, length, state.info["ep_len_last"]
+        )
+
+        # Absent on envs with no goal to arrive at (GoToGoal respawns its goal,
+        # so "arrived" is not a per-episode property there). The key is then
+        # pinned at zero rather than omitted, so the info pytree does not depend
+        # on which env is underneath; `train_ppo.validate()` rejects the
+        # time-to-goal design objective on those tasks rather than letting it
+        # read a constant.
+        arrived = state.info.get("arrived")
+        if arrived is None:
+            state.info["ep_arrived_last"] = jp.zeros_like(running)
+        else:
+            state.info["ep_arrived_last"] = jp.where(
+                finished, arrived, state.info["ep_arrived_last"]
+            )
+            state.info["arrived"] = jp.where(
+                finished, jp.zeros_like(arrived), arrived
+            )
+
         state.info["ep_count"] = state.info["ep_count"] + done
-        state.info["ep_return"] = jp.where(done > 0, jp.zeros_like(running), running)
+        state.info["ep_return"] = jp.where(finished, jp.zeros_like(running), running)
         return state

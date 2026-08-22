@@ -31,7 +31,7 @@ from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.ppo import train as ppo_train
 from mjx_safety_gym.algorithms.wrappers import (
     CostEpisodeWrapper,
-    EpisodeReturnWrapper,
+    EpisodeStatsWrapper,
     MorphologyDesignWrapper,
     MorphologyDomainRandomizationWrapper,
     Saute,
@@ -451,7 +451,7 @@ def wrap_for_brax_training(
     episode_length: int,
     action_repeat: int = 1,
     already_batched: bool = False,
-    track_episode_return: bool = False,
+    track_episode_stats: bool = False,
 ):
     """Vmap + cost-aware episode wrapper + mujoco_playground's auto-reset.
 
@@ -475,13 +475,13 @@ def wrap_for_brax_training(
         env = brax_training.VmapWrapper(env)
     env = CostEpisodeWrapper(env, episode_length, action_repeat)
     env = playground_wrapper.BraxAutoResetWrapper(env)
-    if track_episode_return:
+    if track_episode_stats:
         # OUTSIDE auto-reset on purpose: it needs the per-decision reward and
         # the `done` that CostEpisodeWrapper sets, and auto-reset only swaps
-        # `data`/`obs` -- the accumulator lives in `info` and survives. Only
-        # attached for design optimization, so no existing run's info pytree
-        # changes shape.
-        env = EpisodeReturnWrapper(env)
+        # `data`/`obs` -- the latches live in `info` and survive. Only attached
+        # for design optimization, so no existing run's info pytree changes
+        # shape.
+        env = EpisodeStatsWrapper(env)
     return env
 
 
@@ -664,9 +664,41 @@ def build_argparser() -> argparse.ArgumentParser:
         "--boundary_cost_weight",
         type=float,
         default=1.0,
-        help="[--task run] Cost per step for leaving the corridor. Without it "
-        "the safe optimum is to step out of the obstacle band and run in clean "
-        "air -- full reward, zero cost -- making the constraint vacuous.",
+        help="[--task run] Cost per step for leaving the corridor. LARGELY "
+        "SUPERSEDED by --corridor_walls, which makes the corridor physical -- "
+        "with walls on, a robot cannot leave, so this term is near-dead and "
+        "0.0 keeps `cost` as pure hazard proximity. Measured 2026-08-22 on the "
+        "50M unconstrained minefield policy: cost was 91%% hazard / 9%% "
+        "boundary, so this is no longer the dominant term it once was.",
+    )
+    parser.add_argument(
+        "--hazard_step_on",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Charge hazard cost only while a robot geom is ON THE GROUND "
+        "inside the hazard disc, instead of any time one passes over it in the "
+        "xy-plane. ON by default since 2026-08-22; --no-hazard_step_on "
+        "reproduces earlier results. The old test was purely 2D, so a foot "
+        "swung THROUGH THE AIR over a mine cost exactly as much as standing on "
+        "it -- it charged the ant for its gait rather than for where it put its "
+        "weight. THIS CHANGES WHAT `cost` MEANS: measured on the 50M "
+        "unconstrained policy with both tests evaluated along the SAME "
+        "trajectory, 465.2 (2D) vs 335.1 (step-on), paired -130.1 +-4.4, so 28%% "
+        "of the old cost was pass-over. Every pre-2026-08-22 cost number and "
+        "safety budget is on the old scale -- in particular --safety_budget 250 "
+        "becomes 176 for the same 25%%-of-unconstrained target.",
+    )
+    parser.add_argument(
+        "--corridor_walls",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--task run/minefield] Physical walls at +-corridor_half_width. "
+        "ON by default since 2026-08-22; --no-corridor_walls reproduces earlier "
+        "results. Without them, a cost-constrained policy's best move is to bow "
+        "out to |y|~1.4 where no hazard is ever sampled and cross at zero cost "
+        "for ~4%% extra path -- the constraint becomes cheap rather than a "
+        "trade-off. Walls make that impossible instead of merely expensive, and "
+        "cost nothing in nq/nv (static geoms, no joints).",
     )
     parser.add_argument(
         "--healthy_reward",
@@ -871,8 +903,9 @@ def build_argparser() -> argparse.ArgumentParser:
         "distribution that never improves, which is only half that method: the "
         "policy is conditioned on the genes but nothing makes the genes better. "
         "With it, a Gaussian mixture over designs is updated by REINFORCE on "
-        "normalized episode return, so the population the policy trains on and "
-        "the population being searched are the same thing. Measured 2026-08-18, "
+        "normalized per-design scores (see --design_objective), so the "
+        "population the policy trains on and the population being searched are "
+        "the same thing. Measured 2026-08-18, "
         "that coupling is what the decoupled pipeline lacked: 51%% of candidate "
         "bodies fell outside the trained mass range and 29%% of unseen bodies "
         "were unreliable.",
@@ -903,7 +936,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "this also divides the epoch length: the design can only be resampled "
         "at a Python boundary, because bodies are compiled host-side by MuJoCo "
         "(82.8 ms each, measured). Each iteration must be long enough for an "
-        "episode to FINISH in every lane or the return that scores a design is "
+        "episode to FINISH in every lane or the score a design is judged by is "
         "stale -- watch design/episodes_per_design, which should be >= 1.",
     )
     parser.add_argument(
@@ -919,6 +952,20 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Final phase: freeze the design at the distribution's MODE and "
         "sample it deterministically, so the policy fine-tunes on the single "
         "body that will be reported. Upstream's steps_after_robot_update.",
+    )
+    parser.add_argument(
+        "--design_objective", choices=["time", "return"], default="time",
+        help="What the REINFORCE step scores a design by. 'time' (default) is "
+        "the time-to-goal fitness scripts/eval_morphology.py already uses -- "
+        "arrival decision if it reached the goal, else a miss charge ordered by "
+        "how far short it fell -- so the training signal and the offline "
+        "evaluation are the same quantity. 'return' is Schaff's own score and is "
+        "the faithful baseline, but it is NEARLY BLIND HERE: this reward "
+        "telescopes, so a full traverse pays the goal distance twice however "
+        "long it took (measured: arrival times spanned 1.87x while returns "
+        "spanned std 0.003), and the one speed-dependent term left, the healthy "
+        "bonus, actually pays SLOWER bodies more. 'time' requires "
+        "terminate_on_goal, which is the default.",
     )
     parser.add_argument(
         "--chop_freq", type=int, default=0,
@@ -959,6 +1006,44 @@ def validate(args: argparse.Namespace) -> None:
             "sample becomes one body in the batch, so a population size is "
             "required. Try --num_morphologies 16."
         )
+    if args.design_optimization and args.design_objective == "time":
+        if not args.terminate_on_goal:
+            raise SystemExit(
+                "--design_objective time needs --terminate_on_goal (the "
+                "default): arrival time is read off the episode LENGTH, so "
+                "without goal termination every arriving body reads the "
+                "truncation cap and the objective degenerates to a constant. "
+                "Use --design_objective return to score by episode return "
+                "instead."
+            )
+        if args.task not in ("run", "minefield"):
+            raise SystemExit(
+                f"--design_objective time is only defined for the corridor "
+                f"tasks (run, minefield), not --task {args.task}: GoToGoal "
+                f"respawns its goal mid-episode, so 'time to arrive' is not a "
+                f"per-episode property there. Use --design_objective return."
+            )
+    if args.design_optimization:
+        # AN ITERATION SHORTER THAN AN EPISODE BIASES THE SEARCH, quietly.
+        # Designs are scored off COMPLETED episodes only, and unscored designs
+        # are masked out of the REINFORCE step. Early in training the only thing
+        # ending an episode is a flip -- so the designs that get masked are
+        # exactly the STABLE ones, and the search cannot reward staying upright.
+        # Measured on a 3M smoke run at 389k steps/iteration (0.3 episodes per
+        # lane): 1 then 2 of 8 designs went unscored.
+        evals = max(args.num_evals - 1, 1)
+        per_iter = args.num_timesteps / evals / args.design_updates_per_eval
+        per_lane = per_iter / args.num_envs / args.episode_length
+        if per_lane < 1.0:
+            print(
+                f"WARNING: each design iteration covers {per_lane:.2f} episodes "
+                f"per lane ({per_iter/1e6:.2f}M env steps / {args.num_envs} envs "
+                f"/ {args.episode_length} step episodes). Below 1.0 the only "
+                f"episodes that finish are early terminations, so stable designs "
+                f"go unscored and are dropped from the design gradient -- watch "
+                f"design/UNSCORED_DESIGNS. Lower --design_updates_per_eval, "
+                f"raise --num_timesteps, or lower --num_evals."
+            )
     if args.num_morphologies:
         if args.robot not in morphology_lib._MORPH_ROBOTS:
             raise SystemExit(
@@ -1026,6 +1111,8 @@ def train(args: argparse.Namespace):
                 forward_reward_weight=args.forward_reward_weight,
                 ctrl_cost_weight=args.ctrl_cost_weight,
                 boundary_cost_weight=args.boundary_cost_weight,
+                corridor_walls=args.corridor_walls,
+                hazard_step_on=args.hazard_step_on,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,
                 terminate_on_goal=args.terminate_on_goal,
@@ -1110,6 +1197,15 @@ def train(args: argparse.Namespace):
             steps_before_update=args.steps_before_design_update,
             steps_after_update=args.steps_after_design_update,
             chop_freq=args.chop_freq or None,
+            objective=args.design_objective,
+            action_repeat=args.action_repeat,
+            max_decisions=args.episode_length // args.action_repeat,
+            # Both movement terms telescope, so a straight full traverse pays
+            # the start-to-goal distance twice. Used only for the shortfall term
+            # that orders NON-arrivals, so it wants to be the achievable
+            # maximum, not a padded one. `_finish_x`/`_start_x` are read through
+            # the wrapper chain, which forwards attribute access.
+            return_ceiling=2.0 * float(base_env._finish_x - base_env._start_x),
         )
         # EVAL KEEPS A FIXED, INDEPENDENTLY-SAMPLED POPULATION on purpose, so
         # `episode_reward` stays a stable held-out reference while the training
@@ -1165,7 +1261,7 @@ def train(args: argparse.Namespace):
         episode_length=args.episode_length,
         action_repeat=args.action_repeat,
         already_batched=bool(args.num_morphologies),
-        track_episode_return=bool(design_loop),
+        track_episode_stats=bool(design_loop),
     )
     eval_env = wrap_for_brax_training(
         eval_env,
