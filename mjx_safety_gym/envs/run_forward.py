@@ -125,6 +125,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jp
+import numpy as np
 import mujoco as mj
 from mujoco import mjx
 
@@ -156,7 +157,7 @@ class RunForward(GoToGoal):
         goal_radius: float | None = None,
         goal_reward_weight: float = 0.0,
         goal_observation: bool = False,
-        lidar_groups=("obstacle",),
+        lidar_groups=(),
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -199,6 +200,11 @@ class RunForward(GoToGoal):
         self._obstacle_x_hi = self._finish_x - 0.25 * a
 
         super().__init__(robot=robot, lidar_groups=lidar_groups, **kwargs)
+        # After super(), because it needs self.spec (hazard count) and
+        # self._arena_scale, both of which GoToGoal.__init__ sets. Computed once
+        # rather than per reset: it is a constant, and doing it here keeps it out
+        # of every trace.
+        self._hazard_lattice_xy = self._hazard_lattice()
 
     # -- arena -------------------------------------------------------------
 
@@ -217,6 +223,7 @@ class RunForward(GoToGoal):
             ),
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
+            hazard_size=self._hazard_size,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
         if self._corridor_walls:
@@ -280,6 +287,68 @@ class RunForward(GoToGoal):
                 rgba=[0.35, 0.35, 0.40, 0.6],
             )
 
+    def _hazard_lattice(self) -> np.ndarray:
+        """Evenly spaced hazard centres. Deterministic, computed once.
+
+        Replaces rejection sampling (2026-08-22, user's call). A random field
+        makes the corridor a ROUTING problem -- find the gap this episode
+        happens to have -- which needs long-range directional sensing. An even
+        lattice makes it a GAIT problem: obstacles arrive at a fixed pitch, and
+        the answer is a stride that misses them. That is why the hazard lidar
+        ring is off by default on this task; see `lidar_groups`.
+
+        Laid out as a STAGGERED lattice, alternate columns offset a quarter
+        pitch either side of centre, so that fewer straight-line paths run clear
+        from end to end than a plain grid would leave. Rows x columns is the factorisation of
+        `num_hazards` with the squarest cell, so the pitch the robot meets in x
+        is comparable to the spacing it must thread in y.
+
+        Inset in y by the hazard radius, so no disc is half-buried in a corridor
+        wall where only part of it is reachable.
+
+        NOTE the layout is IDENTICAL every episode -- that is what "evenly
+        spaced" means. The only per-episode variation is the robot's jittered
+        start y, which changes its phase relative to the rows. If that turns out
+        to be too little variation, offsetting the whole lattice by a per-episode
+        random phase is a one-line change.
+        """
+        n = self.spec["hazards"].num_objects
+        r = self._hazard_size * self._arena_scale
+        x_lo, x_hi = self._obstacle_x_lo, self._obstacle_x_hi
+        y_lo = -self._corridor_half_width + r
+        y_hi = self._corridor_half_width - r
+        span_x, span_y = x_hi - x_lo, y_hi - y_lo
+
+        rows, cols = 1, n
+        best = None
+        for rr in range(1, n + 1):
+            if n % rr:
+                continue
+            cc = n // rr
+            # squarest cell, scored in log space so 2x too wide and 2x too tall
+            # are penalised equally
+            score = abs(np.log((span_x / cc) / (span_y / rr)))
+            if best is None or score < best:
+                best, rows, cols = score, rr, cc
+
+        dx, dy = span_x / cols, span_y / rows
+        out = np.empty((n, 2), dtype=float)
+        k = 0
+        for i in range(cols):
+            x = x_lo + dx * (i + 0.5)
+            # SYMMETRIC stagger, -+ a quarter pitch, not a one-sided half
+            # pitch. Shifting odd columns upward only pushes the top row onto
+            # the wall inset and leaves the bottom open: measured at 20
+            # hazards, that gave a 0.43 m disc-free lane hugging one wall.
+            # Splitting the offset either side of centre keeps the pattern
+            # symmetric and halves the widest free lane.
+            shift = dy * (0.25 if i % 2 else -0.25)
+            for j in range(rows):
+                out[k] = (x, y_lo + dy * (j + 0.5) + shift)
+                k += 1
+        self._hazard_grid = (rows, cols)
+        return out
+
     def _sample_corridor_layout(
         self, rng: jax.Array
     ) -> tuple[dict[str, list[tuple[int, jax.Array]]], jax.Array]:
@@ -326,17 +395,29 @@ class RunForward(GoToGoal):
             return xy
 
         idx = 0
-        for name, count in (("hazards", n_haz), ("vases", n_vase)):
-            keepout = self.spec[name].keepout
-            entries = []
-            rng, sub = jax.random.split(rng)
-            for key in jax.random.split(sub, count):
-                xy = draw_one(key, keepout, placed, keepouts)
-                placed = placed.at[idx].set(xy)
-                keepouts = keepouts.at[idx].set(keepout)
-                entries.append((idx, xy))
-                idx += 1
-            layout[name] = entries
+        # HAZARDS ARE NOT SAMPLED. They sit on the fixed lattice built by
+        # _hazard_lattice(). They are still written into `placed`/`keepouts`,
+        # because vases ARE still rejection-sampled and must keep clear of them.
+        haz_keepout = self.spec["hazards"].keepout
+        entries = []
+        for xy_np in self._hazard_lattice_xy:
+            xy = jp.asarray(xy_np)
+            placed = placed.at[idx].set(xy)
+            keepouts = keepouts.at[idx].set(haz_keepout)
+            entries.append((idx, xy))
+            idx += 1
+        layout["hazards"] = entries
+
+        vase_keepout = self.spec["vases"].keepout
+        entries = []
+        rng, sub = jax.random.split(rng)
+        for key in jax.random.split(sub, n_vase):
+            xy = draw_one(key, vase_keepout, placed, keepouts)
+            placed = placed.at[idx].set(xy)
+            keepouts = keepouts.at[idx].set(vase_keepout)
+            entries.append((idx, xy))
+            idx += 1
+        layout["vases"] = entries
 
         # Robot on the start line, jittered in y so it does not memorise one lane.
         rng, rk = jax.random.split(rng)

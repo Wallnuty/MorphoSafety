@@ -305,6 +305,9 @@ def checkpoint_policy_layers(policy_params) -> Optional[tuple[int, ...]]:
 # The full lidar stack the corridor tasks used before 2026-08-15. Kept only so
 # older checkpoints can still be replayed -- see build_env_for_checkpoint.
 _LEGACY_LIDAR_GROUPS = ("obstacle", "goal", "object")
+# The corridor tasks' default from 2026-08-15 to 2026-08-22. Every ant
+# minefield/run checkpoint in the repo was trained at this width.
+_HAZARD_LIDAR_GROUPS = ("obstacle",)
 
 
 def _env_kwarg_candidates(robot: str) -> list[dict]:
@@ -316,6 +319,7 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
 
         goal_observation   +3   (2026-08-15, ON by default for the ants)
         lidar_groups      +32   (2026-08-15, narrowed to the obstacle ring)
+        lidar_groups      +16   (2026-08-22, obstacle ring off by default)
 
     For the ant that makes 44 (current), 47 (current + goal sensing), 76
     (legacy) and 79 (legacy + goal sensing) all reachable, and every ant
@@ -329,6 +333,8 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
          "goal_reward_weight": (
              0.0 if current.get("goal_observation") else current["goal_reward_weight"]
          )},
+        {**current, "lidar_groups": _HAZARD_LIDAR_GROUPS},
+        {**legacy_reward, "lidar_groups": _HAZARD_LIDAR_GROUPS},
         {**legacy_reward, "lidar_groups": _LEGACY_LIDAR_GROUPS},
         {**current, "lidar_groups": _LEGACY_LIDAR_GROUPS},
     ]
@@ -670,6 +676,30 @@ def build_argparser() -> argparse.ArgumentParser:
         "0.0 keeps `cost` as pure hazard proximity. Measured 2026-08-22 on the "
         "50M unconstrained minefield policy: cost was 91%% hazard / 9%% "
         "boundary, so this is no longer the dominant term it once was.",
+    )
+    parser.add_argument(
+        "--hazard_size", type=float, default=0.14,
+        help="Hazard RADIUS before arena scaling. 0.14 since 2026-08-22, down "
+        "from safety-gym's 0.2 (0.7x): smaller discs make the corridor a field "
+        "to be threaded by foot placement rather than a wall to be routed "
+        "around. Every cost number measured at 0.2 is on a different scale. "
+        "The cost threshold is read back off the compiled geom, so it follows "
+        "this automatically and cannot drift from the disc that is drawn.",
+    )
+    parser.add_argument(
+        "--hazard_lidar",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="[--task run/minefield] Give the policy the 16-bin obstacle lidar "
+        "ring. OFF since 2026-08-22, which narrows the ant's observation by 16. "
+        "The ring is a ROUTING sensor -- measured, it exposes ~5.2 distinct "
+        "hazards out to 2 m -- and routing is not what this task is meant to be "
+        "about any more. With hazards on a fixed even lattice their positions "
+        "are a function of the robot's own position, which goal bearing + range "
+        "+ the magnetometer's absolute yaw already determine, so the task asks "
+        "for a GAIT matched to the obstacle pitch. Turn it back on to A/B that "
+        "claim -- if the ant cannot learn the constraint without it, the ring "
+        "(or per-foot hazard clearance) is the missing input.",
     )
     parser.add_argument(
         "--hazard_step_on",
@@ -1103,9 +1133,11 @@ def train(args: argparse.Namespace):
             robot=args.robot,
             morphology_conditioning=bool(args.num_morphologies),
             integrator=args.integrator,
+            hazard_size=args.hazard_size,
         )
         if args.task in ("run", "minefield"):
             corridor = dict(
+                lidar_groups=_HAZARD_LIDAR_GROUPS if args.hazard_lidar else (),
                 corridor_length=args.corridor_length,
                 corridor_half_width=args.corridor_half_width,
                 forward_reward_weight=args.forward_reward_weight,

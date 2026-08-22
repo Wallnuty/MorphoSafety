@@ -110,6 +110,7 @@ class Minefield(RunForward):
             ),
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
+            hazard_size=self._hazard_size,
         )
         # MUST be repeated here. This method OVERRIDES RunForward's, so the
         # identical call at the end of that one does not run for Minefield --

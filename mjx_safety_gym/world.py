@@ -73,6 +73,7 @@ def build_arena(
     obstacle_scale: float = 1.0,
     vase_mass: float | None = None,
     lidar_groups=None,
+    hazard_size: float = 0.2,
 ):
     """Build the arena (currently, just adds Lidar rings). Future: dynamically add obstacles, hazards, objects, goal here
 
@@ -135,7 +136,12 @@ def build_arena(
         hazard.add_geom(
             name=f"hazard_{i}_geom",
             type=mj.mjtGeom.mjGEOM_CYLINDER,
-            size=[0.2 * obstacle_scale, 0.01 * obstacle_scale, 0],
+            # `hazard_size` is the RADIUS before arena scaling. 0.2 is
+            # safety-gym's original; GoToGoal now defaults to 0.14 (0.7x) --
+            # see its constructor. _post_init reads the radius back off this
+            # geom, so the cost threshold follows automatically and cannot
+            # drift from the disc that is drawn.
+            size=[hazard_size * obstacle_scale, 0.01 * obstacle_scale, 0],
             rgba=[0.0, 0.0, 1.0, 0.25],
             userdata=jp.ones(1),
             contype=jp.zeros(()),

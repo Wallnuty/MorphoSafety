@@ -153,6 +153,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         num_hazards: int = 10,
         num_vases: int = 10,
         lidar_groups: Optional[Sequence[str]] = None,
+        hazard_size: float = 0.14,
         hazard_step_on: bool = True,
         ground_contact_eps: float | None = None,
     ):
@@ -196,9 +197,20 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             raise ValueError(
                 f"unknown lidar group(s) {unknown}; available: {lidar.LIDAR_GROUPS}"
             )
-        if not groups:
-            raise ValueError("lidar_groups cannot be empty -- the robot would be blind")
+        # AN EMPTY TUPLE IS LEGAL since 2026-08-22, and used to raise
+        # "the robot would be blind". It is a deliberate configuration for the
+        # corridor tasks: with hazards on a fixed even lattice, their positions
+        # are a function of the robot's own position, which goal bearing + range
+        # + the magnetometer's absolute yaw already determine. The task then
+        # asks for a GAIT matched to the obstacle pitch rather than for
+        # long-range route planning. See RunForward's `lidar_groups` default.
         self._lidar_groups = tuple(groups)
+        # HAZARD RADIUS before arena scaling. 0.14 since 2026-08-22 (user's
+        # call), down from safety-gym's 0.2 -- 0.7x. Smaller discs make the
+        # corridor a field to be threaded by foot placement rather than a wall
+        # to be routed around. Every cost number measured at 0.2 is on a
+        # different scale; pass hazard_size=0.2 to reproduce them.
+        self._hazard_size = float(hazard_size)
         # DEFAULT ON since 2026-08-22 (user's call). Hazard cost is charged only
         # while a robot geom is ON THE GROUND inside the hazard disc. The old
         # test was purely 2D, so a foot swung THROUGH THE AIR over a mine cost
@@ -243,7 +255,11 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         self.spec = {
             "robot": ObjectSpec(0.4 * a, 1),
             "goal": ObjectSpec(0.305 * a, 1),
-            "hazards": ObjectSpec(0.18 * a, int(num_hazards)),
+            # 0.9 * radius, which reproduces the historical 0.18 exactly at the
+            # old radius of 0.2 and shrinks with it. Only vase placement reads
+            # this now -- hazards themselves are laid out on a lattice by
+            # RunForward and do not go through rejection sampling.
+            "hazards": ObjectSpec(0.9 * self._hazard_size * a, int(num_hazards)),
             "vases": ObjectSpec(0.15 * a, int(num_vases)),
         }
 
@@ -358,6 +374,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             mjSpec, objects=self.spec, visualize=True,
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
+            hazard_size=self._hazard_size,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
 
