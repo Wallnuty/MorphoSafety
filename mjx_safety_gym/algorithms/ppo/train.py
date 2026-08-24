@@ -18,6 +18,7 @@ See: https://arxiv.org/pdf/1707.06347.pdf
 """
 
 import functools
+import pathlib
 import time
 from typing import Callable, Optional, Tuple
 
@@ -66,6 +67,36 @@ def _load_checkpoint(path: str):
     if len(loaded) >= 2 and isinstance(loaded[1], dict):
         loaded[1] = ppo_losses.SafePPONetworkParams(**loaded[1])
     return loaded
+
+
+def _passthrough_block_normalizer(tail: int, offset: int):
+    """Normalize every observation dim EXCEPT a contiguous block near the end.
+
+    The block is `tail` dims wide and sits `offset` dims from the right, so
+    `(tail=7, offset=0)` is a plain suffix and `(tail=7, offset=1)` skips one
+    trailing dim.
+
+    Split out of `train` only so it can be exercised without building a
+    training run; the reason it takes an offset at all is that THE GENES ARE
+    NOT ALWAYS LAST. `Saute` appends its remaining-budget scalar OUTSIDE the
+    base env (`wrappers.py`, a plain `hstack([obs, saute_state])`), so under
+    `--penalizer saute` the layout is [..., genes(7), saute_state]. A bare
+    suffix of NUM_GENES would then pass through [gene_6, saute_state] and
+    normalize genes 0-5 -- six of seven genes whitened against a batch whose
+    design distribution is moving, and the budget left raw. Exactly backwards.
+    """
+    tail, offset = int(tail), int(offset)
+    lo = -(tail + offset)
+    hi = -offset if offset else None
+
+    def normalize(x, params):
+        normed = running_statistics.normalize(x, params)
+        parts = [normed[..., :lo], x[..., lo:hi]]
+        if offset:
+            parts.append(normed[..., hi:])
+        return jnp.concatenate(parts, axis=-1)
+
+    return normalize
 
 
 def _unpmap(v):
@@ -149,6 +180,7 @@ def train(
     design_loop=None,
     design_updates_per_eval: int = 1,
     unnormalized_obs_tail: int = 0,
+    unnormalized_obs_tail_offset: int = 0,
 ):
     assert batch_size * num_minibatches % num_envs == 0
     if not safe:
@@ -261,14 +293,11 @@ def train(
             # the same body would present differently to the policy as the
             # search narrows, which is a moving target on top of a moving
             # target. The tail is pasted back raw; its statistics are still
-            # accumulated but never used, which is harmless.
-            _tail = int(unnormalized_obs_tail)
-
-            def normalize(x, params):
-                normed = running_statistics.normalize(x, params)
-                return jnp.concatenate(
-                    [normed[..., :-_tail], x[..., -_tail:]], axis=-1
-                )
+            # accumulated but never used, which is harmless. The block is not
+            # always a bare suffix -- see the helper's docstring for why.
+            normalize = _passthrough_block_normalizer(
+                unnormalized_obs_tail, unnormalized_obs_tail_offset
+            )
 
         else:
             normalize = running_statistics.normalize
@@ -475,6 +504,39 @@ def train(
             optimizer_state=restored_optimizer_state,
         )  # type: ignore
 
+        # THE DESIGN DISTRIBUTION IS THE DELIVERABLE OF A CO-DESIGN RUN, so a
+        # resume that restores the policy and not the distribution is worse
+        # than a resume that fails: it looks like a continuation and is a
+        # restart of the search. Loud on both paths -- there is no reading of
+        # "resumed a co-design run without its design state" that is fine.
+        if design_loop is not None:
+            if design_loop.load(restore_checkpoint_path):
+                # print, not logging.info: absl's default verbosity swallows
+                # INFO in these runs (checked -- brax's own "saving checkpoint
+                # to ..." never appears either), and a silent success here is
+                # indistinguishable from the silent failure this whole block
+                # exists to prevent. The repo prints its other startup facts
+                # the same way.
+                print(
+                    f"restored design state from {restore_checkpoint_path}: "
+                    f"{design_loop.gmm.components_left()} of "
+                    f"{design_loop.gmm.n_components} components live, last "
+                    f"chop at step {design_loop._last_chop}, design axis "
+                    f"resumes at {design_loop._last_step} of tmax "
+                    f"{design_loop.tmax}",
+                    flush=True,
+                )
+            else:
+                logging.warning(
+                    "NO design_state.npz in %s -- the policy resumed but the "
+                    "design distribution did NOT. It restarts at its init "
+                    "(uniform means, std_init, all components live) while the "
+                    "policy continues, so design/mode_* will jump and the "
+                    "chopping schedule restarts. Checkpoints written before "
+                    "design checkpointing existed look exactly like this.",
+                    restore_checkpoint_path,
+                )
+
     if num_timesteps == 0:
         return (
             make_policy,
@@ -519,6 +581,9 @@ def train(
     training_metrics: Metrics = {}
     training_walltime = 0.0
     current_step = 0
+    _total_design_iters = (
+        num_evals_after_init * max(num_resets_per_eval, 1) * design_iters_per_eval
+    )
     for it in range(num_evals_after_init):
         logging.info("starting iteration %s %s", it, time.time() - xt)
 
@@ -548,8 +613,45 @@ def train(
             current_step = int(_unpmap(training_state.env_steps))
             if design_loop is not None:
                 training_metrics = dict(training_metrics)
-                training_metrics.update(
-                    design_loop.finish_iteration(env_state, current_step)
+                _dm = design_loop.finish_iteration(env_state, current_step)
+                training_metrics.update(_dm)
+                # ONE LINE PER DESIGN ITERATION.
+                #
+                # `progress_fn` fires only at evals, and `training_metrics` is
+                # REBUILT every iteration -- so the log otherwise keeps one
+                # design iteration in every `design_updates_per_eval` and
+                # discards the rest. At the recommended sizing that is 1 in 8
+                # or 1 in 16, and a chop that lands on any other iteration
+                # never appears anywhere. For a search whose entire output is
+                # the design trajectory, that is the wrong thing to drop.
+                #
+                # It also makes a long run observable between evals: at 300M
+                # steps this prints roughly every 13 minutes, against ~1.7
+                # hours between eval lines.
+                _n_mode = sum(1 for k in _dm if k.startswith("design/mode_"))
+                _mode = " ".join(
+                    f"{_dm[f'design/mode_{i}']:+.2f}" for i in range(_n_mode)
+                )
+                # Anomalies are appended only when they occur, so their
+                # presence in the line is itself the signal.
+                _flags = "".join(
+                    f" {k.split('/')[-1]}={_dm[k]:g}"
+                    for k in (
+                        "design/chopped",
+                        "design/UNSCORED_DESIGNS",
+                        "design/SKIPPED_UPDATE",
+                    )
+                    if k in _dm
+                )
+                print(
+                    f"design it={len(design_loop.history):>4}/"
+                    f"{_total_design_iters} step={current_step:>12,} "
+                    f"score={_dm['design/score_mean']:+9.3f} "
+                    f"comp={_dm['design/components']:.0f} "
+                    f"ep/design={_dm['design/episodes_per_design']:.1f} "
+                    f"arrive={_dm.get('design/arrival_rate', float('nan')):.2f}"
+                    f" mode=[{_mode}]{_flags}",
+                    flush=True,
                 )
             key_env, tmp_key = jax.random.split(key_env)
             key_envs = jax.random.split(tmp_key, num_envs // process_count)
@@ -592,6 +694,16 @@ def train(
                     checkpoint_params,
                     dummy_ckpt_config,
                 )
+                if design_loop is not None:
+                    # The same directory brax::checkpoint.save just made --
+                    # `epath.Path(path) / f'{step:012d}'`. `DesignLoop.save`
+                    # raises if it is not there rather than writing the state
+                    # somewhere the resume path never looks, so a change to
+                    # that layout upstream fails at the FIRST checkpoint
+                    # instead of at the first resume.
+                    design_loop.save(
+                        pathlib.Path(checkpoint_logdir) / f"{current_step:012d}"
+                    )
 
     total_steps = current_step
     assert total_steps >= num_timesteps

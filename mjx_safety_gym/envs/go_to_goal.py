@@ -35,6 +35,9 @@ _ROBOT_XMLS = {
 # `slide_joints` (2-DOF planar robot) or a single `free_joint` (6-DOF, 7 qpos).
 _ROBOT_CONFIGS = {
     "point": {
+        # A sliding puck has no feet and no step-on semantics, so per-foot
+        # clearance is meaningless for it.
+        "foot_geoms": [],
         "collision_geoms": ["robot", "pointarrow"],
         "slide_joints": ["x", "y"],
         "free_joint": None,
@@ -53,6 +56,14 @@ _ROBOT_CONFIGS = {
         "extra_sensors": [],
     },
     "ant": {
+        # The geoms that actually bear weight, i.e. what `--hazard_step_on`
+        # charges cost for. Used by foot_obstacle_observations to tell the
+        # policy where ITS FEET are relative to obstacles -- the lidar ring is
+        # computed from the torso alone and cannot express this.
+        "foot_geoms": [
+            "left_ankle_geom", "right_ankle_geom",
+            "third_ankle_geom", "fourth_ankle_geom",
+        ],
         "collision_geoms": [
             "torso_geom",
             "aux_1_geom", "left_leg_geom", "left_ankle_geom",
@@ -153,8 +164,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         num_hazards: int = 10,
         num_vases: int = 10,
         lidar_groups: Optional[Sequence[str]] = None,
-        hazard_size: float = 0.18,
+        hazard_size: float = 0.16,
         hazard_step_on: bool = True,
+        foot_obstacle_obs: bool = False,
         ground_contact_eps: float | None = None,
     ):
         if robot not in _ROBOT_XMLS:
@@ -205,12 +217,12 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # asks for a GAIT matched to the obstacle pitch rather than for
         # long-range route planning. See RunForward's `lidar_groups` default.
         self._lidar_groups = tuple(groups)
-        # HAZARD RADIUS before arena scaling. 0.18 since 2026-08-22 (user's
-        # call), i.e. 0.9x safety-gym's 0.2 -- it went to 0.14 (0.7x) earlier
-        # the same day and was raised again. Slightly smaller discs make the
-        # corridor a field to be threaded by foot placement rather than a wall
-        # to be routed around, but 0.14 left more free width than intended: at
-        # 20 hazards it blocked 56% of the corridor to a straight-line path.
+        # HAZARD RADIUS before arena scaling. 0.16 since 2026-08-23 (user's
+        # call), i.e. 0.8x safety-gym's 0.2. The radius has moved three times:
+        # 0.14 (0.7x) -> 0.18 (0.9x) on 2026-08-22, then 0.16 here. Smaller
+        # discs make the corridor a field to be threaded by foot placement
+        # rather than a wall to be routed around; 0.14 left more free width
+        # than intended, blocking only 56% of the corridor at 20 hazards.
         # Every cost number measured at a different radius is on a different
         # scale; pass hazard_size=0.2 to reproduce safety-gym's.
         self._hazard_size = float(hazard_size)
@@ -232,6 +244,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # Pass hazard_step_on=False (CLI: --no-hazard_step_on) to reproduce
         # anything measured before this date.
         self._hazard_step_on = bool(hazard_step_on)
+        self._foot_obstacle_obs = bool(foot_obstacle_obs)
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
@@ -433,9 +446,25 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         self._robot_geom_is_capsule = jp.array(geom_types == mj.mjtGeom.mjGEOM_CAPSULE)
         self._robot_geom_is_sphere = jp.array(geom_types == mj.mjtGeom.mjGEOM_SPHERE)
         self._robot_collision_geom_ids_arr = jp.array(geom_ids)
+        # COLUMN indices of the foot geoms within `_robot_collision_geom_ids`,
+        # so the per-foot observation can slice the same (H, G) matrix the cost
+        # is computed from instead of recomputing the geometry.
+        foot_names = robot_config.get("foot_geoms", [])
+        self._foot_geom_names = list(foot_names)
+        self._foot_geom_cols = jp.array(
+            [robot_config["collision_geoms"].index(n) for n in foot_names],
+            dtype=int,
+        ) if foot_names else jp.zeros((0,), dtype=int)
         # Read the hazard radius off the model rather than hardcoding it, so the
         # threshold cannot silently drift from the geometry drawn in the arena.
-        self._hazard_radius = float(self._mj_model.geom("hazard_0_geom").size[0])
+        # GUARDED because a task may legitimately have NO hazards (envs/lasers.py
+        # replaces them with beams); an unguarded read raises KeyError at
+        # construction, which is why Minefield still refuses num_hazards < 1.
+        self._hazard_radius = (
+            float(self._mj_model.geom("hazard_0_geom").size[0])
+            if self.spec["hazards"].num_objects
+            else 0.0
+        )
 
         # For lidar
         self._robot_body_id = self._mj_model.body("robot").id
@@ -587,60 +616,75 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         else:
             collision_cost = jp.zeros(())
 
-        # Hazard distance, measured from the robot's surface rather than a single
-        # torso point (see _post_init) so that limbs entering a hazard are caught.
-        # Each collision geom is a segment (capsule axis, zero-length for spheres)
-        # inflated by its radius; hazards are flat discs, so this is all done in
-        # the xy-plane -- a raised foot above a hazard still counts, matching the
-        # existing 2D treatment.
-        robot_geom_radius, robot_geom_half_len = self._robot_geom_extent()
+        return (collision_cost + jp.sum(self.hazard_contacts(data))).astype(
+            jp.float32
+        )
+
+    def _hazard_surface_matrix(self, data: mjx.Data, *, step_on: bool) -> jax.Array:
+        """(H, G) distance from each hazard CENTRE to each robot geom's surface.
+
+        Shared by the COST (`hazard_distances`, min over geoms) and the
+        OBSERVATION (`foot_obstacle_observations`, min over hazards for the
+        foot columns only), so the two can never describe different geometry.
+
+        `step_on` is a parameter rather than read from the flag because the two
+        callers genuinely want different things: the cost charges only geoms on
+        the ground, while the observation must report clearance for a foot that
+        is still IN THE AIR -- that is the whole point of giving it, and gating
+        it would only ever say "you are already standing in one".
+        """
+        radius, half_len = self._robot_geom_extent()
         geom_pos = data.geom_xpos[self._robot_collision_geom_ids_arr]  # (G, 3)
         geom_axis = data.geom_xmat[self._robot_collision_geom_ids_arr].reshape(
             -1, 3, 3
         )[:, :, 2]  # capsule axis is local z
-        offset = geom_axis[:, :2] * robot_geom_half_len[:, None]
+        offset = geom_axis[:, :2] * half_len[:, None]
         seg_a = geom_pos[:, :2] + offset
         seg_b = geom_pos[:, :2] - offset
-
         hazard_pos = data.xpos[jp.array(self._hazard_body_ids)][:, :2]  # (H, 2)
-        # Distance from each hazard centre to the robot's surface, then take the
-        # nearest geom: (H, G) -> (H,)
-        surface_distances = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
-        surface_distances -= robot_geom_radius[None, :]
-
-        if self._hazard_step_on:
-            # STEP-ON SEMANTICS: a geom only triggers a hazard while it is on the
-            # ground. Without this the test above is purely 2D, so a foot swung
+        surface = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
+        surface -= radius[None, :]
+        if step_on:
+            # STEP-ON SEMANTICS: a geom only triggers a hazard while it is on
+            # the ground. Without this the test is purely 2D, so a foot swung
             # THROUGH THE AIR over a mine is charged exactly as much as standing
             # on it -- which is not what a minefield means, and it charges the
             # ant for a gait rather than for where it puts its weight.
             #
             # Gate on the geom's LOWEST POINT rather than on mjx contacts. A
             # capsule's lowest point is centre_z - |axis_z| * half_len - radius
-            # (spheres are the half_len == 0 case, and _robot_geom_extent already
-            # returns them that way). Contacts would be the more literal test but
-            # go through the broad phase, which `max_geom_pairs=16` truncates --
-            # so a foot genuinely on the ground could be missing from
-            # `data.contact` and silently escape its cost. Geometry cannot be
-            # truncated.
-            lowest_z = (
-                geom_pos[:, 2]
-                - jp.abs(geom_axis[:, 2]) * robot_geom_half_len
-                - robot_geom_radius
-            )
+            # (spheres are the half_len == 0 case). Contacts would be the more
+            # literal test but go through the broad phase, which
+            # `max_geom_pairs=16` truncates -- so a foot genuinely on the ground
+            # could be missing from `data.contact` and silently escape its cost.
+            # Geometry cannot be truncated.
+            lowest_z = geom_pos[:, 2] - jp.abs(geom_axis[:, 2]) * half_len - radius
             grounded = lowest_z <= self._ground_contact_eps  # (G,)
             # A large finite sentinel, not jp.inf: an all-airborne robot would
-            # otherwise reduce to inf and any later arithmetic on it produces
-            # NaN rather than a clean "no hazard".
-            surface_distances = jp.where(grounded[None, :], surface_distances, 1e6)
+            # otherwise reduce to inf and any later arithmetic produces NaN
+            # rather than a clean "no hazard".
+            surface = jp.where(grounded[None, :], surface, 1e6)
+        return surface
 
-        hazard_distances = jp.min(surface_distances, axis=1)
-        # jax.debug.print("Hazard distances: {dist}", dist=hazard_distances)
+    def hazard_distances(self, data: mjx.Data) -> jax.Array:
+        """Distance from each hazard centre to the robot's nearest surface, (H,).
 
-        # Compute cost: Add cost for collisions and proximity to hazards
-        cost = collision_cost + jp.sum(hazard_distances <= self._hazard_radius)
+        Split out of `get_cost` so the viewer can highlight exactly the hazards
+        being CHARGED rather than reimplementing the geometry and letting the
+        two drift apart. Traced inline, so `get_cost` is unchanged.
+        """
+        if not self._hazard_body_ids:
+            # NO HAZARDS AT ALL (envs/lasers.py). Short-circuit at trace time:
+            # `jp.array([])` is float32, and indexing `data.xpos` with a float
+            # array raises -- the same trap `_reset_goal` guards against.
+            return jp.zeros((0,), dtype=jp.float32)
+        return jp.min(
+            self._hazard_surface_matrix(data, step_on=self._hazard_step_on), axis=1
+        )
 
-        return cost.astype(jp.float32)
+    def hazard_contacts(self, data: mjx.Data) -> jax.Array:
+        """Boolean (H,): which hazards are currently charging cost."""
+        return self.hazard_distances(data) <= self._hazard_radius
 
     def lidar_observations(self, data: mjx.Data) -> jax.Array:
         """Compute Lidar observations."""
@@ -650,7 +694,17 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # Vectorized obstacle position retrieval -- note we can use xpos even for mocap positions after they have been updated
         # These values seem to be equal; TODO: using mocap_pos is maybe more correct
         targets = {
-            "obstacle": lambda: data.xpos[jp.array(self._obstacle_body_ids)],
+            # Guarded exactly like "object" below: with no hazards AND no vases
+            # (envs/lasers.py) this list is empty, and `jp.array([])` is
+            # float32 -- indexing `data.xpos` with it raises
+            # "Indexer must have integer or boolean type". The ring is then a
+            # constant zero vector, which KEEPS observation_size at 47 so
+            # checkpoints still transfer between the corridor tasks.
+            "obstacle": lambda: (
+                data.xpos[jp.array(self._obstacle_body_ids)]
+                if self._obstacle_body_ids
+                else jp.zeros((0, 3))
+            ),
             "goal": lambda: data.mocap_pos[jp.array([self._goal_mocap_id])],
             "object": lambda: (
                 data.xpos[jp.array(self._object_body_ids)]
@@ -688,6 +742,134 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         input shape and the env's reported shape silently disagree."""
         return 0
 
+    def _foot_ground_gap(self, data: mjx.Data) -> jax.Array:
+        """(F,) signed height of each foot above the GROUNDED threshold.
+
+        Negative means the foot is down far enough to charge cost; positive
+        means it is in the air. Same zero-reference convention as the clearance
+        entry, so the whole cost condition reads as
+
+            cost fires  iff  clearance <= 0  AND  ground_gap <= 0
+
+        A capsule's lowest point is `centre_z - |axis_z| * half_len - radius`,
+        which is exactly what `_hazard_surface_matrix` gates on -- computed
+        here rather than returned from there because the observation wants it
+        for the FOOT columns only and ungated.
+        """
+        radius, half_len = self._robot_geom_extent()
+        cols = self._foot_geom_cols
+        ids = self._robot_collision_geom_ids_arr[cols]
+        gp = data.geom_xpos[ids]
+        ga = data.geom_xmat[ids].reshape(-1, 3, 3)[:, :, 2]
+        lowest_z = gp[:, 2] - jp.abs(ga[:, 2]) * half_len[cols] - radius[cols]
+        return lowest_z - self._ground_contact_eps
+
+    def _scaled_ground_gap(self, data: mjx.Data) -> jax.Array:
+        """`_foot_ground_gap` normalised to O(1).
+
+        Scaled by the robot's SPAWN HEIGHT rather than the 2 m used for
+        clearance: feet live within a body-height of the floor, so the
+        clearance scale would compress the entire useful range into a few
+        hundredths and waste the signal. Spawn height is the natural body unit
+        and is already per-robot (0.18 for ant, 0.75 for ant_gym).
+        """
+        scale = float(getattr(self, "_robot_spawn_height", 0.0)) or (
+            0.2 * self._arena_scale
+        )
+        return jp.clip(self._foot_ground_gap(data) / scale, -1.0, 1.0)
+
+    def foot_obstacle_observations(self, data: mjx.Data) -> Optional[jax.Array]:
+        """Per-foot clearance to the nearest hazard: 3 entries per foot.
+
+        WHY THIS EXISTS. The only obstacle input the policy ever had was the
+        lidar ring, and that is computed from `data.xpos[self._robot_body_id]`
+        -- a SINGLE TORSO POINT. Cost, meanwhile, is charged on the minimum
+        over all 13 collision geoms and, since `--hazard_step_on`, only for the
+        ones ON THE GROUND. So the policy was punished for where its FEET
+        landed while being shown only where its TORSO was, and had to recover
+        foot placement by composing the ring with 8 joint angles. That is a
+        plausible reason a 32x4 net was 2.7x worse than 256x4, and why the ring
+        helped ONLY at 256x4.
+
+        Per foot, in the torso's YAW frame:
+            [0] clearance to the nearest hazard's EDGE, negative when inside
+            [1] cos of the bearing to that hazard
+            [2] sin of the bearing to that hazard
+            [3] height above the GROUNDED threshold, negative when down
+
+        [3] EXISTS BECAUSE [0] IS PURELY HORIZONTAL. A foot 40 cm in the air
+        directly over a disc reports the same -0.031 as a foot planted in it --
+        measured. Cost, though, fires only when BOTH the horizontal clearance
+        and the height are non-positive, so without [3] the policy sees one
+        number for two situations that differ entirely in what they cost, and
+        would have to recover height from 8 joint angles plus a torso height
+        that IS NOT IN THE OBSERVATION AT ALL (no sensor reports absolute z --
+        accelerometer, velocimeter, gyro and magnetometer are all body-frame).
+        With [3] the cost condition is fully observable: `[0] <= 0 and [3] <= 0`.
+
+        Clearance is the quantity `get_cost` thresholds (surface distance minus
+        `_hazard_radius`), so 0 is exactly the point at which a grounded foot
+        starts charging. It is scaled by 2 x arena_scale and clipped to
+        [-1, 1]: observations are NOT normalised anywhere in this stack
+        (`normalize = lambda x, y: x`, ppo/train.py), so raw metres would enter
+        the first layer an order of magnitude above every other input -- the
+        same reason `task_observations` divides its range by corridor_length.
+
+        BEARING IS YAW-ONLY, not the full orientation matrix, for the reason
+        documented on `RunForward.task_observations`: `lidar.ego_xy` leaves the
+        robot's own height in the vector it rotates, so a tilted torso distorts
+        every reading -- at 60 degrees of pitch a target 2.00 m away registers
+        as 1.58 m. A foot-placement signal that degrades as the ant falls over
+        would fail exactly where it is needed.
+
+        NOT step-on gated, deliberately -- see `_hazard_surface_matrix`.
+        """
+        if not self._foot_obstacle_obs or self._foot_geom_cols.size == 0:
+            return None
+        n_feet = int(self._foot_geom_cols.size)
+        if not self._hazard_body_ids:
+            # No hazards (envs/lasers.py overrides this method with its own
+            # beam version). Report maximum clearance rather than a shape
+            # mismatch: constant, but honest -- there is nothing to avoid.
+            return jp.stack(
+                [
+                    jp.ones((n_feet,)),        # maximum clearance: nothing to avoid
+                    jp.ones((n_feet,)),        # bearing points nowhere in particular
+                    jp.zeros((n_feet,)),
+                    self._scaled_ground_gap(data),  # height is still real and useful
+                ],
+                axis=-1,
+            ).flatten()
+
+        # (H, G) UNGATED -- a foot in the air must still see what it is about
+        # to land on -- then restrict to the foot columns.
+        surface = self._hazard_surface_matrix(data, step_on=False)
+        surface = surface[:, self._foot_geom_cols]                    # (H, F)
+        nearest = jp.argmin(surface, axis=0)                          # (F,)
+        clearance = jp.min(surface, axis=0) - self._hazard_radius     # (F,)
+        scale = 2.0 * self._arena_scale
+        clearance = jp.clip(clearance / scale, -1.0, 1.0)
+
+        foot_xy = data.geom_xpos[
+            self._robot_collision_geom_ids_arr[self._foot_geom_cols]
+        ][:, :2]                                                      # (F, 2)
+        hazard_xy = data.xpos[jp.array(self._hazard_body_ids)][:, :2]  # (H, 2)
+        delta = hazard_xy[nearest] - foot_xy                           # (F, 2)
+        mat = data.xmat[self._robot_body_id].reshape(3, 3)
+        yaw = jp.arctan2(mat[1, 0], mat[0, 0])
+        rel = jp.arctan2(delta[:, 1], delta[:, 0]) - yaw
+        return jp.stack(
+            [clearance, jp.cos(rel), jp.sin(rel), self._scaled_ground_gap(data)],
+            axis=-1,
+        ).flatten()
+
+    def foot_obstacle_observation_size(self) -> int:
+        """Width of `foot_obstacle_observations`. Must agree with it or the
+        policy's input shape and the env's reported shape silently disagree."""
+        if not self._foot_obstacle_obs:
+            return 0
+        return 4 * int(self._foot_geom_cols.size)
+
     def get_obs(self, data: mjx.Data) -> jax.Array:
         lidar = self.lidar_observations(data)
         other_sensors = self.sensor_observations(data)
@@ -695,6 +877,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         task = self.task_observations(data)
         if task is not None:
             parts.append(task)
+        feet = self.foot_obstacle_observations(data)
+        if feet is not None:
+            parts.append(feet)
         if self._morphology_conditioning:
             parts.append(self._morphology_genes)
         return jp.hstack(parts)
@@ -913,6 +1098,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
     def observation_size(self) -> int:
         size = len(self._lidar_groups) * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
         size += self.task_observation_size()
+        size += self.foot_obstacle_observation_size()
         if self._morphology_conditioning:
             size += NUM_GENES
         return size

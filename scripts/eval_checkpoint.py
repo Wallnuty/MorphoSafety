@@ -54,6 +54,7 @@ from mjx_safety_gym import jax_cache
 from mjx_safety_gym.algorithms import train_ppo
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.envs.run_forward import RunForward
+from mjx_safety_gym.envs.lasers import Lasers
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.go_to_goal import GoToGoal
 
@@ -197,7 +198,19 @@ def summarise(name, out, boundary_weight: float = 1.0):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--robot", default="ant_gym")
-    ap.add_argument("--task", choices=["run", "minefield", "goal"], default="run")
+    ap.add_argument(
+        "--task", choices=["run", "minefield", "lasers", "goal"], default="run"
+    )
+    ap.add_argument(
+        "--saute_budget",
+        type=float,
+        default=None,
+        help="Evaluate a --penalizer saute checkpoint, whose observation is 1 "
+        "wider (the remaining budget). Must equal the --safety_budget the run "
+        "trained with; nothing in the checkpoint records it. Replay uses "
+        "penalty=0/terminate=False, matching the eval-side wrapper training "
+        "itself builds, so the numbers are raw behaviour.",
+    )
     ap.add_argument("--checkpoint", default="checkpoints/ant_gym_run")
     ap.add_argument("--episodes", type=int, default=128)
     ap.add_argument(
@@ -220,7 +233,12 @@ def main() -> None:
     # checkpoint wants 76 where today's defaults give 79. Without this the
     # script dies inside flax with a shape error that names neither the flag
     # nor the checkpoint.
-    _tasks = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
+    _tasks = {
+        "run": RunForward,
+        "minefield": Minefield,
+        "lasers": Lasers,
+        "goal": GoToGoal,
+    }
     if args.task == "goal":
         env = GoToGoal(robot=args.robot)
     else:
@@ -234,7 +252,10 @@ def main() -> None:
             probe = ocp.PyTreeCheckpointer().restore(str(leaf.resolve()))
             want = train_ppo.checkpoint_obs_width(probe[1]["policy"])
         env, _kw, default_width = train_ppo.build_env_for_checkpoint(
-            lambda **kw: _tasks[args.task](robot=args.robot, **kw), args.robot, want
+            lambda **kw: _tasks[args.task](robot=args.robot, **kw),
+            args.robot,
+            want,
+            saute_budget=args.saute_budget,
         )
         if default_width is not None:
             print(

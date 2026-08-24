@@ -133,15 +133,37 @@ def build_arena(
 
     for i in range(objects["hazards"].num_objects):
         hazard = spec.worldbody.add_body(name=f"hazard_{i}", mocap=True)
+        # ONE MATERIAL PER HAZARD, purely so the viewer can make an individual
+        # disc glow (main.py --hazard_highlight writes `mat_emission`). A shared
+        # material could only ever light all 20 at once. Emission starts at 0,
+        # so the resting appearance is unchanged.
+        #
+        # COSTS NOTHING: `mat_*` is render-only data MJX never reads, and this
+        # adds no GEOMS -- which is what actually costs throughput, since
+        # geom_xpos / geom_xmat are recomputed every step (ngeom stays 37).
+        # MEASURED, not assumed: __THROUGHPUT__ on env-only stepping, 512 envs,
+        # alternated reps. Contrast RunForward._add_corridor_walls, where two
+        # extra GEOMS cost 1.3%.
+        #
+        # An actual <light> per hazard was the obvious alternative and does NOT
+        # work: MuJoCo caps a scene at 8 lights (mjMAXLIGHT) and there are 20
+        # hazards.
+        spec.add_material(name=f"hazard_{i}_mat", emission=0.0)
         hazard.add_geom(
             name=f"hazard_{i}_geom",
+            material=f"hazard_{i}_mat",
             type=mj.mjtGeom.mjGEOM_CYLINDER,
             # `hazard_size` is the RADIUS before arena scaling. 0.2 is
-            # safety-gym's original; GoToGoal now defaults to 0.18 (0.9x) --
+            # safety-gym's original; GoToGoal now defaults to 0.16 (0.8x) --
             # see its constructor. _post_init reads the radius back off this
             # geom, so the cost threshold follows automatically and cannot
             # drift from the disc that is drawn.
-            size=[hazard_size * obstacle_scale, 0.01 * obstacle_scale, 0],
+            # size = [RADIUS, HALF-HEIGHT, unused] for a cylinder. Half-height
+            # halved 0.01 -> 0.005 on 2026-08-24 (user's call) so the emissive
+            # glow reads as a marking on the floor rather than a slab. PURELY
+            # VISUAL: _post_init reads the cost threshold off size[0], the
+            # RADIUS, and nothing anywhere reads size[1].
+            size=[hazard_size * obstacle_scale, 0.005 * obstacle_scale, 0],
             rgba=[0.0, 0.0, 1.0, 0.25],
             userdata=jp.ones(1),
             contype=jp.zeros(()),

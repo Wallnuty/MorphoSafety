@@ -21,6 +21,7 @@ from mjx_safety_gym.algorithms.train_ppo import (
     latest_checkpoint,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.lasers import Lasers
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
 import mjx_safety_gym.lidar as lidar
@@ -32,7 +33,7 @@ _parser = argparse.ArgumentParser(
 _parser.add_argument("--robot", choices=sorted(_ROBOT_XMLS), default="point")
 _parser.add_argument(
     "--task",
-    choices=["goal", "run", "minefield"],
+    choices=["goal", "run", "minefield", "lasers"],
     default="goal",
     help="Must match the task the checkpoint was trained on. All three tasks "
     "give the same observation width, so a mismatch loads cleanly and replays a "
@@ -65,6 +66,55 @@ _parser.add_argument(
     "Accepts either a run directory (newest step inside is used) or a single "
     "step directory. Note the ENV is still built from --robot, so this must be "
     "a checkpoint trained on the same robot.",
+)
+_parser.add_argument(
+    "--camera_track",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Point the camera at the robot and FOLLOW it. On by default: the free "
+    "camera starts centred on the arena origin, which on the corridor tasks is "
+    "the middle of an 11 m track with the robot 5.5 m behind it -- so every "
+    "session began by hunting for the ant, and it then walked out of frame "
+    "again. --no-camera_track restores the free camera.",
+)
+_parser.add_argument(
+    "--hazard_highlight",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Light up each hazard while it is actually charging cost. Driven by "
+    "GoToGoal.hazard_contacts -- the SAME per-hazard test get_cost sums -- so "
+    "what lights up is exactly what is being charged, rather than a lookalike "
+    "reimplementation that could drift. Note the step-on rule: a disc only "
+    "fires while a robot geom is ON THE GROUND inside it, so an ant vaulting "
+    "over a mine correctly stays dark. Viewer only.",
+)
+_parser.add_argument(
+    "--camera_distance", type=float, default=4.0,
+    help="Metres from the tracked robot. Scaled by the robot's arena_scale, so "
+    "ant_gym (4x bigger) gets a proportionally wider shot.",
+)
+_parser.add_argument(
+    "--camera_azimuth", type=float, default=120.0,
+    help="Camera heading in degrees. 120 is a three-quarter view from behind "
+    "and to the side, which shows foot placement against the hazard discs "
+    "better than a pure side-on or straight-behind shot.",
+)
+_parser.add_argument(
+    "--camera_elevation", type=float, default=-20.0,
+    help="Camera pitch in degrees; negative looks down.",
+)
+_parser.add_argument(
+    "--saute_budget",
+    type=float,
+    default=None,
+    help="Replay a --penalizer saute checkpoint (its observation is 1 wider, "
+    "carrying the remaining safety budget). MUST equal the --safety_budget the "
+    "run trained with: the wrapper divides accumulated cost by it to produce "
+    "that extra observation dim, so a wrong value feeds the policy an input it "
+    "never saw. Nothing in the checkpoint records it -- training writes an "
+    "empty ConfigDict -- so it has to be supplied here. Replay always uses "
+    "penalty=0/terminate=False, matching the eval-side wrapper, so what you "
+    "watch is raw behaviour rather than a budget-exhaustion artifact.",
 )
 _parser.add_argument(
     "--num_morphologies",
@@ -124,7 +174,12 @@ ckpt_path = resolve_checkpoint(ROBOT)
 # orbax hands each dataclass back as a plain dict of its fields.
 _loaded = None if ckpt_path is None else ocp.PyTreeCheckpointer().restore(str(ckpt_path))
 
-_TASKS = {"run": RunForward, "minefield": Minefield, "goal": GoToGoal}
+_TASKS = {
+    "run": RunForward,
+    "minefield": Minefield,
+    "lasers": Lasers,
+    "goal": GoToGoal,
+}
 _want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
 if _args.num_morphologies:
     # Morphology-conditioned checkpoints are NUM_GENES wider than the task obs
@@ -139,7 +194,14 @@ if _args.num_morphologies:
         env = GoToGoal(robot=ROBOT, morphology_conditioning=True)
     else:
         env = _TASKS[_args.task](
-            robot=ROBOT, morphology_conditioning=True, **robot_env_kwargs(ROBOT)
+            robot=ROBOT,
+            morphology_conditioning=True,
+            # VIEWER-ONLY: draws the corridor as a floor stripe instead of two
+            # solid walls that hide the ant. Costs ~1.3% of env stepping
+            # (ngeom 37 -> 39), so it is off by default and never on in
+            # training. See RunForward._add_corridor_walls.
+            draw_corridor_lines=True,
+            **robot_env_kwargs(ROBOT),
         )
 
     # Reproduce randomization_fn's population EXACTLY: same PRNGKey -> same
@@ -187,8 +249,18 @@ elif _args.task == "goal":
     env = GoToGoal(robot=ROBOT)
 else:
     env, _task_kwargs, _default_width = build_env_for_checkpoint(
-        lambda **kw: _TASKS[_args.task](robot=ROBOT, **kw), ROBOT, _want
+        lambda **kw: _TASKS[_args.task](
+            robot=ROBOT, draw_corridor_lines=True, **kw
+        ),
+        ROBOT,
+        _want,
+        saute_budget=_args.saute_budget,
     )
+    if _args.saute_budget is not None and _want == env.observation_size:
+        print(
+            f"  -> wrapped in Saute(budget={_args.saute_budget}, penalty=0, "
+            f"terminate=False) for the +1 budget observation"
+        )
     if _default_width is not None:
         print(
             f"Checkpoint expects an observation of width {_want}; this robot's "
@@ -305,7 +377,85 @@ total_cost = 0.0
 decisions = 0        # decisions in the CURRENT episode -- comparable to the
                      # arrival numbers eval_morphology.py reports
 episode = 1
+# Hazard highlighting: resolve geom ids and remember the resting colour, so the
+# highlight can be switched on and off per frame by writing `m.geom_rgba` (model
+# data, read at render time -- no effect on physics).
+# SELF-LIT, NOT RECOLOURED. An earlier version flipped the disc to orange, which
+# reads as "a different object" rather than "this one is active". Emission makes
+# MuJoCo render the geom as though it emits its own light, so the HUE IS
+# UNTOUCHED -- only how brightly it burns. Opacity moves with it because a disc
+# resting at 25% opacity swallows the glow; emission-only was tried and was too
+# subtle to read. Every obstacle carries its OWN material (world.py,
+# envs/lasers.py) precisely so they can be lit one at a time.
+#
+# ONE GENERIC LIST, not a block per obstacle type. `lasers` has zero hazards and
+# `minefield` has zero beams, and the empty case is a real trap rather than a
+# no-op: `np.array([])` is FLOAT, and indexing `mat_emission` with it raises
+# "arrays used as indices must be of integer (or boolean) type". That is the
+# same empty-array trap already guarded three times in the env code.
+_highlights = []
+
+
+def _register_highlight(prefix, count, contacts_attr, emis_hot, alpha_hot):
+    """Collect (geom ids, mat ids, mask fn, resting values, lit values)."""
+    if not count or not hasattr(env.unwrapped, contacts_attr):
+        return
+    try:
+        gids = np.array(
+            [m.geom(f"{prefix}_{i}_geom").id for i in range(count)], dtype=int
+        )
+        mids = np.array(
+            [m.material(f"{prefix}_{i}_mat").id for i in range(count)], dtype=int
+        )
+    except KeyError:
+        # A model built before per-obstacle materials existed. Highlighting is a
+        # nicety; degrade to off rather than refusing to open the viewer.
+        return
+    _highlights.append(
+        {
+            "gids": gids,
+            "mids": mids,
+            "fn": jax.jit(getattr(env.unwrapped, contacts_attr)),
+            "emis_base": m.mat_emission[mids].copy(),
+            "alpha_base": m.geom_rgba[gids, 3].copy(),
+            "emis_hot": emis_hot,
+            "alpha_hot": alpha_hot,
+        }
+    )
+
+
+if _args.hazard_highlight:
+    _register_highlight(
+        "hazard",
+        len(getattr(env.unwrapped, "_hazard_body_ids", ())),
+        "hazard_contacts",
+        emis_hot=1.0,
+        alpha_hot=0.85,
+    )
+    # Beams rest already glowing -- a laser that is dark reads as switched off --
+    # so the lit state is a step UP from a nonzero base, not up from nothing.
+    _register_highlight(
+        "laser",
+        len(getattr(env.unwrapped, "_laser_x", ())),
+        "laser_contacts",
+        emis_hot=1.0,
+        alpha_hot=1.0,
+    )
+
 with mujoco.viewer.launch_passive(m, d) as viewer:
+    if _args.camera_track:
+        # TRACKING, not just an initial lookat: the corridor is 11 m long (44 m
+        # for ant_gym) and a policy that works crosses all of it, so a camera
+        # merely *placed* at the spawn loses the robot within seconds. Tracking
+        # keeps it framed for the whole episode and across resets.
+        # `.unwrapped` because the env may be Saute-wrapped.
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = env.unwrapped._robot_body_id
+        viewer.cam.distance = _args.camera_distance * getattr(
+            env.unwrapped, "_arena_scale", 1.0
+        )
+        viewer.cam.azimuth = _args.camera_azimuth
+        viewer.cam.elevation = _args.camera_elevation
     for i in range(num_steps):
         if not viewer.is_running():
             break
@@ -340,6 +490,17 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         lidar.update_lidar_rings(lidar_vals, m, env.lidar_groups)
         mjx.get_data_into(d, m, state.data)
         mujoco.mj_forward(m, d)
+        for _h in _highlights:
+            # One small device->host transfer per group per frame, on the same
+            # `state.data` get_cost consumes, so the highlight cannot disagree
+            # with what is actually being charged.
+            hot = np.asarray(_h["fn"](state.data))
+            m.mat_emission[_h["mids"]] = np.where(
+                hot, _h["emis_hot"], _h["emis_base"]
+            )
+            m.geom_rgba[_h["gids"], 3] = np.where(
+                hot, _h["alpha_hot"], _h["alpha_base"]
+            )
         viewer.sync()
 
         # ACT ON `done`. The env computes it (terminate_on_goal has been the

@@ -142,14 +142,21 @@ import jax, time
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms.train_ppo import robot_env_kwargs
 # Build through robot_env_kwargs, NOT bare. A bare Minefield(robot="ant") is
-# 44 wide; the env training actually uses is 47, because goal_observation adds
-# 3 features. Constructing it bare here printed "obs=(44,) (expect 47)" and
-# looked like a failure when nothing was wrong. This is the same mismatch that
+# narrower than the env training actually uses, because goal_observation adds
+# 3 features. Constructing it bare here printed a mismatched width and looked
+# like a failure when nothing was wrong. This is the same mismatch that
 # main.py and eval_checkpoint.py had to be fixed for.
+#
+# DO NOT hardcode the expected width here. It has moved twice already (47 with
+# the obstacle lidar ring, 31 once --hazard_lidar defaulted off, 2026-08-22),
+# and a stale literal in a provisioning script reads as a failed preflight on
+# a box that is billing. The assert below is the real check: it compares the
+# reset obs against the env's OWN observation_size, which is what any width
+# bug would break.
 env = Minefield(robot="ant", **robot_env_kwargs("ant"))
 t = time.time(); s = jax.jit(env.reset)(jax.random.PRNGKey(0)); s.obs.block_until_ready()
 assert s.obs.shape == (env.observation_size,), (s.obs.shape, env.observation_size)
-print(f"reset ok in {time.time()-t:.1f}s  obs={s.obs.shape}  (training width, expect 47)")
+print(f"reset ok in {time.time()-t:.1f}s  obs={s.obs.shape}  (matches observation_size)")
 step = jax.jit(env.step)
 t = time.time(); s = step(s, jax.numpy.zeros(env.action_size)); s.obs.block_until_ready()
 print(f"step ok in {time.time()-t:.1f}s")

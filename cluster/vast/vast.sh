@@ -41,12 +41,28 @@ IMAGE="${IMAGE:-pytorch/pytorch}"
 #                             wheels jax requires -- irreducible
 #   repo + checkpoints        ~0.1 GB (a checkpoint is 6.4 MB; 10 of them)
 #
-# NOT 12. 12 is the right number only once IMAGE is a slim base; against
-# pytorch/pytorch the image plus the env is ~15 GB and provisioning would die
-# partway through the wheel install, which costs a whole rental cycle to
-# discover. 20 also stays safe under either answer to a thing never actually
-# measured here: whether Vast counts the docker image against this allocation.
-# Run `df -h /` on the next rental and shrink it further if it does not.
+# 20. REVERTED from 10 on 2026-08-23 after 10 FAILED A PROVISION with
+# "[Errno 28] No space left on device" partway through the jaxlib install.
+#
+# The 10 came from one measurement that looked decisive and was not: `df -h /`
+# on a freshly provisioned box read `overlay 20G, 6.3G used`. Two errors in
+# reading that:
+#
+#   1. `/opt/conda` is 14 GB but df counts only 6.5 GB, because the image's
+#      files live in the overlayfs LOWER layer and only what provisioning
+#      WRITES lands in the counted upper layer. So "the image does not count"
+#      was the right conclusion from the wrong evidence -- it is not that Vast
+#      excludes the image, it is that df never showed it. Whether a given host
+#      charges the image against the allocation was still not established.
+#   2. Worse, 6.3 GB is the STEADY-STATE footprint, not the PEAK. pip unpacks
+#      ~3 GB of nvidia-*-cu12 wheels through temporary space on the same
+#      overlay, so provisioning transiently needs several GB more than the env
+#      finally occupies. The failed box died at 6.5 GB used with 3.6 GB still
+#      "available".
+#
+# Measure the peak, not the resting size, before touching this again. The
+# saving was ~$0.07/day of storage; the cost of getting it wrong is a whole
+# rental cycle.
 DISK="${DISK:-20}"
 
 # vastai lives in conda base, not in mjx-safety-gym -- deliberately, so a CLI
@@ -121,15 +137,18 @@ search)
   # card and wall-clock is what costs money. Once the model is pinned, every
   # offer has near-identical compute, so cheapest IS best value.
   #
-  # reliability>0.99, NOT >0.98. The first rental ever attempted here scored
-  # 0.983 -- the LOWEST in its result set -- and its host could not pull a
-  # docker image at all. Reliability is Vast's own measure of how often a
-  # host's rentals actually work; the few cents saved by dropping the floor
-  # are worth far less than one dead boot.
+  # reliability>0.995, RAISED FROM 0.99 on 2026-08-24 (user's call). The
+  # original floor was 0.98 -> 0.99 after the first rental ever attempted here
+  # scored 0.983, the LOWEST in its result set, and its host could not pull a
+  # docker image at all. 0.99 was still not enough: of the rentals taken at
+  # that floor, the 0.9904 offer on 2026-08-24 was ALSO dead on arrival with
+  # the same image-pull failure, and two more before it wasted ~20 min each.
+  # Reliability is Vast's own measure of how often a host's rentals actually
+  # work; a dead boot costs more in wall-clock than the few cents saved.
   GPU="${GPU:-RTX_3090}"
-  echo "Cheapest $GPU, reliability>0.99, CUDA 12+, verified:"
+  echo "Cheapest $GPU, reliability>0.995, CUDA 12+, verified:"
   $VASTAI search offers \
-    "num_gpus=1 gpu_name=$GPU cuda_max_good>=12.0 reliability>0.99
+    "num_gpus=1 gpu_name=$GPU cuda_max_good>=12.0 reliability>0.995
      verified=true disk_space>50 inet_down>100 rentable=true" \
     -o 'dph_total' --limit "${LIMIT:-15}"
   echo

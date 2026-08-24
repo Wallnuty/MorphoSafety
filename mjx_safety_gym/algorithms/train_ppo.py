@@ -37,6 +37,7 @@ from mjx_safety_gym.algorithms.wrappers import (
     Saute,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.lasers import Lasers
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
 
@@ -97,7 +98,7 @@ _ROBOT_DEFAULTS = {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
-        "terminate_on_goal": True,
+        "terminate_on_goal": True, "foot_obstacle_obs": False,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -143,6 +144,13 @@ _ROBOT_DEFAULTS = {
         # still improving at 256 when it stopped. Pass --no-terminate_on_goal
         # to reproduce anything recorded before this date.
         "terminate_on_goal": True,
+        # PER-FOOT OBSTACLE CLEARANCE, on since 2026-08-24. Until then the
+        # only obstacle input was the torso-centred lidar ring, while cost
+        # was charged on grounded FEET -- see
+        # GoToGoal.foot_obstacle_observations. Adds 12 dims (47 -> 59), so
+        # every earlier checkpoint reconciles through the no_feet candidate
+        # in _env_kwarg_candidates.
+        "foot_obstacle_obs": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -215,6 +223,13 @@ _ROBOT_DEFAULTS = {
         # still improving at 256 when it stopped. Pass --no-terminate_on_goal
         # to reproduce anything recorded before this date.
         "terminate_on_goal": True,
+        # PER-FOOT OBSTACLE CLEARANCE, on since 2026-08-24. Until then the
+        # only obstacle input was the torso-centred lidar ring, while cost
+        # was charged on grounded FEET -- see
+        # GoToGoal.foot_obstacle_observations. Adds 12 dims (47 -> 59), so
+        # every earlier checkpoint reconciles through the no_feet candidate
+        # in _env_kwarg_candidates.
+        "foot_obstacle_obs": True,
     },
 }
 
@@ -240,7 +255,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 # are not accepted by the env.
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
-    "goal_observation", "terminate_on_goal",
+    "goal_observation", "terminate_on_goal", "foot_obstacle_obs",
 )
 
 
@@ -320,6 +335,7 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
         goal_observation   +3   (2026-08-15, ON by default for the ants)
         lidar_groups      +32   (2026-08-15, narrowed to the obstacle ring)
         lidar_groups      +16   (2026-08-22, obstacle ring off by default)
+        foot_obstacle_obs +16   (2026-08-24, ON by default for the ants)
 
     For the ant that makes 44 (current), 47 (current + goal sensing), 76
     (legacy) and 79 (legacy + goal sensing) all reachable, and every ant
@@ -327,20 +343,45 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
     """
     current = robot_env_kwargs(robot)
     legacy_reward = {**current, "goal_observation": False, "goal_reward_weight": 0.0}
+    no_feet = {**current, "foot_obstacle_obs": False}
     return [
         current,
+        # PER-FOOT CLEARANCE OFF -- load-bearing since it became the default on
+        # 2026-08-24. Every checkpoint in the repo predates it, so without this
+        # entry the search never reaches the width any of them was trained at.
+        no_feet,
+        {**no_feet, "goal_observation": not current.get("goal_observation", False),
+         "goal_reward_weight": (
+             0.0 if current.get("goal_observation") else current["goal_reward_weight"]
+         )},
+        {**no_feet, "lidar_groups": _HAZARD_LIDAR_GROUPS},
+        {**no_feet, "lidar_groups": ()},
         {**current, "goal_observation": not current.get("goal_observation", False),
          "goal_reward_weight": (
              0.0 if current.get("goal_observation") else current["goal_reward_weight"]
          )},
         {**current, "lidar_groups": _HAZARD_LIDAR_GROUPS},
+        # NO-LIDAR, load-bearing since the ring became the default on
+        # 2026-08-23. `current` now carries the ring, so without this entry
+        # every checkpoint trained during the 2026-08-22/23 no-lidar window
+        # (31 wide, or 32 under Saute) becomes unloadable -- the search would
+        # walk right past the only configuration that produces its width.
+        {**current, "lidar_groups": ()},
+        {**legacy_reward, "lidar_groups": ()},
         {**legacy_reward, "lidar_groups": _HAZARD_LIDAR_GROUPS},
         {**legacy_reward, "lidar_groups": _LEGACY_LIDAR_GROUPS},
         {**current, "lidar_groups": _LEGACY_LIDAR_GROUPS},
     ]
 
 
-def build_env_for_checkpoint(build, robot: str, want_width: Optional[int]):
+def build_env_for_checkpoint(
+    build,
+    robot: str,
+    want_width: Optional[int],
+    *,
+    saute_budget: Optional[float] = None,
+    saute_discounting: float = 0.9,
+):
     """Build a corridor env whose observation width matches a checkpoint's.
 
     `build` is called with env kwargs and returns the env.
@@ -363,7 +404,8 @@ def build_env_for_checkpoint(build, robot: str, want_width: Optional[int]):
     (it was, and printed "73" for a 79-wide default).
     """
     default_width = None
-    for i, kwargs in enumerate(_env_kwarg_candidates(robot)):
+    candidates = list(_env_kwarg_candidates(robot))
+    for i, kwargs in enumerate(candidates):
         env = build(**kwargs)
         if i == 0:
             default_width = env.observation_size
@@ -372,12 +414,40 @@ def build_env_for_checkpoint(build, robot: str, want_width: Optional[int]):
         if env.observation_size == want_width:
             return env, kwargs, default_width
 
+    # SAUTE CHECKPOINTS ARE EXACTLY ONE WIDER than anything the kwargs above
+    # can produce, because the wrapper appends the remaining-budget scalar to
+    # the observation (Saute.observation_size). No combination of
+    # goal_observation and lidar_groups can reach that width, so before this
+    # fallback existed a `--penalizer saute` checkpoint could not be replayed
+    # or evaluated AT ALL -- it died in the SystemExit below blaming the robot.
+    #
+    # penalty=0.0 / terminate=False mirrors the EVAL-side wrapper that
+    # train() builds regardless of the training flags: replay should show raw
+    # behaviour, not budget-exhaustion artifacts.
+    #
+    # THE BUDGET MUST MATCH THE TRAINING RUN. It divides the accumulated cost
+    # to produce the observed scalar, so a wrong budget feeds the policy an
+    # observation it never trained against. Nothing in the checkpoint records
+    # it (training writes an empty ConfigDict), so callers have to supply it.
+    if saute_budget is not None and want_width is not None:
+        for kwargs in candidates:
+            env = build(**kwargs)
+            if env.observation_size + 1 == want_width:
+                wrapped = Saute(env, saute_discounting, saute_budget, 0.0, False)
+                return wrapped, kwargs, default_width
+
     raise SystemExit(
         f"Cannot load this checkpoint against --robot {robot}.\n"
         f"  the checkpoint's policy expects an observation of width {want_width}\n"
         f"  this robot/task produces {default_width}\n"
         f"No combination of goal_observation and lidar_groups reaches "
-        f"{want_width}, so the checkpoint was most likely trained on a "
+        f"{want_width}"
+        + (
+            ", even allowing for the +1 a Saute wrapper adds"
+            if saute_budget is not None
+            else " (pass saute_budget= if this is a --penalizer saute checkpoint)"
+        )
+        + f", so the checkpoint was most likely trained on a "
         f"different robot (observation width also depends on the robot's "
         f"sensor count)."
     )
@@ -601,7 +671,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--task",
-        choices=["goal", "run", "minefield"],
+        choices=["goal", "run", "minefield", "lasers"],
         default="goal",
         help="'goal' is the original navigate-to-a-respawning-goal task. 'run' "
         "is RunForward: start at one end of a corridor and get as far in +x as "
@@ -628,6 +698,44 @@ def build_argparser() -> argparse.ArgumentParser:
         "raising this is close to free in physics -- it costs one more row in "
         "get_cost's distance matrix. Placement is rejection-sampled with a "
         "bounded retry, so very high counts silently start overlapping.",
+    )
+    parser.add_argument(
+        "--foot_obstacle_obs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--task run/minefield/lasers] Give the policy PER-FOOT clearance "
+        "to the nearest obstacle (4 dims x 4 feet = 16; obs 47 -> 63). ON since "
+        "2026-08-24. Until then the only obstacle input was the lidar ring, "
+        "computed from a SINGLE TORSO POINT -- while cost is charged on the "
+        "minimum over all 13 collision geoms and, since --hazard_step_on, only "
+        "for the ones on the ground. The policy was punished for where its FEET "
+        "landed and shown only where its TORSO was. Per foot: [signed gap to "
+        "the obstacle EDGE, cos bearing, sin bearing, height above the "
+        "GROUNDED threshold]. Entries 0 and 3 are the two halves of the cost "
+        "condition -- it fires iff both are <= 0 -- so it is fully observable. "
+        "--no-foot_obstacle_obs reproduces every run before this date.",
+    )
+    parser.add_argument(
+        "--num_lasers",
+        type=int,
+        default=None,
+        help="[--task lasers] Full-width tripwire beams along the corridor. "
+        "Default 10, which over the ant's ~10 m obstacle band is a 1.0 m "
+        "pitch -- deliberately the same x-pitch as the minefield lattice, so "
+        "the two tasks demand the same stride frequency and their costs are "
+        "comparable. Beams span the whole FLOOR, not just the corridor, so "
+        "they cannot be walked around; see envs/lasers.py.",
+    )
+    parser.add_argument(
+        "--laser_width",
+        type=float,
+        default=None,
+        help="[--task lasers] FULL beam thickness in x, before arena scaling. "
+        "Default 0.10 (half-width 0.05). Against the ant's 0.02 foot radius "
+        "the forbidden band is 0.07 wide per beam. Measured on a settled ant, "
+        "12 of 41 torso-x offsets across one 1.0 m period charge cost -- with "
+        "a gap at dead centre where the beam passes BETWEEN the front and rear "
+        "foot pairs.",
     )
     parser.add_argument(
         "--corridor_length",
@@ -678,9 +786,10 @@ def build_argparser() -> argparse.ArgumentParser:
         "boundary, so this is no longer the dominant term it once was.",
     )
     parser.add_argument(
-        "--hazard_size", type=float, default=0.18,
-        help="Hazard RADIUS before arena scaling. 0.18 since 2026-08-22, i.e. "
-        "0.9x safety-gym's 0.2: slightly smaller discs make the corridor a "
+        "--hazard_size", type=float, default=0.16,
+        help="Hazard RADIUS before arena scaling. 0.16 since 2026-08-23, i.e. "
+        "0.8x safety-gym's 0.2 (it was 0.9x=0.18 the day before): smaller discs "
+        "make the corridor a "
         "field to be threaded by foot placement rather than a wall to be routed "
         "around. Every cost number measured at a different radius is on a "
         "different scale. "
@@ -690,9 +799,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hazard_lidar",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="[--task run/minefield] Give the policy the 16-bin obstacle lidar "
-        "ring. OFF since 2026-08-22, which narrows the ant's observation by 16. "
+        "ring. BACK ON since 2026-08-23, and the flip-flop is worth reading "
+        "before changing it again: whether the ring helps DEPENDS ON POLICY "
+        "WIDTH, and measuring it at the old (32,)*4 gave the wrong answer. At "
+        "32x4 the ring HURT (reward 18.8 vs 21.4 without it, 6.7 SE over 256 "
+        "episodes) -- 16 extra inputs into a 4,752-parameter policy is burden, "
+        "not information. At 256x4 it HELPS: cost 85 vs 120 for the same "
+        "reward, ~30%%. So the 2026-08-22 removal was a true statement about a "
+        "narrow policy and a false one about the sensor. "
         "The ring is a ROUTING sensor -- measured, it exposes ~5.2 distinct "
         "hazards out to 2 m -- and routing is not what this task is meant to be "
         "about any more. With hazards on a fixed even lattice their positions "
@@ -849,13 +965,19 @@ def build_argparser() -> argparse.ArgumentParser:
         "--policy_hidden_layer_sizes",
         type=int,
         nargs="+",
-        default=[32, 32, 32, 32],
-        help="Defaults to ppo/networks.py's own default (32,)*4 -- fine for a "
-        "single fixed body, likely too small once the policy is conditioned "
-        "on --num_morphologies morphologies at once (the value/cost-value "
-        "networks are already (256,)*5, so the policy is the bottleneck). "
-        "If per-morphology eval returns come out near-identical under "
-        "morphology randomization, widen this first.",
+        default=[256, 256, 256, 256],
+        help="256x4 since 2026-08-23, up from brax's (32,)*4 -- MEASURED, and "
+        "the single largest effect found so far on this task. ant/minefield, "
+        "Saute budget 500, 50M, everything else identical: 32x4 reached reward "
+        "21.4 at cost 325, while 256x4 reached 21.4 at cost 120 -- a 2.7x cost "
+        "reduction for the same return, plus roughly 10x faster early learning "
+        "(reward 8.1 vs 0.75 at 5M). It costs ~3%% of throughput on a 3090 "
+        "(6556 -> 6335 sps at 512 envs), because physics dominates. "
+        "The value and cost-value networks were ALREADY (256,)*5, so a 4,752-"
+        "parameter policy was the narrow part of the network all along; 256x4 "
+        "is 214,032 parameters. Widen further only with evidence -- a 512x4 "
+        "arm is the open question. Layer widths are read back off the "
+        "checkpoint weights on load, so older 32x4 checkpoints still replay.",
     )
     parser.add_argument(
         "--terminate_on_goal",
@@ -960,6 +1082,18 @@ def build_argparser() -> argparse.ArgumentParser:
         "--design_std_init", type=float, default=0.577,
         help="Initial per-dimension std of each component, in [-1,1] design "
         "space. Upstream's value.",
+    )
+    parser.add_argument(
+        "--design_tmax", type=int, default=None,
+        help="Total design-schedule length in env steps; defaults to "
+        "--num_timesteps. THIS EXISTS FOR RESUMES. The design lr anneals as "
+        "1 - step/tmax and the burn-in and fine-tune phases are measured "
+        "against it, but the trainer's step counter restarts at 0 on a resume "
+        "(env_steps is not in the checkpoint), so the design axis is continued "
+        "from the restored state instead. Pass the ORIGINAL total here and the "
+        "REMAINING budget as --num_timesteps, or the anneal will be computed "
+        "against the wrong horizon -- too fast if the resumed run is shorter, "
+        "and clamped to zero part-way through if it is the full length again.",
     )
     parser.add_argument(
         "--design_updates_per_eval", type=int, default=8,
@@ -1136,7 +1270,7 @@ def train(args: argparse.Namespace):
             integrator=args.integrator,
             hazard_size=args.hazard_size,
         )
-        if args.task in ("run", "minefield"):
+        if args.task in ("run", "minefield", "lasers"):
             corridor = dict(
                 lidar_groups=_HAZARD_LIDAR_GROUPS if args.hazard_lidar else (),
                 corridor_length=args.corridor_length,
@@ -1146,6 +1280,7 @@ def train(args: argparse.Namespace):
                 boundary_cost_weight=args.boundary_cost_weight,
                 corridor_walls=args.corridor_walls,
                 hazard_step_on=args.hazard_step_on,
+                foot_obstacle_obs=args.foot_obstacle_obs,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,
                 terminate_on_goal=args.terminate_on_goal,
@@ -1157,6 +1292,14 @@ def train(args: argparse.Namespace):
                 # None lets Minefield apply its own default rather than this
                 # module deciding the count in two places.
                 return Minefield(num_hazards=args.num_hazards, **corridor)
+            if args.task == "lasers":
+                # Lasers has NO hazards, so --num_hazards is meaningless here
+                # and is deliberately not forwarded; --num_lasers is the knob.
+                return Lasers(
+                    num_lasers=args.num_lasers,
+                    laser_width=args.laser_width,
+                    **corridor,
+                )
             return RunForward(**corridor)
         return GoToGoal(**common)
 
@@ -1226,7 +1369,7 @@ def train(args: argparse.Namespace):
             wrapper=design_wrapper,
             num_morphologies=args.num_morphologies,
             num_envs=args.num_envs,
-            tmax=args.num_timesteps,
+            tmax=args.design_tmax or args.num_timesteps,
             steps_before_update=args.steps_before_design_update,
             steps_after_update=args.steps_after_design_update,
             chop_freq=args.chop_freq or None,
@@ -1357,6 +1500,11 @@ def train(args: argparse.Namespace):
         # against (checkpoints/vast/vast_morph30M among them).
         unnormalized_obs_tail=(
             morphology_lib.NUM_GENES if design_loop is not None else 0
+        ),
+        # Saute hstacks its budget scalar after everything else, genes
+        # included, so under it the gene block ends one dim from the right.
+        unnormalized_obs_tail_offset=(
+            1 if (design_loop is not None and args.penalizer == "saute") else 0
         ),
     )
     return make_policy, params, metrics

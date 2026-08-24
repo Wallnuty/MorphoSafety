@@ -110,7 +110,10 @@ against `LIDAR_MAX_DIST = 2.0`; closest approach measured over the whole run was
 implements. Together they were 32 of 76 observation entries -- 42% of the input
 was a constant.
 
-`lidar_groups` now defaults to ("obstacle",) here. The goal is still parked at
+`lidar_groups` defaults to ("obstacle",) here -- the OBSTACLE ring only. It was
+briefly () between 2026-08-22 and 2026-08-23; see train_ppo's --hazard_lidar
+for the measurement that put it back (it helps at a 256x4 policy and hurts at
+32x4). The goal ring stays off regardless. The goal is still parked at
 the far end, and its DIRECTION is still available -- via `goal_observation`,
 which supplies bearing and range as three numbers rather than as a ring that
 could not see it. GoToGoal keeps all three rings: its goal actually moves and
@@ -134,6 +137,14 @@ from mjx_safety_gym.mjx_env import State, step
 from mjx_safety_gym.world import build_arena, placement_not_valid
 
 
+# Corridor-wall colour. The second entry is the VIEWING style, selected by
+# `draw_corridor_lines`: alpha 0 leaves the collider present but undrawn, and
+# a flat `corridor_line_*` stripe marks the boundary instead. See
+# RunForward._add_corridor_walls.
+_WALL_RGBA_SOLID = [0.35, 0.35, 0.40, 0.6]
+_WALL_RGBA_HIDDEN = [0.35, 0.35, 0.40, 0.0]
+
+
 class RunForward(GoToGoal):
     """Run as far as possible in +x along an obstacle-strewn corridor.
 
@@ -151,13 +162,14 @@ class RunForward(GoToGoal):
         ctrl_cost_weight: float = 0.0,
         boundary_cost_weight: float = 1.0,
         corridor_walls: bool = True,
+        draw_corridor_lines: bool = False,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
         terminate_on_goal: bool = True,
         goal_radius: float | None = None,
         goal_reward_weight: float = 0.0,
         goal_observation: bool = False,
-        lidar_groups=(),
+        lidar_groups=("obstacle",),
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -179,6 +191,7 @@ class RunForward(GoToGoal):
         self._ctrl_cost_weight = float(ctrl_cost_weight)
         self._boundary_cost_weight = float(boundary_cost_weight)
         self._corridor_walls = bool(corridor_walls)
+        self._draw_corridor_lines = bool(draw_corridor_lines)
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
         self._terminate_on_goal = bool(terminate_on_goal)
@@ -271,6 +284,27 @@ class RunForward(GoToGoal):
         # Tall enough that the ant cannot climb or ballistically clear it: the
         # ant's torso stands at ~0.33 m at arena_scale 1, ant_gym's at ~0.67.
         half_height = 0.5 * a
+        # VIEWING STYLE, off by default (2026-08-24). With
+        # `draw_corridor_lines=True` the collider is drawn fully transparent and
+        # a flat blue stripe is laid on the floor in its place, so the corridor
+        # reads as a lane marking rather than a canyon -- the ant is small in
+        # frame and two 0.5 m walls hid it from most camera angles.
+        #
+        # OFF IN TRAINING BECAUSE IT IS NOT FREE. The stripes never collide
+        # (contype=0/conaffinity=0, the same mechanism that keeps the 20 hazards
+        # out of the broad phase) and add no DOFs, so physics is BIT-IDENTICAL --
+        # verified by sha256 over qpos after 40 steps, max abs diff 0.0. But
+        # they raise ngeom 37 -> 39, so geom_xpos/geom_xmat carry two more rows
+        # through kinematics every step, and that measured -1.27% on env-only
+        # stepping (512 envs, laptop GPU, 2 alternated reps: -0.93% / -1.61%).
+        # That is only ~0.4% of training/sps once diluted by the non-physics
+        # two-thirds of a training step -- but it buys nothing during training,
+        # where nothing is rendered at all.
+        #
+        # main.py turns it on; every other caller gets the fast path by default.
+        wall_rgba = _WALL_RGBA_HIDDEN if self._draw_corridor_lines else _WALL_RGBA_SOLID
+        half_thick_line = 0.02 * a
+        half_height_line = 0.002 * a
         for sign, side in ((1.0, "left"), (-1.0, "right")):
             spec.worldbody.add_geom(
                 name=f"corridor_wall_{side}",
@@ -284,7 +318,25 @@ class RunForward(GoToGoal):
                     sign * (self._corridor_half_width + half_thick),
                     half_height,
                 ],
-                rgba=[0.35, 0.35, 0.40, 0.6],
+                rgba=wall_rgba,
+            )
+            if not self._draw_corridor_lines:
+                continue
+            # Centred ON the boundary, not on the wall's centre, so the stripe
+            # marks where the collider's inner face actually is. Not in any
+            # lidar group, and both cost-path id lists are built by explicit
+            # NAME lookup, so this cannot leak into the cost signal.
+            spec.worldbody.add_geom(
+                name=f"corridor_line_{side}",
+                type=mj.mjtGeom.mjGEOM_BOX,
+                size=[half_len, half_thick_line, half_height_line],
+                pos=[0.0, sign * self._corridor_half_width, half_height_line],
+                contype=0,
+                conaffinity=0,
+                # Azure, opaque. Deliberately NOT the hazards' pure blue,
+                # which is [0, 0, 1] at alpha 0.25 -- a translucent disc
+                # against an opaque line, so the two stay tellable apart.
+                rgba=[0.15, 0.45, 0.95, 1.0],
             )
 
     def _hazard_lattice(self) -> np.ndarray:
@@ -313,6 +365,11 @@ class RunForward(GoToGoal):
         random phase is a one-line change.
         """
         n = self.spec["hazards"].num_objects
+        if n == 0:
+            # A task may replace hazards entirely (envs/lasers.py). The loop
+            # below divides by the column count, so this is a ZeroDivisionError
+            # at CONSTRUCTION time rather than anything subtle.
+            return np.empty((0, 2), dtype=float)
         r = self._hazard_size * self._arena_scale
         x_lo, x_hi = self._obstacle_x_lo, self._obstacle_x_hi
         y_lo = -self._corridor_half_width + r

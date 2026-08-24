@@ -57,6 +57,7 @@ stays comparable; the cost is that the design box is slightly narrower.
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 
 import numpy as np
 
@@ -68,6 +69,26 @@ STD_INIT = 0.577
 DESIGN_LO, DESIGN_HI = -1.0, 1.0
 
 _DEAD = -1e6  # what upstream writes into logmixprobs to retire a component
+
+_U64 = (1 << 64) - 1
+
+
+def _u128_to_words(x: int) -> np.ndarray:
+    """Split a 128-bit int into two uint64 words, low word first.
+
+    numpy's PCG64 keeps its counter and increment as 128-bit PYTHON ints, which
+    no array format stores natively -- hence the split. Round-tripped in
+    `verify_design_checkpoint.py` by drawing from a restored generator and
+    comparing against the original, which is the only check that actually
+    proves the encoding.
+    """
+    x = int(x)
+    return np.array([x & _U64, (x >> 64) & _U64], dtype=np.uint64)
+
+
+def _words_to_u128(words) -> int:
+    w = np.asarray(words, dtype=np.uint64)
+    return int(w[0]) | (int(w[1]) << 64)
 
 
 @dataclasses.dataclass
@@ -325,17 +346,116 @@ class GmmDesignDistribution:
     def from_genes(genes: np.ndarray) -> np.ndarray:
         return np.asarray(genes) * 2.0 - 1.0
 
+    # -- checkpointing -----------------------------------------------------
+    #
+    # EVERY MUTABLE FIELD HAS TO BE IN HERE, and the ones that are easy to
+    # forget are the ones that matter. A resumed run restores the policy from
+    # the orbax checkpoint; if the distribution came back at its init, the run
+    # would silently discard every design update it had already paid for and
+    # NOTHING IN THE METRICS WOULD SAY SO -- `design/mode_*` would simply jump
+    # and read as a large gradient step. The pieces:
+    #
+    #   means / log_stds    the trained parameters.
+    #   log_mixprobs        which components have been chopped. Losing this
+    #                       resurrects dead components, which is not a small
+    #                       error: chopping is the ONLY mechanism by which this
+    #                       mixture ever commits to a design (the weights are
+    #                       frozen), so a resume that forgets it restarts the
+    #                       commitment schedule from 8 components.
+    #   Adam moments        `chop` resets these ON PURPOSE, so a resume that
+    #                       also resets them is indistinguishable from an
+    #                       unscheduled chop -- the surviving components take a
+    #                       few oversized steps just as they would after one.
+    #   rng                 the sampling stream. Re-seeding would redraw the
+    #                       same eps sequence the run already used.
     def state_dict(self) -> dict:
+        bg = self.rng.bit_generator.state
+        if bg["bit_generator"] != "PCG64":
+            raise RuntimeError(
+                f"design RNG is {bg['bit_generator']}, not PCG64; the 128-bit "
+                f"word encoding in _u128_to_words does not apply to it."
+            )
         return {
             "means": self.means.copy(),
             "log_stds": self.log_stds.copy(),
             "log_mixprobs": self.log_mixprobs.copy(),
+            "adam_mean_m": self._adam_mean.m.copy(),
+            "adam_mean_v": self._adam_mean.v.copy(),
+            "adam_mean_t": np.array(self._adam_mean.t, dtype=np.int64),
+            "adam_logstd_m": self._adam_logstd.m.copy(),
+            "adam_logstd_v": self._adam_logstd.v.copy(),
+            "adam_logstd_t": np.array(self._adam_logstd.t, dtype=np.int64),
+            "rng_state": _u128_to_words(bg["state"]["state"]),
+            "rng_inc": _u128_to_words(bg["state"]["inc"]),
+            # These two cache a half-consumed 32-bit draw. Dropping them
+            # perturbs the stream by one word on resume -- harmless, but there
+            # is no reason to accept a known-wrong round trip.
+            "rng_has_uint32": np.array(bg["has_uint32"], dtype=np.int64),
+            "rng_uinteger": np.array(bg["uinteger"], dtype=np.int64),
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.means = np.asarray(state["means"]).copy()
-        self.log_stds = np.asarray(state["log_stds"]).copy()
-        self.log_mixprobs = np.asarray(state["log_mixprobs"]).copy()
+        """Restore in place. Shape mismatches raise; missing optional keys warn.
+
+        SHAPE MISMATCH IS FATAL, deliberately: resuming with a different
+        `--design_components` or a different gene count against an existing
+        sidecar is a configuration error, and quietly reshaping it would
+        produce a run whose distribution means something other than what its
+        flags say. Missing Adam/RNG keys only warn, matching how
+        `ppo/train.py` already treats a checkpoint whose optimizer state it
+        cannot read -- a partially restored distribution beats a dead resume.
+        """
+        means = np.asarray(state["means"])
+        log_stds = np.asarray(state["log_stds"])
+        log_mixprobs = np.asarray(state["log_mixprobs"])
+        want = (self.n_components, self.n_params)
+        if means.shape != want or log_stds.shape != want:
+            raise ValueError(
+                f"design state is {means.shape}, but this run is configured for "
+                f"{want} (--design_components {self.n_components}, "
+                f"{self.n_params} genes). Refusing to reshape it."
+            )
+        if log_mixprobs.shape != (self.n_components,):
+            raise ValueError(
+                f"design log_mixprobs is {log_mixprobs.shape}, expected "
+                f"{(self.n_components,)}."
+            )
+        self.means = means.astype(float).copy()
+        self.log_stds = log_stds.astype(float).copy()
+        self.log_mixprobs = log_mixprobs.astype(float).copy()
+
+        try:
+            self._adam_mean.m = np.asarray(state["adam_mean_m"]).astype(float).copy()
+            self._adam_mean.v = np.asarray(state["adam_mean_v"]).astype(float).copy()
+            self._adam_mean.t = int(np.asarray(state["adam_mean_t"]))
+            self._adam_logstd.m = (
+                np.asarray(state["adam_logstd_m"]).astype(float).copy()
+            )
+            self._adam_logstd.v = (
+                np.asarray(state["adam_logstd_v"]).astype(float).copy()
+            )
+            self._adam_logstd.t = int(np.asarray(state["adam_logstd_t"]))
+        except KeyError as exc:
+            print(
+                f"WARNING: design state has no Adam moments ({exc}); they "
+                f"restart from zero, which behaves like an extra chop."
+            )
+        try:
+            self.rng.bit_generator.state = {
+                "bit_generator": "PCG64",
+                "state": {
+                    "state": _words_to_u128(state["rng_state"]),
+                    "inc": _words_to_u128(state["rng_inc"]),
+                },
+                "has_uint32": int(np.asarray(state["rng_has_uint32"])),
+                "uinteger": int(np.asarray(state["rng_uinteger"])),
+            }
+        except KeyError as exc:
+            print(
+                f"WARNING: design state has no RNG state ({exc}); sampling "
+                f"resumes from the seeded stream and will redraw eps values "
+                f"this run has already used."
+            )
 
 
 class DesignLoop:
@@ -420,6 +540,28 @@ class DesignLoop:
         self._pending = None  # (params, comps) awaiting a score
         self._comp_scores: dict[int, float] = {}
         self._last_chop = 0
+        # Step of the last COMPLETED iteration, ON THE DESIGN AXIS. Tracked
+        # separately from `history` because history is in-memory only: on a
+        # resume it is empty, and reading the step off it would report 0 and
+        # un-freeze a run that was in its final fine-tune phase.
+        self._last_step = 0
+        # THE TRAINER'S STEP COUNTER RESTARTS AT ZERO ON A RESUME.
+        # `ppo/train.py` restores four things from the checkpoint -- normalizer,
+        # network params, penalizer params, optimizer state -- and `env_steps`
+        # is not among them, so `current_step` counts from 0 again. Every
+        # schedule in this class is expressed in absolute steps (`lr_frac`, the
+        # burn-in and fine-tune phases, and the chop interval), so taking the
+        # trainer's number at face value after a resume would rewind all three.
+        # The chop is the one that fails silently: `_last_chop` comes back as
+        # an absolute step from before the crash, so `step - _last_chop` stays
+        # negative until the resumed run has RE-CLIMBED past the pre-crash step
+        # count. A run that crashed at 120M would not chop again until trainer
+        # step 120M of the resume, and a resume shorter than that never chops
+        # at all -- so the mixture never commits to a design, which is the
+        # entire point of the method. This offset keeps a private, monotone
+        # axis: zero on a fresh run (identical behaviour), and on a resume it
+        # continues from where the checkpoint left off.
+        self._step_offset = 0
         self.history: list[dict] = []
 
     # -- called from inside the jitted reset ------------------------------
@@ -451,7 +593,7 @@ class DesignLoop:
 
     def sample(self, n_devices: int, n_envs: int):
         """Draw a population and compile it. Returns device-shaped (fields, genes)."""
-        step = self.history[-1]["step"] if self.history else 0
+        step = self._last_step
         if self._frozen(step):
             params = np.tile(self.gmm.mode(), (self.num_morphologies, 1))
             comps = np.zeros(self.num_morphologies, dtype=int)
@@ -549,7 +691,12 @@ class DesignLoop:
         return -fitness.mean(axis=1), counts
 
     def finish_iteration(self, env_state, step: int) -> dict:
-        """Score the population, take one REINFORCE step, chop on schedule."""
+        """Score the population, take one REINFORCE step, chop on schedule.
+
+        `step` arrives on the TRAINER's axis, which restarts at zero after a
+        resume; `_step_offset` maps it onto the design axis. See __init__.
+        """
+        step = int(step) + self._step_offset
         params, comps = self._pending
         scores, counts = self.scores_from(env_state)
         metrics: dict[str, float] = {
@@ -608,7 +755,78 @@ class DesignLoop:
         mode = self.gmm.mode()
         for i, v in enumerate(mode):
             metrics[f"design/mode_{i}"] = float(v)
+        self._last_step = int(step)
         self.history.append(
             {"step": step, "scores": scores.tolist(), "mode": mode.tolist()}
         )
         return metrics
+
+    # -- checkpointing -----------------------------------------------------
+
+    SIDECAR = "design_state.npz"
+
+    def state_dict(self) -> dict:
+        """Everything a resume needs, flattened to arrays for `np.savez`.
+
+        The GMM's own state plus the two things that live out here: the
+        per-component score EMA that decides the next chop, and when the last
+        chop happened. Lose the EMA and the next chop is taken on a window that
+        starts at the resume, which is a different (much shorter) average than
+        the schedule intends -- and chopping is irreversible.
+        """
+        idx = sorted(self._comp_scores)
+        state = {f"gmm_{k}": v for k, v in self.gmm.state_dict().items()}
+        state["comp_score_idx"] = np.array(idx, dtype=np.int64)
+        state["comp_score_val"] = np.array(
+            [self._comp_scores[i] for i in idx], dtype=float
+        )
+        state["last_chop"] = np.array(self._last_chop, dtype=np.int64)
+        state["last_step"] = np.array(self._last_step, dtype=np.int64)
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        self.gmm.load_state_dict(
+            {k[len("gmm_") :]: v for k, v in state.items() if k.startswith("gmm_")}
+        )
+        idx = np.asarray(state["comp_score_idx"]).reshape(-1)
+        val = np.asarray(state["comp_score_val"]).reshape(-1)
+        self._comp_scores = {int(i): float(v) for i, v in zip(idx, val)}
+        self._last_chop = int(np.asarray(state["last_chop"]))
+        self._last_step = int(np.asarray(state["last_step"]))
+        # Future trainer steps stack on top of where the checkpoint stopped.
+        # Idempotent: saving mid-resume writes an already-absolute `last_step`,
+        # so loading that again reproduces the same offset.
+        self._step_offset = self._last_step
+
+    def save(self, directory) -> str:
+        """Write the sidecar into an existing checkpoint directory.
+
+        A SIDECAR, not a fifth element of the orbax tuple. That tuple is
+        unpacked POSITIONALLY by three separate loaders (`ppo/train.py`,
+        `main.py`, `scripts/eval_checkpoint.py`), and this repo has already
+        been bitten once by orbax returning a saved dataclass as a
+        dict whose leaves sort alphabetically -- see `_load_checkpoint`, where
+        that would have loaded the cost critic into the policy. Design state is
+        host-side numpy that no policy loader wants; keeping it in its own file
+        means adding it cannot perturb what those three already read.
+        """
+        directory = pathlib.Path(directory)
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"{directory} does not exist, so brax's checkpoint layout is "
+                f"not what this expected ('<logdir>/<step:012d>'). The design "
+                f"state would have been written somewhere the resume path "
+                f"never looks."
+            )
+        path = directory / self.SIDECAR
+        np.savez(path, **self.state_dict())
+        return str(path)
+
+    def load(self, directory) -> bool:
+        """Restore from a checkpoint directory. False if there is no sidecar."""
+        path = pathlib.Path(directory) / self.SIDECAR
+        if not path.is_file():
+            return False
+        with np.load(path) as f:
+            self.load_state_dict({k: f[k] for k in f.files})
+        return True
