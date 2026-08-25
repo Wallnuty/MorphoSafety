@@ -184,7 +184,28 @@ MorphoSafetyToken.txt
 # Previously untracked-but-committed history already bloated .git to ~142MB;
 # this stops it from growing further. Existing large blobs stay in history
 # unless someone runs a filter-repo pass separately.
-checkpoints/
+#
+# `checkpoints/*`, NOT `checkpoints/` -- git cannot re-include anything under a
+# directory that is itself excluded, so the directory has to stay visible for
+# the exception below to be reachable at all. Consequence: this is now anchored
+# to the repo root, so a nested copy (cluster/cluster/checkpoints/, as landed
+# once via scp) is NOT covered any more. Watch for that in `git status`.
+checkpoints/*
+# EXCEPTION, 2026-08-25: ONE checkpoint is tracked on purpose, because scp to
+# the cluster would not work and git pull was the way to get it there. It is
+# the 50M lidar-only Saute run that cluster/ant_minefield_lidar_resume100M.sbatch
+# resumes from -- 6.4 MB, 9 files.
+#
+# THIS IS PERMANENT. Deleting it later shrinks the working tree but not .git;
+# the blob stays in history unless someone runs a filter-repo pass. Do not use
+# this as a precedent for the other checkpoints -- the rule above exists
+# because that habit already took .git to ~142 MB.
+#
+# Each level has to be re-included in turn; a single negation of the leaf does
+# not work, because git stops descending at the first excluded parent.
+!checkpoints/ant_minefield_saute500_lidar_wide/
+checkpoints/ant_minefield_saute500_lidar_wide/*
+!checkpoints/ant_minefield_saute500_lidar_wide/000050176000/
 # Training/eval logs (logs/). Per-run artifacts like checkpoints, not source.
 # NOTE: these are the only record of what a run actually did -- reward curves,
 # episode lengths, crash exit codes -- and being ignored they exist on ONE
