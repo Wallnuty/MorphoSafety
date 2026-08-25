@@ -144,13 +144,38 @@ _ROBOT_DEFAULTS = {
         # still improving at 256 when it stopped. Pass --no-terminate_on_goal
         # to reproduce anything recorded before this date.
         "terminate_on_goal": True,
-        # PER-FOOT OBSTACLE CLEARANCE, on since 2026-08-24. Until then the
-        # only obstacle input was the torso-centred lidar ring, while cost
-        # was charged on grounded FEET -- see
-        # GoToGoal.foot_obstacle_observations. Adds 12 dims (47 -> 59), so
-        # every earlier checkpoint reconciles through the no_feet candidate
-        # in _env_kwarg_candidates.
-        "foot_obstacle_obs": True,
+        # PER-FOOT OBSTACLE CLEARANCE. Adds 16 dims (47 -> 63). ON for one
+        # day (2026-08-24), OFF again on 2026-08-25 BECAUSE IT MEASURED WORSE.
+        #
+        # The idea was sound: the only obstacle input was a lidar ring computed
+        # from a SINGLE TORSO POINT, while cost is charged on the minimum over
+        # all 13 collision geoms and, under --hazard_step_on, only the grounded
+        # ones -- so the policy was punished for where its FEET landed and
+        # shown only where its TORSO was. See
+        # GoToGoal.foot_obstacle_observations.
+        #
+        # It did not pay. Matched 50M runs on minefield/saute-500, identical
+        # but for this flag, both at 512 envs:
+        #
+        #     lidar only   episode_cost 84.88   reward 20.52
+        #     + foot obs   episode_cost 97.08   reward 21.24
+        #
+        # The curves CROSS at ~32M: foot sensing reaches any given cost sooner,
+        # then stops falling while the lidar-only run keeps going. Confirmed on
+        # an independent harness (scripts/eval_checkpoint.py, 128 episodes,
+        # identical arena seeds, run twice): HAZARD cost 100.7/99.5 against
+        # 87.5/86.5.
+        #
+        # The result is not clean, and this default is the conservative reading
+        # rather than a verdict. The same evaluation found the lidar-only
+        # policy carrying ~21 of BOUNDARY cost against ~2 -- it drifts wider,
+        # around the mines, and training charged nothing for that
+        # (--boundary_cost_weight 0). Score total cost in a world where leaving
+        # the corridor counts and the ranking flips. So foot sensing may be
+        # losing to a free exploit rather than on merit; what is measured is
+        # that it does not lower hazard cost on the objective as it stands.
+        # Pass --foot_obstacle_obs to get it back.
+        "foot_obstacle_obs": False,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -223,13 +248,38 @@ _ROBOT_DEFAULTS = {
         # still improving at 256 when it stopped. Pass --no-terminate_on_goal
         # to reproduce anything recorded before this date.
         "terminate_on_goal": True,
-        # PER-FOOT OBSTACLE CLEARANCE, on since 2026-08-24. Until then the
-        # only obstacle input was the torso-centred lidar ring, while cost
-        # was charged on grounded FEET -- see
-        # GoToGoal.foot_obstacle_observations. Adds 12 dims (47 -> 59), so
-        # every earlier checkpoint reconciles through the no_feet candidate
-        # in _env_kwarg_candidates.
-        "foot_obstacle_obs": True,
+        # PER-FOOT OBSTACLE CLEARANCE. Adds 16 dims (47 -> 63). ON for one
+        # day (2026-08-24), OFF again on 2026-08-25 BECAUSE IT MEASURED WORSE.
+        #
+        # The idea was sound: the only obstacle input was a lidar ring computed
+        # from a SINGLE TORSO POINT, while cost is charged on the minimum over
+        # all 13 collision geoms and, under --hazard_step_on, only the grounded
+        # ones -- so the policy was punished for where its FEET landed and
+        # shown only where its TORSO was. See
+        # GoToGoal.foot_obstacle_observations.
+        #
+        # It did not pay. Matched 50M runs on minefield/saute-500, identical
+        # but for this flag, both at 512 envs:
+        #
+        #     lidar only   episode_cost 84.88   reward 20.52
+        #     + foot obs   episode_cost 97.08   reward 21.24
+        #
+        # The curves CROSS at ~32M: foot sensing reaches any given cost sooner,
+        # then stops falling while the lidar-only run keeps going. Confirmed on
+        # an independent harness (scripts/eval_checkpoint.py, 128 episodes,
+        # identical arena seeds, run twice): HAZARD cost 100.7/99.5 against
+        # 87.5/86.5.
+        #
+        # The result is not clean, and this default is the conservative reading
+        # rather than a verdict. The same evaluation found the lidar-only
+        # policy carrying ~21 of BOUNDARY cost against ~2 -- it drifts wider,
+        # around the mines, and training charged nothing for that
+        # (--boundary_cost_weight 0). Score total cost in a world where leaving
+        # the corridor counts and the ranking flips. So foot sensing may be
+        # losing to a free exploit rather than on merit; what is measured is
+        # that it does not lower hazard cost on the objective as it stands.
+        # Pass --foot_obstacle_obs to get it back.
+        "foot_obstacle_obs": False,
     },
 }
 
@@ -335,7 +385,7 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
         goal_observation   +3   (2026-08-15, ON by default for the ants)
         lidar_groups      +32   (2026-08-15, narrowed to the obstacle ring)
         lidar_groups      +16   (2026-08-22, obstacle ring off by default)
-        foot_obstacle_obs +16   (2026-08-24, ON by default for the ants)
+        foot_obstacle_obs +16   (2026-08-24 on, 2026-08-25 off again)
 
     For the ant that makes 44 (current), 47 (current + goal sensing), 76
     (legacy) and 79 (legacy + goal sensing) all reachable, and every ant
@@ -343,19 +393,25 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
     """
     current = robot_env_kwargs(robot)
     legacy_reward = {**current, "goal_observation": False, "goal_reward_weight": 0.0}
-    no_feet = {**current, "foot_obstacle_obs": False}
+    # THE FEET FLAG, FLIPPED -- written as "the opposite of whatever is
+    # current" rather than a hardcoded False, because it has now defaulted each
+    # way inside two days (on 2026-08-24, off again on 2026-08-25) and a list
+    # that names one side silently stops reaching the other the next time it
+    # moves. That is exactly how main.py's morphology branch broke: it assumed
+    # the default and never consulted this list at all.
+    alt_feet = {**current, "foot_obstacle_obs": not current.get("foot_obstacle_obs", False)}
     return [
         current,
-        # PER-FOOT CLEARANCE OFF -- load-bearing since it became the default on
-        # 2026-08-24. Every checkpoint in the repo predates it, so without this
-        # entry the search never reaches the width any of them was trained at.
-        no_feet,
-        {**no_feet, "goal_observation": not current.get("goal_observation", False),
+        # PER-FOOT CLEARANCE THE OTHER WAY. Load-bearing in both directions:
+        # with the flag off by default this is what reaches the 63-wide
+        # (64 under Saute) checkpoints trained on 2026-08-24.
+        alt_feet,
+        {**alt_feet, "goal_observation": not current.get("goal_observation", False),
          "goal_reward_weight": (
              0.0 if current.get("goal_observation") else current["goal_reward_weight"]
          )},
-        {**no_feet, "lidar_groups": _HAZARD_LIDAR_GROUPS},
-        {**no_feet, "lidar_groups": ()},
+        {**alt_feet, "lidar_groups": _HAZARD_LIDAR_GROUPS},
+        {**alt_feet, "lidar_groups": ()},
         {**current, "goal_observation": not current.get("goal_observation", False),
          "goal_reward_weight": (
              0.0 if current.get("goal_observation") else current["goal_reward_weight"]
@@ -702,18 +758,22 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--foot_obstacle_obs",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="[--task run/minefield/lasers] Give the policy PER-FOOT clearance "
-        "to the nearest obstacle (4 dims x 4 feet = 16; obs 47 -> 63). ON since "
-        "2026-08-24. Until then the only obstacle input was the lidar ring, "
-        "computed from a SINGLE TORSO POINT -- while cost is charged on the "
-        "minimum over all 13 collision geoms and, since --hazard_step_on, only "
-        "for the ones on the ground. The policy was punished for where its FEET "
-        "landed and shown only where its TORSO was. Per foot: [signed gap to "
-        "the obstacle EDGE, cos bearing, sin bearing, height above the "
-        "GROUNDED threshold]. Entries 0 and 3 are the two halves of the cost "
-        "condition -- it fires iff both are <= 0 -- so it is fully observable. "
-        "--no-foot_obstacle_obs reproduces every run before this date.",
+        "to the nearest obstacle (4 dims x 4 feet = 16; obs 47 -> 63). OFF by "
+        "default for every robot as of 2026-08-25 -- it was on for one day and "
+        "MEASURED WORSE: matched 50M runs gave episode_cost 97.08 with it "
+        "against 84.88 without, and a paired 128-episode replay on identical "
+        "arena seeds put HAZARD cost at ~100 against ~87, twice. Per foot: "
+        "[signed gap to the obstacle EDGE, cos bearing, sin bearing, height "
+        "above the GROUNDED threshold]; entries 0 and 3 are the two halves of "
+        "the cost condition, which fires iff both are <= 0, so the charge is "
+        "fully observable -- the policy simply did not spend the information "
+        "on avoidance. Read _ROBOT_DEFAULTS before concluding it is useless: "
+        "the run it lost to was also collecting ~21 of boundary cost that "
+        "training charged at zero. Defaults to None so apply_robot_defaults "
+        "governs it like every other per-robot flag; passing it explicitly "
+        "still wins.",
     )
     parser.add_argument(
         "--num_lasers",

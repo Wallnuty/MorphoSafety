@@ -37,17 +37,34 @@
 # ============================== SIZING ====================================
 #
 # THROUGHPUT IS AN EXTRAPOLATION, NOT A MEASUREMENT -- read training/sps off
-# the first eval line and correct the --time on the next submission. The chain:
-# a rented RTX 3090 measured 7755 training/sps for ant/minefield at 1024 envs
-# (logs/vast/throughput.log), and morphology batching cost ~17% on the laptop
-# (403 -> 335 sps) from heterogeneous per-lane geometry. Call it ~6400:
+# the first eval line and correct the --time on the next submission.
 #
-#   300M / 6400          ~= 13.0 h training
+# THE NUMBER TO EXTRAPOLATE FROM IS 7127, NOT THE 7755 IN THE SWEEP.
+# `training/sps` is reported PER EPOCH, and it RISES 8-28% within a single run
+# as the policy learns: an untrained ant flails and flips, which generates far
+# more contacts than a settled trot, so the physics itself gets cheaper. The
+# 50M Saute runs all show it (logs/vast/*.log):
+#
+#     ant_minefield_saute500_lidar    512 envs   5869 -> 6617   (+13%)
+#     ant_minefield_saute50_lidar    1024 envs   5561 -> 7127   (+28%)
+#
+# Every row of logs/vast/throughput.log ran 1M steps with --num_evals 2, i.e.
+# exactly ONE epoch, under an untrained policy -- so the whole sweep measures
+# the slow regime, and 7755 is an untrained 1024-env number. 7127 is the
+# measured TRAINED rate at 1024 envs. Morphology batching then costs ~17% on
+# the laptop (403 -> 335 sps) from heterogeneous per-lane geometry:
+#
+#   300M / 5900          ~= 14.1 h training   (7127 x 0.83)
 #   10 evals x ~360 s    ~=  1.0 h   (320 episodes each, 625-decision unrolls)
 #   host model rebuilds  ~=  0.1 h   (80 iterations x 16 designs x ~0.2 s)
 #   ----------------------------------
-#                        ~= 14 h.  --time 24h is ~1.7x margin; bigbatch caps
+#                        ~= 15 h.  --time 24h is ~1.6x margin; bigbatch caps
 #                                  at 72h so there is room to raise it.
+#
+# Expect this run to sit at the LOW end, and possibly below it: co-design
+# resamples the population every design iteration, so the policy is repeatedly
+# put onto bodies it has not settled on and may never reach the clean-gait
+# regime that earns the +28%.
 #
 # WHY 1024 ENVS AND 32 MINIBATCHES -- AND WHY THAT IS FREE. They must move
 # together: validate() requires num_envs to divide batch_size*num_minibatches.
@@ -61,10 +78,15 @@
 #     gradient updates / step    = num_minibatches * num_updates_per_batch
 #
 # num_minibatches cancels. The 3090 sweep confirms it directly -- every Phase A
-# row reports upd/Ms = 1562, identical at 512, 1024, 2048 and 4096 envs, while
-# sps goes 5917 -> 7755 at 1024. So this is a 31% speedup at IDENTICAL learning
-# density, not a different learning curve. batch_size and unroll_length are the
-# two that would genuinely change it, and both are left alone.
+# row reports upd/Ms = 1562, identical at 512, 1024, 2048 and 4096 envs. So
+# this is a speedup at IDENTICAL learning density, not a different learning
+# curve. batch_size and unroll_length are the two that would genuinely change
+# it, and both are left alone.
+#
+# HOW BIG A SPEEDUP DEPENDS ON THE REGIME, so do not quote the sweep's +31%
+# (5917 -> 7755) as what this run will see: those are both UNTRAINED numbers.
+# Trained, the two measured 50M runs give 6617 at 512 and 7127 at 1024, i.e.
+# about +8%. Still free, just smaller than advertised.
 #
 # WHY 8 DESIGN UPDATES PER EVAL AND NOT 16. This is the one thing 1024 envs
 # really does constrain. A design is scored only off episodes that FINISH
@@ -217,8 +239,40 @@ echo
 # cluster jobs use, left alone so a VRAM problem here is comparable to theirs.
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 
-CKPT="${SLURM_SUBMIT_DIR:-$PWD}/checkpoints/ant_codesign_lidar_300M"
-echo "=== co-design: 300M steps, 80 design updates, 1024 envs, checkpoints -> $CKPT ==="
+# ---- overridable at submit time, e.g.
+#        DESIGN_LR=0.03 RESUME=<ckpt-step-dir> STEPS=240000000 sbatch <this>
+#      sbatch exports the submitting environment by default (--export=ALL), so
+#      these reach the job without editing the file.
+STEPS="${STEPS:-300000000}"
+DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
+DESIGN_LR="${DESIGN_LR:-0.001}"
+RESUME="${RESUME:-}"
+
+# A RESUMED RUN MUST NOT WRITE INTO THE DIRECTORY IT IS RESUMING FROM. The
+# trainer's step counter restarts at 0 (env_steps is not in the checkpoint), so
+# it would write 000000030146560 again and OVERWRITE the checkpoint that is the
+# only copy of the design state -- destroying the thing being resumed from,
+# halfway through the run that depends on it. Distinct name by default.
+NAME="${NAME:-ant_codesign_lidar_300M}"
+if [ -n "$RESUME" ] && [ "$NAME" = "ant_codesign_lidar_300M" ]; then
+  NAME="ant_codesign_lidar_300M_r$(date -u +%m%d%H%M)"
+fi
+CKPT="${SLURM_SUBMIT_DIR:-$PWD}/checkpoints/$NAME"
+
+if [ -n "$RESUME" ]; then
+  [ -d "$RESUME" ] || { echo "ABORT: RESUME=$RESUME is not a directory"; exit 1; }
+  # No design_state.npz means the policy would resume onto a FRESH
+  # distribution -- a silent restart of the search dressed as a continuation.
+  [ -f "$RESUME/design_state.npz" ] || {
+    echo "ABORT: no design_state.npz in $RESUME -- resuming would restart the"
+    echo "design search from its init while the policy continued. Refusing."; exit 1; }
+  echo "=== RESUMING from $RESUME ==="
+  echo "    design_lr=$DESIGN_LR  steps=$STEPS  design_tmax=$DESIGN_TMAX"
+  set -- --restore_checkpoint_path "$RESUME"
+else
+  set --
+fi
+echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
 
 # python -u is NOT optional: Python block-buffers stdout when redirected, and a
 # segfault never flushes it. A laptop run once reached 573k steps -- proven by
@@ -248,9 +302,11 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --chop_freq 60000000 \
   --steps_after_design_update 30000000 \
   --num_envs 1024 --num_minibatches 32 \
-  --num_timesteps 300000000 \
+  --design_lr "$DESIGN_LR" \
+  --num_timesteps "$STEPS" \
+  --design_tmax "$DESIGN_TMAX" \
   --num_evals 11 \
-  --checkpoint_logdir "$CKPT"
+  --checkpoint_logdir "$CKPT" "$@"
 status=$?
 
 echo

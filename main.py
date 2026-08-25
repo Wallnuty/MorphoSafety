@@ -180,29 +180,73 @@ _TASKS = {
     "lasers": Lasers,
     "goal": GoToGoal,
 }
+def _report_reconciliation(want, default_width, task_kwargs, robot):
+    """Say WHICH flags were flipped to fit the checkpoint, not just that some were.
+
+    The old message named goal_observation and goal_reward_weight and nothing
+    else, which was complete back when those were the only width-changing
+    flags. They no longer are -- lidar_groups (2026-08-15, again 2026-08-22)
+    and foot_obstacle_obs (2026-08-24) both move the width too. A message that
+    omits the flag that actually changed is worse than no message: it reads as
+    confirmation that nothing else did.
+    """
+    if default_width is None:
+        return
+    from mjx_safety_gym.algorithms.train_ppo import robot_env_kwargs
+
+    _missing = object()
+    defaults = robot_env_kwargs(robot)
+    changed = {
+        k: v for k, v in task_kwargs.items() if defaults.get(k, _missing) != v
+    }
+    print(
+        f"Checkpoint expects an observation of width {want}; this robot's "
+        f"defaults give {default_width}."
+    )
+    if changed:
+        print(
+            "  -> rebuilt with "
+            + ", ".join(f"{k}={v}" for k, v in sorted(changed.items()))
+            + " to match it"
+        )
+
+
 _want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
 if _args.num_morphologies:
-    # Morphology-conditioned checkpoints are NUM_GENES wider than the task obs
-    # (47 -> 54 for the ant on minefield), which the width reconciliation in
-    # build_env_for_checkpoint cannot produce -- it only flips goal_observation,
-    # worth +-3. So build the env directly with conditioning on rather than
-    # letting the search fail with "most likely a different robot".
+    # A morphology-conditioned checkpoint is NUM_GENES wider than the task obs
+    # it was trained against, so the width to reconcile is the checkpoint's --
+    # the builder below adds conditioning, so the env it produces already
+    # carries the genes and the comparison is apples to apples.
+    #
+    # THIS USED TO SKIP RECONCILIATION ENTIRELY and build straight from
+    # robot_env_kwargs, on the reasoning that the search "only flips
+    # goal_observation, worth +-3". That stopped being true the moment
+    # foot_obstacle_obs landed (2026-08-24) defaulting ON for the ants: the
+    # defaults jumped 47 -> 63, so every morphology checkpoint trained before
+    # that date built a 70-wide env against a 54-wide policy and died in flax
+    # with "expected (54, 256), got (70, 256)". _env_kwarg_candidates already
+    # carries a no-feet variant; this path just was not consulting it.
     from mjx_safety_gym import morphology as _morph
-    from mjx_safety_gym.algorithms.train_ppo import robot_env_kwargs
 
     if _args.task == "goal":
         env = GoToGoal(robot=ROBOT, morphology_conditioning=True)
     else:
-        env = _TASKS[_args.task](
-            robot=ROBOT,
-            morphology_conditioning=True,
-            # VIEWER-ONLY: draws the corridor as a floor stripe instead of two
-            # solid walls that hide the ant. Costs ~1.3% of env stepping
-            # (ngeom 37 -> 39), so it is off by default and never on in
-            # training. See RunForward._add_corridor_walls.
-            draw_corridor_lines=True,
-            **robot_env_kwargs(ROBOT),
+        env, _task_kwargs, _default_width = build_env_for_checkpoint(
+            lambda **kw: _TASKS[_args.task](
+                robot=ROBOT,
+                morphology_conditioning=True,
+                # VIEWER-ONLY: draws the corridor as a floor stripe instead of
+                # two solid walls that hide the ant. Costs ~1.3% of env
+                # stepping (ngeom 37 -> 39), so it is off by default and never
+                # on in training. See RunForward._add_corridor_walls.
+                draw_corridor_lines=True,
+                **kw,
+            ),
+            ROBOT,
+            _want,
+            saute_budget=_args.saute_budget,
         )
+        _report_reconciliation(_want, _default_width, _task_kwargs, ROBOT)
 
     # Reproduce randomization_fn's population EXACTLY: same PRNGKey -> same
     # host-side numpy seed -> same draws, with lane 0 pinned to nominal. The
@@ -227,10 +271,15 @@ if _args.num_morphologies:
     # simulating another is the kind of thing that would look like a physics bug.
     # Topology is identical across morphologies, so the geom/body ids cached in
     # _post_init stay valid.
-    _mj = env.build_morphology_model(_spec)
-    env._mj_model = _mj
-    env._mjx_model = mjx.put_model(_mj)
-    env._morphology_genes = jax.numpy.asarray(_spec.genes, dtype=jax.numpy.float32)
+    # `.unwrapped`, not `env`: build_env_for_checkpoint returns a Saute WRAPPER
+    # for a saute checkpoint, and a wrapper forwards attribute READS but not
+    # writes -- so assigning to `env._mjx_model` would set a dead attribute on
+    # the wrapper and silently leave the nominal body simulating underneath.
+    _inner = getattr(env, "unwrapped", env)
+    _mj = _inner.build_morphology_model(_spec)
+    _inner._mj_model = _mj
+    _inner._mjx_model = mjx.put_model(_mj)
+    _inner._morphology_genes = jax.numpy.asarray(_spec.genes, dtype=jax.numpy.float32)
 
     _mass = float(_mj.body_subtreemass[_mj.body("robot").id])
     _scales = _spec.scales
@@ -261,16 +310,7 @@ else:
             f"  -> wrapped in Saute(budget={_args.saute_budget}, penalty=0, "
             f"terminate=False) for the +1 budget observation"
         )
-    if _default_width is not None:
-        print(
-            f"Checkpoint expects an observation of width {_want}; this robot's "
-            f"defaults give {_default_width}."
-        )
-        print(
-            f"  -> built the env with goal_observation="
-            f"{_task_kwargs['goal_observation']}, goal_reward_weight="
-            f"{_task_kwargs['goal_reward_weight']} to match it"
-        )
+    _report_reconciliation(_want, _default_width, _task_kwargs, ROBOT)
 
 rng = jax.random.PRNGKey(_args.seed)
 

@@ -750,6 +750,14 @@ class DesignLoop:
                         k: v for k, v in self._comp_scores.items() if k not in killed
                     }
                     metrics["design/chopped"] = float(len(killed))
+                    # Re-read AFTER the chop. `design/components` is captured
+                    # at the top of this method, before the chop that happens
+                    # below it, so a chop iteration reported the PRE-chop count
+                    # -- job 46267 logged `components=8` and `chopped=4` on the
+                    # same line, which reads like a contradiction. This is the
+                    # metric anyone uses to follow the 8->4->2->1 schedule, so
+                    # it should name the state the iteration ended in.
+                    metrics["design/components"] = float(self.gmm.components_left())
         metrics["design/updating"] = float(active)
 
         mode = self.gmm.mode()

@@ -68,8 +68,27 @@ def build_policy(ckpt_dir: Path | None, env, deterministic: bool, seed: int):
     subtree this repo also saves).
     """
     obs_shape = (env.observation_size,)
+    # THE NETWORK SHAPE HAS TO COME FROM THE CHECKPOINT, NOT FROM THE DEFAULT.
+    # `make_ppo_networks` defaults the policy to (32,)*4, but every run that
+    # matters here was trained at (256,)*4 -- the 32-wide default was measured
+    # to be the bottleneck (32x4 -> 256x4 cut cost 2.7x), so the saved runs use
+    # the wide net. Rebuilding at the default does not warn, it raises
+    # ScopeParamShapeError deep inside flax naming only "kernel" in
+    # "/hidden_0", which reads like an observation-width problem and is not.
+    # main.py already probes the checkpoint for this; this script did not, so
+    # it could not load any of the wide checkpoints at all.
+    layers = None
+    if ckpt_dir is not None:
+        steps = sorted(q for q in ckpt_dir.iterdir() if q.is_dir() and q.name.isdigit())
+        probe_leaf = steps[-1] if steps else ckpt_dir
+        probe = ocp.PyTreeCheckpointer().restore(str(probe_leaf.resolve()))
+        layers = train_ppo.checkpoint_policy_layers(probe[1]["policy"])
+        if layers is not None:
+            print(f"  checkpoint policy layers {layers}")
+    extra = {} if layers is None else {"policy_hidden_layer_sizes": layers}
     network = ppo_networks.make_ppo_networks(
-        obs_shape, env.action_size, preprocess_observations_fn=lambda x, _: x
+        obs_shape, env.action_size,
+        preprocess_observations_fn=lambda x, _: x, **extra
     )
     if ckpt_dir is None:
         key = jax.random.PRNGKey(seed)
