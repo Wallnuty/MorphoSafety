@@ -10,6 +10,9 @@
 #   bash cluster/vast/vast.sh throughput      # full hyperparameter sweep (~90 min)
 #   bash cluster/vast/vast.sh throughput-log  # follow the sweep
 #   bash cluster/vast/vast.sh train <args>    # real run, detached in tmux
+#   bash cluster/vast/vast.sh push-ckpt <dir> # send a checkpoint to resume FROM
+#   bash cluster/vast/vast.sh codesign        # morphology co-design run (+preflights)
+#   bash cluster/vast/vast.sh codesign-log    # follow the co-design run
 #   bash cluster/vast/vast.sh logs            # follow the remote log
 #   bash cluster/vast/vast.sh pull            # bring checkpoints/logs home
 #   bash cluster/vast/vast.sh down            # DESTROY (billing stops here)
@@ -28,7 +31,16 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
 ROOT="$PWD"
-STATE="$ROOT/cluster/vast/.instance"      # gitignored; holds the instance id
+# gitignored; holds the instance id. VAST_TAG gives a SECOND (third, ...)
+# concurrent rental its own state file, e.g.
+#     VAST_TAG=crpo bash cluster/vast/vast.sh up <offer>
+# without it, `up` refuses while another instance is recorded -- which is the
+# right default (an unrecorded id cannot be destroyed and bills forever), but
+# wrong once two runs genuinely need to be in flight at the same time. Every
+# subcommand reads the same variable, so a tagged instance is addressed by
+# prefixing VAST_TAG on each call. Forgetting it on `down` targets the
+# UNTAGGED instance, so check `status` first.
+STATE="$ROOT/cluster/vast/.instance${VAST_TAG:+.$VAST_TAG}"
 REMOTE_DIR="/root/MorphoSafety"
 IMAGE="${IMAGE:-pytorch/pytorch}"
 # 20, down from 40 (2026-08-22). Vast bills ALLOCATED disk, not used, so the
@@ -353,6 +365,89 @@ train)
           2>&1 | tee logs/vast_train.log' && \
          echo 'launched in tmux session: train'"
   echo "Follow it with: $0 logs"
+  ;;
+
+push-ckpt)
+  # Send ONE checkpoint step-directory to the remote so a run can resume from
+  # it. `sync` deliberately excludes checkpoints/ (347 MB locally, and the
+  # remote needs none of it to train from scratch), so a resume has no other
+  # way to get its starting point across.
+  #
+  # THE DESTINATION IS FIXED AND SEPARATE FROM WHERE THE RUN WRITES. The
+  # trainer's step counter restarts at 0 on a resume (env_steps is not in the
+  # checkpoint), so a run pointed at its own source directory would write
+  # 000000060293120 again and OVERWRITE the only copy of the design state --
+  # destroying the thing it is resuming from, halfway through the run that
+  # depends on it. checkpoints/codesign_resume_src/ is read-only by convention.
+  src="${2:-}"; [ -n "$src" ] || die "usage: $0 push-ckpt <local checkpoint step dir>"
+  [ -d "$src" ] || die "not a directory: $src"
+  ssh_parts
+  base="$(basename "$src")"
+  dest="$REMOTE_DIR/checkpoints/${PUSH_AS:-codesign_resume_src}/$base"
+  rexec "mkdir -p $(dirname "$dest")"
+  rsync -az --info=stats1 -e "$(rsh)" "$src/" "$SSH_USER@$SSH_HOST:$dest/" \
+    || die "rsync failed -- the remote does NOT have the checkpoint. Do not train."
+  echo "pushed -> $dest"
+  rexec "ls -la $dest | tail -5"
+  ;;
+
+codesign)
+  # The morphology co-design run, with its own preflights. See
+  # cluster/vast/remote_codesign.sh for what it does and why.
+  shift || true
+  ssh_parts
+  # Env overrides pass through under a CODESIGN_ PREFIX, e.g.
+  #     CODESIGN_DESIGN_LR=0.05 $0 codesign
+  #
+  # THE PREFIX IS NOT DECORATION -- it exists because the unprefixed version
+  # shipped a real bug. Forwarding bare `NAME` picked up THIS MACHINE's own
+  # environment (WSL exports NAME=SamLaptop), so the first launch wrote its
+  # checkpoints to checkpoints/SamLaptop and the log read
+  # "out /root/MorphoSafety/checkpoints/SamLaptop". Nothing was destroyed --
+  # the resume source is a separate directory -- but a 12-hour run would have
+  # landed somewhere meaningless. Generic names like NAME, STEPS and RESUME
+  # are exactly the ones a shell, a CI runner or a conda hook is most likely
+  # to have already set, so an inherited value is indistinguishable from an
+  # intended one. A prefix nothing else uses removes the ambiguity.
+  envs=""
+  for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME; do
+    eval "val=\${CODESIGN_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
+  done
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t codesign 2>/dev/null; \
+         tmux new-session -d -s codesign \
+         '$envs bash cluster/vast/remote_codesign.sh 2>&1 | tee logs/vast_codesign.log' && \
+         echo 'launched in tmux session: codesign'"
+  echo "Follow it with: $0 codesign-log"
+  ;;
+
+codesign-log)
+  ssh_parts
+  rexec "tail -n ${LINES:-60} -f $REMOTE_DIR/logs/vast_codesign.log"
+  ;;
+
+crpo)
+  # ant/minefield CRPO at a tight budget, with its own preflights and a
+  # cost/step summary at the end. See cluster/vast/remote_crpo_b30.sh -- read
+  # its header before reading the log, CRPO has a collapse mode on this task
+  # that looks like success in every headline metric.
+  shift || true
+  ssh_parts
+  envs=""
+  for v in STEPS BUDGET NAME; do
+    eval "val=\${CRPO_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
+  done
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t crpo 2>/dev/null; \
+         tmux new-session -d -s crpo \
+         '$envs bash cluster/vast/remote_crpo_b30.sh 2>&1 | tee logs/vast_crpo.log' && \
+         echo 'launched in tmux session: crpo'"
+  echo "Follow it with: VAST_TAG=crpo $0 crpo-log"
+  ;;
+
+crpo-log)
+  ssh_parts
+  rexec "tail -n ${LINES:-60} -f $REMOTE_DIR/logs/vast_crpo.log"
   ;;
 
 logs)

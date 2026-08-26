@@ -125,8 +125,14 @@ from mjx_safety_gym.algorithms import train_ppo as T
 p = Path(os.environ['RESUME'])
 assert p.is_absolute(), f'ABORT: --restore_checkpoint_path must be absolute, got {p}'
 assert p.is_dir(), (
-    f'ABORT: {p} does not exist. The checkpoint lives on the LAPTOP -- scp it '
-    f'across first, see the header of this file.')
+    f'ABORT: {p} does not exist. Two likely causes:\n'
+    f'  1. it was never copied across -- the checkpoint lives on the LAPTOP, '
+    f'see the scp in this file\'s header; or\n'
+    f'  2. YOU SUBMITTED FROM THE WRONG DIRECTORY. This path is built from '
+    f'$SLURM_SUBMIT_DIR, so `sbatch` run inside cluster/ looks in '
+    f'MorphoSafety/cluster/checkpoints/ instead of MorphoSafety/checkpoints/. '
+    f'The co-design job 46267 was submitted that way. cd to the repo root '
+    f'first, or pass RESUME=<absolute path>.')
 d = ocp.PyTreeCheckpointer().restore(str(p))
 w = T.checkpoint_obs_width(d[1]['policy'])
 layers = T.checkpoint_policy_layers(d[1]['policy'])

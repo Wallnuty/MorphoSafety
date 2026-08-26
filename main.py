@@ -1,4 +1,5 @@
 import argparse
+import pathlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -135,7 +136,26 @@ _parser.add_argument(
     "include_nominal), so --morphology 0 shows the unmodified robot and is the "
     "one directly comparable to a single-body checkpoint.",
 )
+_parser.add_argument(
+    "--design_from",
+    default=None,
+    help="Watch the EVOLVED design from a co-design run instead of a randomly "
+    "sampled one. Takes a checkpoint directory (a run dir, or one step dir "
+    "inside it) and reads the GMM's mode out of its design_state.npz sidecar. "
+    "Overrides --morphology, and implies --num_morphologies 1 so you do not "
+    "have to remember to pass it. THIS IS THE ONLY WAY TO SEE THE RESULT OF A "
+    "CO-DESIGN RUN: --morphology picks from a population re-sampled here from "
+    "--seed, which has nothing to do with the design the search converged on. "
+    "The A/B is this flag against --morphology 0 (nominal), same --seed.",
+)
 _args = _parser.parse_args()
+
+# --design_from is meaningless outside the morphology branch, and that branch is
+# gated on --num_morphologies being non-zero. Requiring both would be a trap
+# whose only symptom is a nominal ant silently appearing instead of the evolved
+# one -- the exact confusion this flag exists to remove.
+if _args.design_from and not _args.num_morphologies:
+    _args.num_morphologies = 1
 
 DURATION_SECONDS = _args.duration
 ACTION_HOLD = 10  # resample a random action every N steps for smoother motion
@@ -257,12 +277,54 @@ if _args.num_morphologies:
     _rng = np.random.default_rng(_seed)
     _specs = [_morph.MorphologySpec.sample(_rng) for _ in range(_args.num_morphologies)]
     _specs[0] = _morph.MorphologySpec.nominal()
-    if not 0 <= _args.morphology < _args.num_morphologies:
-        raise SystemExit(
-            f"--morphology {_args.morphology} out of range for "
-            f"--num_morphologies {_args.num_morphologies}"
+    if _args.design_from:
+        # Rebuild the trained distribution and ask it for its mode, rather than
+        # reading gmm_means[0] out of the npz by hand: with more than one
+        # component still alive the highest-density design is NOT simply the
+        # first live row, and mode() already implements upstream's comparison
+        # (logp + log_mix, argmax). Reusing it means the body shown here is the
+        # same one design/mode_0..6 reported in the training log.
+        import numpy as _np
+        from mjx_safety_gym import design as _design
+
+        _dpath = pathlib.Path(_args.design_from)
+        if not (_dpath / _design.DesignLoop.SIDECAR).is_file():
+            _cands = sorted(
+                d for d in _dpath.glob("*")
+                if (d / _design.DesignLoop.SIDECAR).is_file()
+            )
+            if not _cands:
+                raise SystemExit(
+                    f"--design_from {_dpath}: no {_design.DesignLoop.SIDECAR} "
+                    f"here or in any subdirectory. A co-design run writes one "
+                    f"inside every checkpoint step dir; a plain training run "
+                    f"writes none, and has no evolved design to show."
+                )
+            _dpath = _cands[-1]          # newest step
+        _z = _np.load(_dpath / _design.DesignLoop.SIDECAR, allow_pickle=True)
+        _gmm = _design.GmmDesignDistribution(
+            n_params=_morph.NUM_GENES,
+            n_components=int(_np.asarray(_z["gmm_log_mixprobs"]).size),
         )
-    _spec = _specs[_args.morphology]
+        _gmm.load_state_dict(
+            {k[len("gmm_"):]: _z[k] for k in _z.files if k.startswith("gmm_")}
+        )
+        _spec = _morph.MorphologySpec(_gmm.to_genes(_gmm.mode()))
+        _design_label = (
+            f"EVOLVED design from {_dpath.name} "
+            f"({int(_gmm.alive.sum())} of {_gmm.n_components} components live)"
+        )
+    else:
+        if not 0 <= _args.morphology < _args.num_morphologies:
+            raise SystemExit(
+                f"--morphology {_args.morphology} out of range for "
+                f"--num_morphologies {_args.num_morphologies}"
+            )
+        _spec = _specs[_args.morphology]
+        _design_label = (
+            f"Morphology {_args.morphology}/{_args.num_morphologies - 1}"
+            f"{' (NOMINAL)' if _args.morphology == 0 else ''}"
+        )
 
     # Install the body. This is exactly what MorphologyDomainRandomizationWrapper
     # does per lane, minus the vmap -- the viewer runs a single env, so the
@@ -284,8 +346,7 @@ if _args.num_morphologies:
     _mass = float(_mj.body_subtreemass[_mj.body("robot").id])
     _scales = _spec.scales
     print(
-        f"Morphology {_args.morphology}/{_args.num_morphologies - 1}"
-        f"{' (NOMINAL)' if _args.morphology == 0 else ''}: "
+        f"{_design_label}: "
         f"mass {_mass:.1f} kg, gear {_mj.actuator_gear[0, 0]:.0f}"
     )
     print(
