@@ -183,5 +183,5 @@ for line in log.splitlines():
     except KeyError:
         continue
     print(f"{int(float(g['step'])):>12,} {float(g['eval/episode_reward']):>8.2f} "
-          f"{c:>8.2f} {l:>8.0f} {c/max(l,1):>10.4f} {g.get('crpo/active','--'):>7}")
+          f"{c:>8.2f} {l:>8.0f} {c/max(l,1):>10.4f} {g.get('training/crpo/active','--'):>7}")
 PY

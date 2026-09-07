@@ -177,6 +177,12 @@ def train(
     safe: bool = False,
     use_disagreement: bool = False,
     normalize_budget: bool = True,
+    # Divide the budget by the episode length the batch ACTUALLY shows rather
+    # than by the episode-length cap. Off by default so every run before
+    # 2026-09-05 reproduces bit-identically. See the long comment at the
+    # constraint in ppo/losses.py for why the fixed cap penalises a policy for
+    # finishing early.
+    adaptive_budget_horizon: bool = False,
     design_loop=None,
     design_updates_per_eval: int = 1,
     unnormalized_obs_tail: int = 0,
@@ -187,6 +193,9 @@ def train(
         penalizer = None
         penalizer_params = None
     original_safety_budget = safety_budget
+    # Hoisted out of the branch below: the adaptive horizon clamps against this
+    # cap whether or not the budget itself was normalised.
+    num_decision_steps = episode_length // action_repeat
     if normalize_budget:
         # Rescale an episode-total cost budget onto the cost critic's scale.
         #
@@ -199,7 +208,6 @@ def train(
         # budget of 25/4, while eval still judged it against 25). Dividing by
         # the decision-step count makes `safety_budget` mean what it says.
         # Identical to upstream when action_repeat == 1.
-        num_decision_steps = episode_length // action_repeat
         safety_budget = (safety_budget / num_decision_steps) / (
             1.0 - safety_discounting
         )
@@ -334,6 +342,8 @@ def train(
         normalize_advantage=normalize_advantage,
         safety_budget=safety_budget,
         use_disagreement=use_disagreement,
+        adaptive_budget_horizon=adaptive_budget_horizon,
+        budget_decision_steps=num_decision_steps,
     )
     training_step = update_step_factory(
         policy_loss,

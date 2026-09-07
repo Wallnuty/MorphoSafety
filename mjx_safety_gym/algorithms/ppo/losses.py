@@ -109,6 +109,8 @@ def make_losses(
     safety_discounting,
     safety_gae_lambda,
     use_disagreement,
+    adaptive_budget_horizon=False,
+    budget_decision_steps=None,
 ):
     def compute_policy_loss(
         policy_params,
@@ -194,7 +196,64 @@ def make_losses(
             if use_disagreement:
                 disagreement = data.extras["state_extras"]["disagreement"]
                 cumulative_cost += disagreement
-            constraint = safety_budget - vsc.mean()
+            # ---- THE BUDGET IS A RATE, AND WITHOUT THIS IT PENALISES SPEED --
+            #
+            # `safety_budget` arrived here already normalised in train.py as
+            #     (B / num_decision_steps) / (1 - safety_discounting)
+            # where num_decision_steps is the EPISODE-LENGTH CAP (2500//4 = 625).
+            # For a steady per-decision cost c the cost critic saturates at
+            # vsc = c/(1-safety_discounting), so `constraint >= 0` reduces
+            # exactly to `c <= B / 625` -- a RATE that must hold in every state,
+            # not a total that must hold over an episode.
+            #
+            # That is fine while every episode runs to the cap. It stops being
+            # fine under `terminate_on_goal`, which is default-on for the ants:
+            # a policy that crosses and stops runs ~123 decisions, so its real
+            # allowance is 123 * B/625 = 0.20 B, while a policy that loiters to
+            # the cap is allowed the full B. Same flag, 5x different real
+            # budget, and THE ONE DOING THE TASK GETS LESS. Measured on the
+            # 2026-08-26 budget-30 pair: CRPO settled at 0.63 m of an 11 m
+            # corridor and Lagrangian at 0.85 m, both with episodes stretched
+            # back out toward the cap. Loitering was the rational answer to the
+            # constraint as posed, and both algorithms found it.
+            #
+            # With adaptive_budget_horizon the denominator becomes the episode
+            # length the batch ACTUALLY shows, so allowance * length == B for
+            # every policy and the incentive disappears.
+            #
+            # ESTIMATOR: termination and truncation are (T, N) indicators of an
+            # episode ending, so their mean is the per-decision probability of
+            # an ending and its reciprocal is the mean episode length. No new
+            # extra_fields plumbing -- both are already computed above for GAE.
+            #
+            # It is deliberately CLAMPED to [1, budget_decision_steps]: an
+            # episode can never exceed the cap, and a batch in which nothing
+            # ends (early training, before the ant reaches the goal at all)
+            # gives end_rate 0, which then degrades exactly to the fixed
+            # behaviour rather than dividing by zero.
+            budget = safety_budget
+            mean_ep_decisions = jnp.asarray(
+                budget_decision_steps if budget_decision_steps else 1.0,
+                dtype=jnp.float32,
+            )
+            if adaptive_budget_horizon:
+                if not budget_decision_steps:
+                    raise ValueError(
+                        "adaptive_budget_horizon needs budget_decision_steps "
+                        "(the episode-length cap in decisions) to clamp against"
+                    )
+                end_rate = jnp.mean(termination + truncation)
+                mean_ep_decisions = jnp.clip(
+                    1.0 / jnp.maximum(end_rate, 1e-8), 1.0, float(budget_decision_steps)
+                )
+                # safety_budget was normalised against the CAP; rescale it onto
+                # the observed length. cap/mean >= 1, so this only ever LOOSENS
+                # the per-decision rate -- the episode TOTAL it permits is
+                # unchanged at B, which is the whole point.
+                budget = safety_budget * (
+                    float(budget_decision_steps) / mean_ep_decisions
+                )
+            constraint = budget - vsc.mean()
             policy_loss, penalizer_aux, _ = penalizer(
                 policy_loss,
                 constraint,
@@ -202,6 +261,8 @@ def make_losses(
                 rest=-cost_advantages.mean(),
             )
             aux["normalized_constraint_estimate"] = constraint
+            aux["budget_mean_episode_decisions"] = mean_ep_decisions
+            aux["budget_effective_rate"] = budget * (1.0 - safety_discounting)
             aux["cumulative_costs"] = cumulative_cost.max(0).mean()
             aux |= penalizer_aux
         total_loss = policy_loss + entropy_loss

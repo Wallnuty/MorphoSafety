@@ -160,7 +160,7 @@ for line in log.splitlines():
         continue
     print(f"{int(float(g['step'])):>12,} {float(g['eval/episode_reward']):>8.2f} "
           f"{c:>8.2f} {l:>8.0f} {c/max(l,1):>10.4f} "
-          f"{g.get('crpo/active','--'):>7}")
+          f"{g.get('training/crpo/active','--'):>7}")
 PY
 echo
 echo "PULL BEFORE YOU DESTROY:  VAST_TAG=crpo bash cluster/vast/vast.sh pull"

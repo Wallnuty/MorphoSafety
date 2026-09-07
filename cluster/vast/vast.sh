@@ -13,6 +13,8 @@
 #   bash cluster/vast/vast.sh push-ckpt <dir> # send a checkpoint to resume FROM
 #   bash cluster/vast/vast.sh codesign        # morphology co-design run (+preflights)
 #   bash cluster/vast/vast.sh codesign-log    # follow the co-design run
+#   bash cluster/vast/vast.sh crpo            # CRPO safety run (+preflights)
+#   bash cluster/vast/vast.sh lagrangian      # Lagrangian arm; queues behind crpo
 #   bash cluster/vast/vast.sh logs            # follow the remote log
 #   bash cluster/vast/vast.sh pull            # bring checkpoints/logs home
 #   bash cluster/vast/vast.sh down            # DESTROY (billing stops here)
@@ -448,6 +450,29 @@ crpo)
 crpo-log)
   ssh_parts
   rexec "tail -n ${LINES:-60} -f $REMOTE_DIR/logs/vast_crpo.log"
+  ;;
+
+lagrangian)
+  # PPO-Lagrangian arm. QUEUES BEHIND the crpo tmux session if one is live --
+  # one GPU/JAX process at a time -- so this is safe to fire while CRPO is
+  # still running. See cluster/vast/remote_lagrangian_b30.sh.
+  shift || true
+  ssh_parts
+  envs=""
+  for v in STEPS BUDGET MULTIPLIER_LR NAME; do
+    eval "val=\${LAGR_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
+  done
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t lagr 2>/dev/null; \
+         tmux new-session -d -s lagr \
+         '$envs bash cluster/vast/remote_lagrangian_b30.sh 2>&1 | tee logs/vast_lagrangian.log' && \
+         echo 'launched in tmux session: lagr'"
+  echo "Follow it with: $0 lagrangian-log"
+  ;;
+
+lagrangian-log)
+  ssh_parts
+  rexec "tail -n ${LINES:-60} -f $REMOTE_DIR/logs/vast_lagrangian.log"
   ;;
 
 logs)

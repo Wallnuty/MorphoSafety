@@ -69,10 +69,17 @@
 #                                   The constraint never binds. A 2.5-hour
 #                                   unconstrained PPO run wearing a safety flag.
 #     lr 1e-5   ->    0.16
-#     lr 1e-4   ->    1.6        <- THIS RUN. Multiplier can reach O(1), which
-#                                   is where multiplier * cost_advantage becomes
-#                                   comparable to the (normalised) reward
-#                                   advantage.
+#     lr 1e-4   ->    1.6        <- THIS RUN.
+#
+#     MEASURED 2026-08-26: the multiplier actually travelled 0.01 -> 17.60 over
+#     45M steps, TEN TIMES the 1.6 predicted here. The shape of the estimate is
+#     right but |constraint| is ~2.25, not the 0.2 assumed above -- so scale
+#     every row by ~11x. The DECISION still holds (7e-7 gives 0.12 of travel
+#     even at the true constraint magnitude, far too slow to engage), but 1e-4
+#     turned out to be on the aggressive side rather than the modest side: the
+#     multiplier ratcheted monotonically and never came back down, crushing a
+#     policy that had already learned to traverse 4.75 m at 5M. If rerunning,
+#     1e-5 is the better first try.
 #     lr 3e-3   ->   47
 #     lr 1e-2   ->  156          <- and the 2026-08-22 measurement of this repo
 #                                   at 1e-2 recorded the multiplier reaching

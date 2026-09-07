@@ -643,6 +643,28 @@ def build_argparser() -> argparse.ArgumentParser:
         "cost of 108.94; still an extrapolation, not a measurement -- pair "
         "the first real run with a short unconstrained baseline to check it.",
     )
+    parser.add_argument(
+        "--adaptive_budget_horizon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Divide --safety_budget by the episode length the batch ACTUALLY "
+        "shows, instead of by the episode-length cap (episode_length // "
+        "action_repeat = 625 for the ants). AFFECTS crpo AND ppo_lagrangian "
+        "ONLY -- saute carries its own budget scalar and never touches this "
+        "path. OFF by default so every run before 2026-09-05 reproduces "
+        "bit-identically. WHAT IT FIXES: the normalised budget is a per-"
+        "decision RATE, so with --terminate_on_goal (default on for the ants) "
+        "a policy that crosses and stops in ~123 decisions is really allowed "
+        "123 * B/625 = 0.20 B of total cost, while one that loiters to the cap "
+        "gets the full B -- five times more budget for refusing to do the "
+        "task. Measured 2026-08-26 at B=30: CRPO settled at 0.63 m of an 11 m "
+        "corridor and Lagrangian at 0.85 m, both with episode length drifting "
+        "back toward the 2500-step cap. With this flag the denominator tracks "
+        "the observed length, so allowance * length == B for every policy and "
+        "loitering buys nothing. NOTE THIS CHANGES WHAT THE NUMBER MEANS: B is "
+        "now an episode TOTAL, directly comparable to eval/episode_cost "
+        "(~85 for an unconstrained traversing policy), not a rate.",
+    )
     parser.add_argument("--crpo_eta", type=float, default=0.0)
     parser.add_argument("--crpo_burnin", type=int, default=0)
     parser.add_argument(
@@ -1546,6 +1568,7 @@ def train(args: argparse.Namespace):
         deterministic_eval=args.deterministic_eval,
         seed=args.seed,
         safety_budget=args.safety_budget,
+        adaptive_budget_horizon=args.adaptive_budget_horizon,
         penalizer=penalizer,
         penalizer_params=penalizer_params,
         safe=penalizer is not None,
