@@ -5,6 +5,57 @@
 #   sbatch cluster/ant_minefield_safe_b50.sbatch                     # Lagrangian
 #   SAFE_PENALIZER=crpo sbatch cluster/ant_minefield_safe_b50.sbatch # CRPO
 #
+# ======================= THE 2026-09-12 PLAN, FOUR JOBS =====================
+#
+# All at 50M, 1024/32, 256x4, lidar-only, budget 50, adaptive horizon, and the
+# spawn now FIXED at y=0 (--start_y_jitter 0.0 is the new default -- the last
+# per-episode randomness on minefield is gone; the world is identical every
+# episode up to the policy's own action noise).
+#
+#  1. RESUME the Lagrangian arm +50M. It traverses (reward ~19-21) but at 50M
+#     its cost was 1.6x the unconstrained run's and its multiplier still rising
+#     in a straight line (integral-only controller). This decides whether the
+#     integral controller converges or winds up -- i.e. whether lever (b), PID,
+#     is needed. Build (b) AFTER this reports, not before.
+#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_ppo_lagrangian_b50_adaptive/000050380800 \
+#     sbatch cluster/ant_minefield_safe_b50.sbatch
+#
+#  2. LEVER (c): scheduled penalty from scratch. kappa 0.01 -> 5 geometrically
+#     over the first 60% of the run, gated on violation, then held.
+#   SAFE_PENALIZER=scheduled sbatch cluster/ant_minefield_safe_b50.sbatch
+#
+#  4. UNCONSTRAINED CONTROL at 47 wide. Zero code: --penalizer none has the
+#     identical SafePPONetworkParams structure, so it is both the proper
+#     control (the Saute500 "reference" differs in obs width, batch config AND
+#     seed -- and seeds diverged 2.2x at 5M) and the warm-start source for 3.
+#   SAFE_PENALIZER=none sbatch cluster/ant_minefield_safe_b50.sbatch
+#
+#  3. LEVER (a): Lagrangian warm-started from 4, ONCE 4 HAS FINISHED. The
+#     restore path already tolerates the penalizer mismatch (warns, starts the
+#     multiplier fresh at 0.01) and the optimizer state carries over.
+#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl/000050380800 \
+#   SAFE_NAME=ant_minefield_ppo_lagrangian_b50_warm \
+#     sbatch cluster/ant_minefield_safe_b50.sbatch
+#
+# NOT lever (b) yet, and NOT (a)+(b) in one run: they fix different failures
+# (pressure-before-competence vs multiplier windup) and a combined arm could
+# not say which one mattered. Run 1 is the windup test and it is free.
+#
+# ======================== RESULT OF THE FIRST PAIR ========================
+#
+#   arm                      reward   cost   ep_len   displacement   multiplier
+#   crpo b50 adaptive         2.54    84.5     575       1.21 m        --
+#   ppo_lagrangian b50 adpt  19.29   136.1     735       9.57 m       4.16
+#   unconstrained (Saute500) 20.52    84.9     494      10.2  m        --
+#
+# LAGRANGIAN TRAVERSES. First constrained run in the project to do the task.
+# But at 50M its cost is 1.6x the UNCONSTRAINED run's at the same step, with
+# the multiplier still rising linearly (~0.36 per 5M, integral-only, constraint
+# pinned at -4.5). Whether cost crosses below ~85 before the multiplier grows
+# large enough to crush reward is what the resume answers. Single seed each,
+# and the two differed 2.2x at 5M when the multiplier was 0.06 -- run-to-run
+# variance is large here, so read a 1.6x gap with that in mind.
+#
 # Submit it BOTH ways. The pair is the experiment; a single arm cannot
 # distinguish "the fix worked" from "this algorithm happens to cope".
 #
@@ -137,6 +188,21 @@
 #SBATCH --job-name=ant-safe50
 #SBATCH --output=ant_safe_b50_%j.log
 #SBATCH --partition=bigbatch
+# mscluster45's GPU was wedged on 2026-09-07 -- job 50715 landed there and
+# nvidia-smi reported "Unable to determine the device handle for GPU0", so jax
+# fell back to CPU and the preflight aborted it.
+#
+# EXCLUDING IT IS NOT PARANOIA, IT IS THE ONLY WAY TO STOP LANDING ON IT. A
+# node whose jobs die in seconds is always idle, so it is always the first node
+# free -- it will catch submission after submission while healthy nodes stay
+# busy. The preflight makes each hit cheap (seconds, not hours), but it cannot
+# stop them recurring.
+#
+# Remove this line once the node is repaired. Check with:
+#     sinfo -p bigbatch -N -l          # look for drain/down states
+# and report a wedged GPU to support@wits-mss.supportsystem.com -- a node in
+# that state stays broken until someone resets it.
+#SBATCH --exclude=mscluster45
 #SBATCH --time=06:00:00
 set -u
 
@@ -159,8 +225,32 @@ STEPS="${SAFE_STEPS:-50000000}"
 BUDGET="${SAFE_BUDGET:-50}"
 PENALIZER="${SAFE_PENALIZER:-ppo_lagrangian}"
 MULT_LR="${SAFE_MULT_LR:-1e-5}"
-NAME="${SAFE_NAME:-ant_minefield_${PENALIZER}_b${BUDGET}_adaptive}"
+RESUME="${SAFE_RESUME:-}"
+KAPPA_MAX="${SAFE_KAPPA_MAX:-5.0}"        # scheduled only
+RAMP_FRAC="${SAFE_RAMP_FRAC:-0.6}"        # scheduled only
+if [ "$PENALIZER" = "none" ]; then
+  # The unconstrained control. Budget/horizon flags are parsed and ignored;
+  # the name must not pretend a budget applied.
+  NAME="${SAFE_NAME:-ant_minefield_none_wide_ctrl}"
+else
+  NAME="${SAFE_NAME:-ant_minefield_${PENALIZER}_b${BUDGET}_adaptive}"
+fi
+# A RESUMED RUN MUST NOT WRITE INTO THE DIRECTORY IT RESUMES FROM. The trainer's
+# step counter restarts at 0 (env_steps is not in the checkpoint), so it would
+# write 000005038080 again and overwrite the source run's early checkpoints.
+[ -n "$RESUME" ] && [ -z "${SAFE_NAME:-}" ] && NAME="${NAME}_r$(date -u +%m%d%H%M)"
 CKPT="${SLURM_SUBMIT_DIR:-$PWD}/checkpoints/$NAME"
+
+if [ -n "$RESUME" ]; then
+  [ -d "$RESUME" ] || { echo "ABORT: SAFE_RESUME=$RESUME is not a directory"; exit 1; }
+  # The Lagrange multiplier lives in penalizer_params, which IS part of the
+  # 4-element restore -- so a resumed Lagrangian run continues from the
+  # multiplier it reached, not from 0.01. The adaptive horizon is stateless.
+  echo "=== RESUMING from $RESUME (multiplier restored with it) ==="
+  set -- --restore_checkpoint_path "$RESUME"
+else
+  set --
+fi
 
 # PREFLIGHT 1: a GPU that JAX can actually SEE.
 #
@@ -194,6 +284,12 @@ from mjx_safety_gym.algorithms import train_ppo as T
 from mjx_safety_gym.algorithms.ppo import train as ppo_train, losses as ppo_losses
 
 dests = {a.dest for a in T.build_argparser()._actions}
+opts = next(a for a in T.build_argparser()._actions if a.dest == 'penalizer').choices
+assert 'scheduled' in opts, (
+    'ABORT: no scheduled penalizer in this checkout (added 2026-09-12). git pull.')
+assert 'start_y_jitter' in dests, (
+    'ABORT: no --start_y_jitter in this checkout (added 2026-09-12); the spawn '
+    'would still be jittered and this run would not match the others. git pull.')
 assert 'adaptive_budget_horizon' in dests, (
     'ABORT: no --adaptive_budget_horizon in this checkout. It was added '
     '2026-09-05 and IS THE ENTIRE POINT of this run -- without it this '
@@ -220,6 +316,8 @@ echo "=========================================================="
 echo " $PENALIZER  budget=$BUDGET (EPISODE TOTAL, adaptive horizon)"
 echo "   policy 256x4, lidar-only, $STEPS steps -> $CKPT"
 [ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR"
+[ "$PENALIZER" = "scheduled" ] && echo "   kappa 0.01 -> $KAPPA_MAX over the first $RAMP_FRAC of the run, then held"
+[ "$PENALIZER" = "none" ] && echo "   UNCONSTRAINED CONTROL -- budget flags ignored; warm-start source for lever (a)"
 echo "   CHECK FIRST: training/budget_mean_episode_decisions"
 echo "     pinned at 625 => the fix never engaged, this is the OLD experiment"
 echo "   THE QUESTION: eval/episode_reward. ~20 = traverses, ~1 = loiters"
@@ -241,12 +339,13 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --penalizer "$PENALIZER" --safety_budget "$BUDGET" \
   --adaptive_budget_horizon \
   --lagrangian_multiplier_lr "$MULT_LR" \
+  --penalty_kappa_max "$KAPPA_MAX" --penalty_ramp_frac "$RAMP_FRAC" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
   --corridor_walls --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes 256 256 256 256 \
   --num_envs 1024 --num_minibatches 32 \
   --num_timesteps "$STEPS" --num_evals 11 \
-  --checkpoint_logdir "$CKPT"
+  --checkpoint_logdir "$CKPT" "$@"
 status=$?
 
 echo
@@ -262,7 +361,7 @@ p = pathlib.Path(os.environ["LOGFILE"])
 if not p.is_file():
     raise SystemExit(f"(log {p} not readable yet -- read it by hand)")
 B = float(os.environ["BUDGET"])
-print(f"{'step':>12} {'reward':>7} {'travel':>7} {'cost':>7} {'vs B':>6} "
+print(f"{'step':>12} {'reward':>7} {'displ':>7} {'cost':>7} {'vs B':>6} "
       f"{'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
 for line in p.read_text().splitlines():
     if not line.startswith("step="):
@@ -273,11 +372,14 @@ for line in p.read_text().splitlines():
         r = float(g["eval/episode_reward"])
     except (KeyError, ValueError):
         continue
-    # travel = reward minus the upright bonus (0.0002 per INNER step), i.e.
-    # what the policy earned by actually going somewhere. The B=30 arms sat at
-    # 0.6-0.9 m of an 11 m corridor.
-    knob = g.get("training/lagrange_multiplier") or g.get("training/crpo/active", "--")
-    print(f"{int(float(g['step'])):>12,} {r:>7.2f} {r-0.0002*l:>6.2f}m {c:>7.1f} "
+    # displacement = (reward - upright bonus) / 2. The /2 is not optional:
+    # reward telescopes to dx + (d_initial - d_final) + healthy, and for a
+    # corridor traverse BOTH terms equal the displacement, so reward counts it
+    # twice -- a full 11 m traverse scores ~22. The first version of this
+    # printer omitted the /2 and reported 19 m on an 11 m corridor.
+    knob = (g.get("training/lagrange_multiplier") or g.get("training/scheduled/kappa")
+            or g.get("training/crpo/active", "--"))
+    print(f"{int(float(g['step'])):>12,} {r:>7.2f} {(r-0.0002*l)/2:>6.2f}m {c:>7.1f} "
           f"{c/B:>5.1f}x {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY

@@ -170,6 +170,17 @@ class RunForward(GoToGoal):
         goal_reward_weight: float = 0.0,
         goal_observation: bool = False,
         lidar_groups=("obstacle",),
+        # Half-range of the robot's start-line y position, as a FRACTION of
+        # corridor_half_width. 0.0 = the same spawn every episode. Was 0.5
+        # (i.e. +-0.5 m) until 2026-09-12, user's call to fix it: with the
+        # hazard lattice already deterministic since 2026-08-22, this was the
+        # ONLY per-episode randomness left on minefield, and removing it makes
+        # every body face the identical problem -- the right setting for a
+        # controlled morphology comparison. The trade is stated in the
+        # docstring of _hazard_lattice: with nothing random at all, "avoids
+        # the mines" and "memorised one trajectory" become indistinguishable.
+        # --start_y_jitter 0.5 reproduces every earlier run.
+        start_y_jitter: float = 0.0,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -195,6 +206,9 @@ class RunForward(GoToGoal):
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
         self._terminate_on_goal = bool(terminate_on_goal)
+        if not 0.0 <= float(start_y_jitter) <= 1.0:
+            raise ValueError(f"start_y_jitter must be in [0, 1], got {start_y_jitter}")
+        self._start_y_jitter = float(start_y_jitter)
         # Matches world.build_arena's goal cylinder, 0.3 * obstacle_scale, so
         # the capture radius is the thing you can actually see in the viewer.
         self._goal_radius = (
@@ -476,16 +490,15 @@ class RunForward(GoToGoal):
             idx += 1
         layout["vases"] = entries
 
-        # Robot on the start line, jittered in y so it does not memorise one lane.
+        # Robot on the start line. Jittered in y (so it cannot memorise one
+        # lane) only if start_y_jitter > 0; the default is now a FIXED spawn at
+        # y = 0. The rng is split either way so the key stream downstream is
+        # identical whichever setting is used.
         rng, rk = jax.random.split(rng)
+        half = self._start_y_jitter * self._corridor_half_width
         robot_xy = jp.array([
             self._start_x,
-            jax.random.uniform(
-                rk,
-                (),
-                minval=-0.5 * self._corridor_half_width,
-                maxval=0.5 * self._corridor_half_width,
-            ),
+            jax.random.uniform(rk, (), minval=-half, maxval=half),
         ])
         layout["robot"] = [(0, robot_xy)]
         # Fixed beacon at the far end -- never moves, never respawns.

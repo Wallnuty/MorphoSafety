@@ -624,7 +624,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--penalizer",
-        choices=["crpo", "ppo_lagrangian", "saute", "none"],
+        choices=["crpo", "ppo_lagrangian", "scheduled", "saute", "none"],
         default="crpo",
     )
     parser.add_argument(
@@ -664,6 +664,36 @@ def build_argparser() -> argparse.ArgumentParser:
         "loitering buys nothing. NOTE THIS CHANGES WHAT THE NUMBER MEANS: B is "
         "now an episode TOTAL, directly comparable to eval/episode_cost "
         "(~85 for an unconstrained traversing policy), not a rate.",
+    )
+    parser.add_argument(
+        "--penalty_kappa_init",
+        type=float,
+        default=0.01,
+        help="--penalizer scheduled only. Starting cost-penalty coefficient. "
+        "Near zero so the policy is effectively unconstrained while it learns "
+        "to walk -- the failure mode every constrained run before 2026-09-11 "
+        "shared was full constraint pressure on a policy that could not yet "
+        "locomote, whose cost-minimal answer is to stay put.",
+    )
+    parser.add_argument(
+        "--penalty_kappa_max",
+        type=float,
+        default=5.0,
+        help="--penalizer scheduled only. Cap on the penalty coefficient. 5.0 "
+        "is anchored on the Lagrangian b50 arm, whose multiplier reached 4.16 "
+        "at 50M with reward still ~19-21 (a full traverse). Above ~6-11 the "
+        "b30 arm's reward collapsed, though under the old budget semantics.",
+    )
+    parser.add_argument(
+        "--penalty_ramp_frac",
+        type=float,
+        default=0.6,
+        help="--penalizer scheduled only. Fraction of the run over which kappa "
+        "ramps geometrically from --penalty_kappa_init to --penalty_kappa_max; "
+        "held at the cap for the rest. Converted to a count of penalizer "
+        "updates (one per minibatch) from --num_timesteps, --batch_size, "
+        "--unroll_length, --num_minibatches, --action_repeat and "
+        "num_updates_per_batch, so it is approximate to within one epoch.",
     )
     parser.add_argument("--crpo_eta", type=float, default=0.0)
     parser.add_argument("--crpo_burnin", type=int, default=0)
@@ -866,6 +896,18 @@ def build_argparser() -> argparse.ArgumentParser:
         "0.0 keeps `cost` as pure hazard proximity. Measured 2026-08-22 on the "
         "50M unconstrained minefield policy: cost was 91%% hazard / 9%% "
         "boundary, so this is no longer the dominant term it once was.",
+    )
+    parser.add_argument(
+        "--start_y_jitter",
+        type=float,
+        default=0.0,
+        help="Corridor tasks only. Half-range of the robot's start-line y "
+        "position as a fraction of corridor_half_width. DEFAULT 0.0 SINCE "
+        "2026-09-12 (fixed spawn at y=0); every run before that used 0.5, i.e. "
+        "+-0.5 m, and passing --start_y_jitter 0.5 reproduces them. With the "
+        "hazard lattice deterministic since 2026-08-22 this was the only "
+        "per-episode randomness left on minefield, so 0.0 makes the task fully "
+        "deterministic up to the policy's own action noise.",
     )
     parser.add_argument(
         "--hazard_size", type=float, default=0.16,
@@ -1361,6 +1403,7 @@ def train(args: argparse.Namespace):
                 ctrl_cost_weight=args.ctrl_cost_weight,
                 boundary_cost_weight=args.boundary_cost_weight,
                 corridor_walls=args.corridor_walls,
+                start_y_jitter=args.start_y_jitter,
                 hazard_step_on=args.hazard_step_on,
                 foot_obstacle_obs=args.foot_obstacle_obs,
                 healthy_reward=args.healthy_reward,
@@ -1529,12 +1572,38 @@ def train(args: argparse.Namespace):
     )
 
     penalizer_name = None if args.penalizer in ("none", "saute") else args.penalizer
+    # How many penalizer.update() calls the run will make. update() fires once
+    # per MINIBATCH (ppo/training_step.py), so:
+    #   training steps  = num_timesteps / (batch * unroll * minibatches * action_repeat)
+    #   updates         = training steps * minibatches * num_updates_per_batch
+    # num_updates_per_batch is not CLI-exposed; read ppo.train's own default so
+    # this cannot drift from it. Approximate to within one epoch of rounding.
+    import inspect as _inspect
+    from mjx_safety_gym.algorithms.ppo import train as _ppo_train
+    _upb = _inspect.signature(_ppo_train.train).parameters["num_updates_per_batch"].default
+    _env_steps_per_training_step = (
+        args.batch_size * args.unroll_length * args.num_minibatches * args.action_repeat
+    )
+    _total_updates = int(
+        (args.num_timesteps / _env_steps_per_training_step) * args.num_minibatches * _upb
+    )
+    _ramp_updates = max(1, int(args.penalty_ramp_frac * _total_updates))
+    if args.penalizer == "scheduled":
+        print(
+            f"[scheduled] kappa {args.penalty_kappa_init} -> {args.penalty_kappa_max} "
+            f"over {_ramp_updates:,} of ~{_total_updates:,} penalizer updates "
+            f"({args.penalty_ramp_frac:.0%} of the run), then held",
+            flush=True,
+        )
     penalizer, penalizer_params = get_penalizer(
         penalizer_name,
         eta=args.crpo_eta,
         burnin=args.crpo_burnin,
         multiplier_lr=args.lagrangian_multiplier_lr,
         initial_lagrange_multiplier=args.initial_lagrange_multiplier,
+        penalty_kappa_init=args.penalty_kappa_init,
+        penalty_kappa_max=args.penalty_kappa_max,
+        penalty_ramp_updates=_ramp_updates,
     )
 
     def progress_fn(step, metrics):

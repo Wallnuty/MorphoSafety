@@ -1,5 +1,9 @@
-Compare bodygen approach to our approach.
-Look at morphology agnostic methods for the sake of morphology optimisation
-See if current method where policy takes in morphology parameters as input could also maybe work for different topology morphology
-When doing nsga later on maybe train the network further specifically for the robot parameters that nsga evolved.
-Maybe train a version of this network that can also include topology parameters.
+(a) Warm-start the constrained run from an unconstrained traverser. This is CRAX's "safety transfer" protocol verbatim: "we first train an unconstrained PPO policy... and subsequently use its parameters to initialize a safe RL algorithm, which is then trained with the remaining half of the allowed timesteps." It removes exactly our failure mode — the constraint no longer has to coexist with learning to walk, only with learning where to walk. CRAX found it helps on some tasks and not on Point-Goal; nobody has reported it for a legged Goal task, which is the case where the locomotion bottleneck is the whole story. We already have the traverser (the 150M lidar checkpoint). This is the cheapest high-value experiment on the table.
+
+(b) Fix the multiplier controller, not its learning rate. Our ratchet (0.98 → 17.6, monotone, never falling even when cost was inside budget) is textbook integral windup — plain gradient ascent is pure integral control. Stooke et al. 2020 (PID Lagrangian) diagnose exactly this: "Lagrangian methods exhibit oscillations and overshoot." CRAX's PPOPID gains are the tell: Kp = 10, Ki = 0.01, Kd = 0.01, integral clip 1.0. Proportional-dominant with the integral clipped to a tiny value means the multiplier drops the moment violation stops — it can't wind up. Ours has no proportional term at all. It's ~10 lines in penalizers.py.
+
+(c) Schedule the constraint strength. P3O — one of the two "strongest baselines on CRAX" — is a penalty that starts at κ = 0.01, multiplies by 1.1 per update, caps at 50. That's a curriculum on constraint pressure: the agent is effectively unconstrained while it learns to walk and constrained once it can. Same principle as (a), no checkpoint needed.
+
+(d) Hierarchy. The strongest results on legged agents come from separating "how to walk" from "where to go" — the Heess/DeepMind lineage (pretrain a quadruped to reach targets in open space, then a high-level policy emits targets), and SPEIS on Doggo: 79% success, 5.8% collision. Biggest gains, biggest change to the codebase. Worth it only if (a)–(c) stall.
+
+(e) Curriculum on hazard density (CRAX): train on fewer mines first. Easy for us — --num_hazards.
