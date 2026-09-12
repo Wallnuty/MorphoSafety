@@ -198,11 +198,16 @@
 # busy. The preflight makes each hit cheap (seconds, not hours), but it cannot
 # stop them recurring.
 #
-# Remove this line once the node is repaired. Check with:
+# mscluster83 joined the list on 2026-09-12 (job 53418, identical signature).
+# Excluding 45 did not fix anything -- it moved the front of the idle queue to
+# the NEXT broken node. Expect this list to grow until the nodes are actually
+# drained, which only support can do.
+#
+# Remove a node once it is repaired. Check with:
 #     sinfo -p bigbatch -N -l          # look for drain/down states
 # and report a wedged GPU to support@wits-mss.supportsystem.com -- a node in
 # that state stays broken until someone resets it.
-#SBATCH --exclude=mscluster45
+#SBATCH --exclude=mscluster45,mscluster83
 #SBATCH --time=06:00:00
 set -u
 
