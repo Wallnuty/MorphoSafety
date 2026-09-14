@@ -943,6 +943,67 @@ def build_argparser() -> argparse.ArgumentParser:
         "(or per-foot hazard clearance) is the missing input.",
     )
     parser.add_argument(
+        "--hazard_shaping_weight",
+        type=float,
+        default=0.0,
+        help="[--task run/minefield] Weight of a GRADED foot-in-hazard penalty "
+        "on the REWARD (GoToGoal.hazard_shaping): per hazard, 1 with a grounded "
+        "geom's surface at the centre, ramping to 0 at --hazard_shaping_radius. "
+        "0.0 (default) = off, reward exactly as before. The binary `cost` is "
+        "NOT changed -- it stays the safety metric and the thing any budget is "
+        "judged against -- and eval/episode_reward reports the UNSHAPED reward "
+        "(via info['eval_reward']), so it still reads as 2x displacement; the "
+        "penalty total appears separately as eval/episode_hazard_shaping. WHY: "
+        "the cost is a step function of foot position, so a critic trained on "
+        "it gets no direction toward the free floor; CRPO, Lagrangian and the "
+        "scheduled penalty all met their budget by doing less of the task "
+        "instead (2026-09-12), while a kinematic check found a connected "
+        "zero-cost path exists. Sizing: summed over the 4 inner steps of a "
+        "decision like the rest of the reward, so a decision with a foot at "
+        "half depth costs ~2x this weight against ~0.17 of progress reward; "
+        "on the 2026-09-14 cost scale (touching only) 0.3 makes the "
+        "unconstrained control's penalty ~6 of its ~21 return.",
+    )
+    parser.add_argument(
+        "--hazard_shaping_radius",
+        type=float,
+        default=None,
+        help="Ramp radius for --hazard_shaping_weight, metres from hazard "
+        "centre to geom surface. Default None = the cost threshold "
+        "(--hazard_size after scaling), i.e. zero exactly at the rim. Larger "
+        "(0.25 recommended against the 0.16 threshold) also nudges LEGAL "
+        "stances in the ring outside the disc, pushing feet toward the middle "
+        "of a free cell; the lattice's best footholds sit ~0.5 from every "
+        "centre, so 0.25 leaves them untouched.",
+    )
+    parser.add_argument(
+        "--ground_contact_eps",
+        type=float,
+        default=None,
+        help="How far a robot geom's lowest point may sit above the floor and "
+        "still count as ON THE GROUND for the hazard cost (and the shaping "
+        "ramp). Default None = 0.001 m x arena_scale, i.e. touching. WAS 0.02 "
+        "until 2026-09-14, and that was not a tolerance, it was most of the "
+        "cost: the trained gait skims (median ankle 1.45 cm up, 21%% of "
+        "foot-steps in contact), so hover over a mine was charged like "
+        "standing on it -- 84.0 cost/episode at 0.02 vs 26.9 at 0.001 on the "
+        "same trajectories, against 26.8 from MuJoCo's own floor contacts. "
+        "EVERY COST NUMBER BEFORE 2026-09-14 IS ON THE 0.02 SCALE (~3x this "
+        "one); pass 0.02 with --hazard_footprint shadow to reproduce them.",
+    )
+    parser.add_argument(
+        "--hazard_footprint",
+        choices=["contact", "shadow"],
+        default="contact",
+        help="Which part of a grounded geom the hazard test uses. 'contact' "
+        "(default since 2026-09-14): only the part at floor level, so a tilted "
+        "lower leg is charged at its foot tip, not along its xy shadow up to "
+        "the knee. 'shadow': the whole projection, as before -- 8%% of the old "
+        "cost was airborne shadow, and it depended on leg tilt, i.e. on the "
+        "body. With 'contact' the test reproduces MuJoCo's contact points to "
+        "4 cells in 856.",
+    )
+    parser.add_argument(
         "--hazard_step_on",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1393,6 +1454,8 @@ def train(args: argparse.Namespace):
             morphology_conditioning=bool(args.num_morphologies),
             integrator=args.integrator,
             hazard_size=args.hazard_size,
+            ground_contact_eps=args.ground_contact_eps,
+            hazard_footprint=args.hazard_footprint,
         )
         if args.task in ("run", "minefield", "lasers"):
             corridor = dict(
@@ -1405,6 +1468,8 @@ def train(args: argparse.Namespace):
                 corridor_walls=args.corridor_walls,
                 start_y_jitter=args.start_y_jitter,
                 hazard_step_on=args.hazard_step_on,
+                hazard_shaping_weight=args.hazard_shaping_weight,
+                hazard_shaping_radius=args.hazard_shaping_radius,
                 foot_obstacle_obs=args.foot_obstacle_obs,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,

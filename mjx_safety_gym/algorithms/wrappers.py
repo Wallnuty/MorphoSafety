@@ -30,21 +30,22 @@ from brax.envs.wrappers import training as brax_training
 class CostEpisodeWrapper(brax_training.EpisodeWrapper):
     """Maintains episode step count and sets done at episode end."""
 
+    # Per-inner-step info scalars that must be SUMMED over the action_repeat
+    # scan, like reward -- anything left out reads as its last inner step only.
+    # `hazard_shaping` (RunForward, 2026-09-13) is the graded foot-in-hazard
+    # term; it is here so eval/episode_hazard_shaping is an exact episode total.
+    _SUMMED_INFO_KEYS = ("cost", "eval_reward", "hazard_shaping")
+
     def step(self, state: State, action: jax.Array) -> State:
         def f(state, _):
             nstate = self.env.step(state, action)
-            maybe_cost = nstate.info.get("cost", None)
-            maybe_eval_reward = nstate.info.get("eval_reward", None)
-            return nstate, (nstate.reward, maybe_cost, maybe_eval_reward)
+            summed = {k: nstate.info[k] for k in self._SUMMED_INFO_KEYS if k in nstate.info}
+            return nstate, (nstate.reward, summed)
 
-        state, (rewards, maybe_costs, maybe_eval_rewards) = jax.lax.scan(
-            f, state, (), self.action_repeat
-        )
+        state, (rewards, summed) = jax.lax.scan(f, state, (), self.action_repeat)
         state = state.replace(reward=jp.sum(rewards, axis=0))
-        if maybe_costs is not None:
-            state.info["cost"] = jp.sum(maybe_costs, axis=0)
-        if maybe_eval_rewards is not None:
-            state.info["eval_reward"] = jp.sum(maybe_eval_rewards, axis=0)
+        for k, v in summed.items():
+            state.info[k] = jp.sum(v, axis=0)
         steps = state.info["steps"] + self.action_repeat
         one = jp.ones_like(state.done)
         zero = jp.zeros_like(state.done)
@@ -170,7 +171,10 @@ class Saute(Wrapper):
             )
         saute_state = jp.where(terminate, ones, saute_state)
         nstate.info["saute_state"] = saute_state
-        nstate.info["eval_reward"] = nstate.reward
+        # Keep an inner env's own eval_reward if it set one (RunForward does
+        # under hazard shaping): that is the unshaped reward, which is what
+        # eval should report. Absent, this is exactly the old assignment.
+        nstate.info["eval_reward"] = nstate.info.get("eval_reward", nstate.reward)
         nstate.metrics["saute_reward"] = saute_reward
         nstate.metrics["saute_unsafe"] = (saute_state <= 0.0).astype(jp.float32)
         nstate.metrics["saute_terminate"] = terminate.astype(jp.float32)

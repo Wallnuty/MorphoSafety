@@ -33,6 +33,12 @@
 #SBATCH --job-name=gpu-smoke-test
 #SBATCH --output=gpu_smoke_test_%j.log
 #SBATCH --partition=bigbatch
+# Wedged GPUs (nvidia-smi "Unable to determine the device handle for GPU0"):
+# mscluster45 since 2026-09-07, mscluster83 since 2026-09-12. A node whose jobs
+# die in seconds is always idle, so it is always first in the queue -- exclude
+# or it catches every submission. Same list as ant_minefield_safe_b50.sbatch;
+# drop a node once support has reset it (sinfo -p bigbatch -N -l).
+#SBATCH --exclude=mscluster45,mscluster83
 #SBATCH --time=00:10:00
 set -u
 echo "=== node ==="

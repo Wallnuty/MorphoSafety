@@ -181,6 +181,24 @@ class RunForward(GoToGoal):
         # the mines" and "memorised one trajectory" become indistinguishable.
         # --start_y_jitter 0.5 reproduces every earlier run.
         start_y_jitter: float = 0.0,
+        # Graded foot-in-hazard penalty on the REWARD (see
+        # GoToGoal.hazard_shaping). 0.0 = off, reward exactly as before. The
+        # binary `cost` is untouched either way: it stays the safety metric,
+        # and eval reports the UNSHAPED reward through info["eval_reward"] so
+        # eval/episode_reward keeps reading as 2x displacement. Sizing: the
+        # penalty is summed over the action_repeat inner steps of a decision
+        # like everything else in the reward, so one decision with a foot at
+        # half depth costs ~2 * weight, against ~0.17 of progress reward at
+        # full stride. On the 2026-09-14 cost scale (touching only, see
+        # GoToGoal's ground_contact_eps) the unconstrained control incurs
+        # ~20 shaped units per episode, so 0.3 makes the penalty ~6, about a
+        # third of its ~21 return; one bad footfall (~3 inner steps of stance
+        # at half depth) costs ~0.45, i.e. ~2.5 decisions of progress.
+        hazard_shaping_weight: float = 0.0,
+        # Radius of the ramp, metres from the hazard CENTRE to a geom's
+        # SURFACE; None = the cost threshold itself (0 exactly at the rim). A
+        # larger value also nudges legal stances in the ring outside the disc.
+        hazard_shaping_radius: float | None = None,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -209,6 +227,10 @@ class RunForward(GoToGoal):
         if not 0.0 <= float(start_y_jitter) <= 1.0:
             raise ValueError(f"start_y_jitter must be in [0, 1], got {start_y_jitter}")
         self._start_y_jitter = float(start_y_jitter)
+        if float(hazard_shaping_weight) < 0.0:
+            raise ValueError(f"hazard_shaping_weight must be >= 0, got {hazard_shaping_weight}")
+        self._hazard_shaping_weight = float(hazard_shaping_weight)
+        self._hazard_shaping_radius_arg = hazard_shaping_radius
         # Matches world.build_arena's goal cylinder, 0.3 * obstacle_scale, so
         # the capture radius is the thing you can actually see in the viewer.
         self._goal_radius = (
@@ -232,6 +254,14 @@ class RunForward(GoToGoal):
         # rather than per reset: it is a constant, and doing it here keeps it out
         # of every trace.
         self._hazard_lattice_xy = self._hazard_lattice()
+        # Also after super(): the default is the cost threshold, which GoToGoal
+        # reads off the compiled hazard geom.
+        r = self._hazard_shaping_radius_arg
+        self._hazard_shaping_radius = self._hazard_radius if r is None else float(r)
+        if self._hazard_shaping_weight and not self._hazard_shaping_radius > 0.0:
+            raise ValueError(
+                f"hazard_shaping_radius must be > 0, got {self._hazard_shaping_radius}"
+            )
 
     # -- arena -------------------------------------------------------------
 
@@ -729,6 +759,13 @@ class RunForward(GoToGoal):
             # adding another consumer must not clear it a second time.
             "arrived": jp.zeros(()),
         }
+        if self._hazard_shaping_weight:
+            # Both keys in reset AND step, same gate, or the auto-reset wrapper
+            # sees a pytree mismatch. `eval_reward` is what
+            # ConstraintEvalWrapper reports instead of the (shaped) reward;
+            # CostEpisodeWrapper sums both over the inner steps of a decision.
+            info["eval_reward"] = jp.zeros(())
+            info["hazard_shaping"] = jp.zeros(())
         return State(data, self.get_obs(data), jp.zeros(()), jp.zeros(()), {}, info)
 
     def step(self, state: State, action: jax.Array) -> State:
@@ -744,6 +781,16 @@ class RunForward(GoToGoal):
             reward = reward - self._ctrl_cost_weight * jp.sum(jp.square(action))
 
         cost = self.get_cost(data)
+        if self._hazard_shaping_weight:
+            # Shaping goes on the REWARD, not the cost. The metric the budget is
+            # judged against must stay the binary count or nothing before this
+            # date is comparable; what changes is only the landscape PPO's
+            # reward critic sees, which now slopes toward the free floor
+            # instead of stepping at the rim.
+            shaping = jp.sum(self.hazard_shaping(data, self._hazard_shaping_radius))
+            state.info["eval_reward"] = reward
+            state.info["hazard_shaping"] = shaping
+            reward = reward - self._hazard_shaping_weight * shaping
         done = (jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()).astype(jp.float32)
         # Ending the episode on a flip is the larger half of this fix. Without
         # it an ant that goes over at step 50 still contributes 2450 further

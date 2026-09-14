@@ -168,6 +168,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         hazard_step_on: bool = True,
         foot_obstacle_obs: bool = False,
         ground_contact_eps: float | None = None,
+        hazard_footprint: str = "contact",
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -245,17 +246,42 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # anything measured before this date.
         self._hazard_step_on = bool(hazard_step_on)
         self._foot_obstacle_obs = bool(foot_obstacle_obs)
+        # Which part of a grounded geom is charged (see _hazard_surface_matrix):
+        #   "contact"  only the part of it that is at floor level  (default)
+        #   "shadow"   its whole xy projection, airborne part included
+        # "shadow" reproduces every cost number before 2026-09-14.
+        if hazard_footprint not in ("contact", "shadow"):
+            raise ValueError(f"hazard_footprint must be 'contact' or 'shadow', got {hazard_footprint!r}")
+        self._hazard_footprint = hazard_footprint
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
         self._arena_scale = float(_ROBOT_CONFIGS[robot]["arena_scale"])
         # How far a geom's lowest point may sit above the floor and still count
-        # as "on the ground", for --hazard_step_on. Scales with the robot,
-        # because a tolerance that is generous for the 0.06 m-radius ant foot is
-        # invisible against ant_gym's 4x geometry. Assigned AFTER _arena_scale,
-        # which it depends on.
+        # as "on the ground", for --hazard_step_on. Scales with the robot.
+        # Assigned AFTER _arena_scale, which it depends on.
+        #
+        # 0.001 (1 mm) SINCE 2026-09-14; it was 0.02. That was not a tolerance,
+        # it was most of the cost. Measured on the 50M Saute500 policy, 32
+        # episodes, every variant on the SAME trajectory (session scratchpad
+        # cost_audit.py):
+        #
+        #     grounded means lowest point <= ...    hazard cost / episode
+        #       0.02  (old)                                84.0
+        #       0.005                                      40.8
+        #       0.001 (new)                                26.9
+        #     MuJoCo's own floor contacts, dist <= 1 mm    26.8   <- reference
+        #
+        # The trained gait skims: the median ankle sits 1.45 cm above the floor
+        # and only 21.5% of foot-steps are in penetrating contact, so at 2 cm
+        # a foot HOVERING over a mine was charged like one standing on it and
+        # ~65% of every cost number was hover. At 1 mm the geometric test and
+        # the physics contacts agree on every one of ~19k foot-steps (fractions
+        # 0.253 vs 0.253) and disagree on 4 of 856 charged (step, hazard)
+        # cells. Pass ground_contact_eps=0.02 (CLI --ground_contact_eps) with
+        # hazard_footprint="shadow" to reproduce anything measured before.
         self._ground_contact_eps = (
-            0.02 * self._arena_scale
+            0.001 * self._arena_scale
             if ground_contact_eps is None
             else float(ground_contact_eps)
         )
@@ -638,9 +664,35 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         geom_axis = data.geom_xmat[self._robot_collision_geom_ids_arr].reshape(
             -1, 3, 3
         )[:, :, 2]  # capsule axis is local z
-        offset = geom_axis[:, :2] * half_len[:, None]
-        seg_a = geom_pos[:, :2] + offset
-        seg_b = geom_pos[:, :2] - offset
+        # Axis parameter range [lo, hi] of the part of each capsule that is
+        # charged, in metres along geom_axis from its centre.
+        lo, hi = -half_len, half_len
+        if step_on and self._hazard_footprint == "contact":
+            # ONLY THE PART AT FLOOR LEVEL. A grounded capsule that is tilted
+            # (a lower leg, always) has its foot tip on the floor and its knee
+            # end 12 cm up; charging its whole xy shadow charges a strip of AIR
+            # up to 7 cm long, and makes the charged region depend on leg tilt
+            # -- a body with more horizontal legs paid more for the same
+            # footprint, which is exactly the kind of artifact a morphology
+            # search would exploit. Keep the axis points whose underside is
+            # within `_ground_contact_eps` of the floor: z(t) = cz + t*az, so
+            # z(t) - r <= eps  <=>  t on one side of t* = (eps + r - cz) / az.
+            # A flat capsule (az ~ 0) keeps its whole length when grounded,
+            # which the grounding gate below already decides; a sphere has
+            # half_len 0 and collapses to its contact point. Measured 8% of
+            # the old cost at eps 0.02, and at eps 1 mm reproduces MuJoCo's
+            # own contact points to within 4 cells in 856.
+            az, cz = geom_axis[:, 2], geom_pos[:, 2]
+            safe_az = jp.where(jp.abs(az) < 1e-6, 1e-6, az)
+            t_star = (self._ground_contact_eps + radius - cz) / safe_az
+            lo = jp.where(az < -1e-6, jp.maximum(lo, t_star), lo)
+            hi = jp.where(az > 1e-6, jp.minimum(hi, t_star), hi)
+            # An airborne geom gives lo > hi; it is masked out by the grounding
+            # gate below, but keep its endpoints inside the geom regardless.
+            lo = jp.clip(lo, -half_len, half_len)
+            hi = jp.clip(hi, -half_len, half_len)
+        seg_a = geom_pos[:, :2] + geom_axis[:, :2] * hi[:, None]
+        seg_b = geom_pos[:, :2] + geom_axis[:, :2] * lo[:, None]
         hazard_pos = data.xpos[jp.array(self._hazard_body_ids)][:, :2]  # (H, 2)
         surface = _segment_point_distance_2d(hazard_pos, seg_a, seg_b)
         surface -= radius[None, :]
@@ -685,6 +737,36 @@ class GoToGoal(playground_mjx_env.MjxEnv):
     def hazard_contacts(self, data: mjx.Data) -> jax.Array:
         """Boolean (H,): which hazards are currently charging cost."""
         return self.hazard_distances(data) <= self._hazard_radius
+
+    def hazard_shaping(self, data: mjx.Data, radius: float) -> jax.Array:
+        """Graded version of `hazard_contacts`, (H,) in [0, 1].
+
+        1 when a grounded geom's surface is AT a hazard centre, falling
+        linearly to 0 at `radius` from it. Same geometry, same grounding gate
+        as the cost -- it is `hazard_distances` put through a ramp instead of a
+        threshold -- so it cannot describe a different minefield.
+
+        WHY IT EXISTS. `hazard_contacts` is a step function of foot position:
+        a foot 1 mm inside a disc and one at dead centre cost the same, and
+        1 mm outside costs nothing. A critic trained on that learns "this
+        stance was bad" but never "3 cm to the left would have been fine" --
+        it has to find the free floor from the rare samples that happen to land
+        just outside. Every constraint mechanism tried on minefield (CRPO,
+        Lagrangian, scheduled penalty) satisfied its budget by doing LESS of the
+        task instead, because that is the one direction that descends smoothly
+        under a binary cost. A kinematic check on 2026-09-12 found the lattice
+        leaves a connected zero-cost path with 77% of torso positions fully
+        standable, so the missing thing is the gradient, not the floor.
+
+        With `radius` > `_hazard_radius` (the cost threshold) a LEGAL stance in
+        the ring between them is nudged too, which pushes feet toward the
+        middle of a free cell rather than its edge. Used as a REWARD term by
+        RunForward (`hazard_shaping_weight`); the binary cost is untouched and
+        remains the safety metric, so every earlier cost number stays
+        comparable. Airborne robot: the 1e6 sentinel from
+        `_hazard_surface_matrix` clips to exactly 0, no NaN.
+        """
+        return jp.clip(1.0 - self.hazard_distances(data) / float(radius), 0.0, 1.0)
 
     def lidar_observations(self, data: mjx.Data) -> jax.Array:
         """Compute Lidar observations."""
