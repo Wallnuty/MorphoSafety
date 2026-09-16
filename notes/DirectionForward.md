@@ -11,3 +11,25 @@ My recommendation: the torso hazard grid, plus touchdown clearance on top of the
 3. Gait-parameterised actions (PMTG/CPG-style: the policy outputs stride length, phase, clearance over a trajectory generator instead of raw torques). Foot placement becomes a low-dimensional, semantic decision rather than something emergent from 8 torques at 12 Hz. Standard in legged robotics; the biggest build on this list.
 
 4. Imitation from the planner. The kinematic check produces a zero-cost foothold sequence; use it as a reference for a tracking reward or DAgger, DeepMimic-style. Sits between the hierarchy I described and pure RL: the planner is used at training time only, the deployed policy is flat.
+
+5. Read all three against the actual code. The pasted advice is mostly right, one claim is off, and the sources disagree with two of my choices.
+
+What the sources actually do
+
+hazard cost	where	grounding gate	what the policy sees
+Safety Gym / Gymnasium (hazards.py:85-89)	cost × (size − dist) — linear in penetration depth, torso centre	cost	none (2D)	torso lidar
+CRAX Pathway (safe_pathway.py:412-473)	(1 − d/r)² per foot, quadratic, max over feet, sum over hazards, ×1.5; plus 5.0 cost on unhealthy termination	cost	foot z < 0.10 m	torso lidar only (planar robots — it's a timing task, not 2D placement)
+Hwang et al. 2026	none — stepping stones, falling is the failure	—	—	17×11 heightmap at 0.1 m + per-foot Gaussian blobs (w=10, σ=0.1) on the same grid, CNN + attention; the foot map alone was +10% success, the biggest component
+So "the field has converged on penetration depth" is right — even the original Safety Gym hazard cost we ported is graded, and ours went binary somewhere in the port. "Quadratic" is CRAX; Safety Gym is linear. The CaT "13×11 at 8 cm" detail I can't verify locally — treat as unconfirmed.
+
+Where we differ, and what I'd change
+
+The graded term belongs in the cost. Both references make penetration the cost; I put it in the reward. Your instinct was right and the sources back it. Fix: cost = Σ_hazards max_feet(depth) (linear like Safety Gym, quadratic as an option), with the binary count still logged as episode_hazard_steps so the new numbers stay readable. Reward shaping stays available for the unconstrained arms only.
+No ring outside the disc. Neither reference ramps beyond the hazard edge; my 0.25 margin is nonstandard. Default the ramp to the disc radius.
+Charge the flip. CRAX's 5.0 termination cost is the answer to the exit both CRPO and Lagrangian took: if ending the episode costs about a careless crossing's worth, "walk 3 m and fall over" no longer satisfies the budget. A --flip_cost flag, off by default.
+Foot-resolution obs. Hwang's point is feet and terrain in one representation so the network can relate them; CRAX doesn't do it at all. The MLP-scale version is the per-foot local hazard grid I suggested — the grid is the source's idea, the per-foot centring is our substitute for their attention encoder.
+One thing the sources are looser on: grounding. CRAX charges a foot hovering up to 10 cm; Safety Gym charges the torso passing over. Our 1 mm is the physically honest choice you asked for, but it's the strictest in the literature and the signal is correspondingly sparser — worth remembering if the graded cost still doesn't bite.
+
+The velocity-tracking warning doesn't apply: our reward is global +x with walls and a lattice spanning the corridor, so the field can't be dodged — the analogous exploit here is stopping/flipping, which is what item 3 closes.
+
+Items 1–3 are ~80 lines and change the budget's units (penetration units, ~0.8× hazard-steps on the walker), so the constrained arm's budget would be re-derived. Want me to build them before the cluster arms go out?
