@@ -79,6 +79,33 @@ _parser.add_argument(
     "again. --no-camera_track restores the free camera.",
 )
 _parser.add_argument(
+    "--ground_contact_eps",
+    type=float,
+    default=None,
+    help="Grounding tolerance for the hazard test, metres above the floor. "
+    "Default None = the env's (0.001 x arena_scale since 2026-09-14). Pass 0.02 "
+    "with --hazard_footprint shadow to watch the OLD cost fire: discs light up "
+    "under feet that are still 1-2 cm in the air.",
+)
+_parser.add_argument(
+    "--hazard_footprint",
+    choices=["contact", "shadow"],
+    default="contact",
+    help="'contact' charges only the floor-level part of a grounded geom; "
+    "'shadow' its whole xy projection (pre-2026-09-14). Viewer A/B knob.",
+)
+_parser.add_argument(
+    "--shaping_ring",
+    type=float,
+    default=None,
+    help="Draw a faint disc of this RADIUS (metres, surface-to-centre) under "
+    "every hazard: the reach of --hazard_shaping_radius, i.e. where the graded "
+    "reward penalty starts ramping. The solid blue disc is the COST trigger "
+    "exactly as drawn -- cost fires the moment a grounded geom's visible edge "
+    "overlaps it -- so this only marks the wider shaping zone. Viewer-only "
+    "overlay (viewer.user_scn); the model is untouched.",
+)
+_parser.add_argument(
     "--hazard_highlight",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -260,6 +287,8 @@ if _args.num_morphologies:
                 # stepping (ngeom 37 -> 39), so it is off by default and never
                 # on in training. See RunForward._add_corridor_walls.
                 draw_corridor_lines=True,
+                ground_contact_eps=_args.ground_contact_eps,
+                hazard_footprint=_args.hazard_footprint,
                 **kw,
             ),
             ROBOT,
@@ -360,7 +389,9 @@ elif _args.task == "goal":
 else:
     env, _task_kwargs, _default_width = build_env_for_checkpoint(
         lambda **kw: _TASKS[_args.task](
-            robot=ROBOT, draw_corridor_lines=True, **kw
+            robot=ROBOT, draw_corridor_lines=True,
+            ground_contact_eps=_args.ground_contact_eps,
+            hazard_footprint=_args.hazard_footprint, **kw
         ),
         ROBOT,
         _want,
@@ -602,6 +633,25 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             m.geom_rgba[_h["gids"], 3] = np.where(
                 hot, _h["alpha_hot"], _h["alpha_base"]
             )
+        if _args.shaping_ring:
+            # Overlay geoms live in the viewer's scene, not the model, so they
+            # cost nothing in physics and cannot drift into a training run.
+            _scn = viewer.user_scn
+            _scn.ngeom = 0
+            for _b in getattr(env.unwrapped, "_hazard_body_ids", ()):
+                if _scn.ngeom >= _scn.maxgeom:
+                    break
+                _pos = d.xpos[_b].copy()
+                _pos[2] = 0.0002  # just under the hazard disc's 0.0005 floor
+                mujoco.mjv_initGeom(
+                    _scn.geoms[_scn.ngeom],
+                    type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                    size=np.array([_args.shaping_ring, 0.0002, 0.0]),
+                    pos=_pos,
+                    mat=np.eye(3).flatten(),
+                    rgba=np.array([0.0, 0.5, 1.0, 0.12], dtype=np.float32),
+                )
+                _scn.ngeom += 1
         viewer.sync()
 
         # ACT ON `done`. The env computes it (terminate_on_goal has been the

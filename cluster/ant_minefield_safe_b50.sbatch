@@ -35,20 +35,42 @@
 # (twice -- that script's own caveat is that cost does not resolve at 128
 # episodes across runs). Expect roughly a third of 111, i.e. ~35 / ~3.5 per m.
 #
-# Three arms, each vs the unconstrained control (none, 47 wide, reward 20.81 /
-# 10.36 m; cost on the new scale per the re-evaluation above):
+# SHAPING GOES ON A WALKER, NOT ON A RANDOM POLICY (2026-09-14). Measured on
+# the Saute500 walker, 32 episodes, new scale: a crossing (10.65 m, 106
+# decisions) incurs 21.8 shaping units at radius 0.25 -- 0.2 per decision, i.e.
+# feet land at random relative to the mines -- so at w=0.3 the penalty is 6.5
+# per crossing, 0.61 reward per metre against the 2.0 earned; break-even
+# w=0.98. FROM SCRATCH IT IS A DIFFERENT SUM: the penalty is per step, the
+# reward per metre, and the early gait is slow -- 0.018 m/decision at 5M on
+# the Saute500 curve, earning 0.036/decision against a ~0.06-0.12 penalty.
+# Between first reaching the mines and getting quick (~3-10M) the field is
+# net NEGATIVE, which is the "linger at the entrance" local optimum. So the
+# shaping arms resume from a finished walker; C is run first because it is
+# B's walker.
 #
-#  A. shaping alone, obs 47 -- the single-variable test.
+# Arms, each vs the unconstrained control (none, 47 wide, reward 20.81 /
+# 10.36 m; cost on the new scale from D's step-0 row, see below):
+#
+#  C. foot obs alone, from scratch (obs 63). Completes the 2x2, and is the
+#     63-wide walker B resumes from. The 2026-08-24 foot-obs arm predates the
+#     walls, so it was confounded by the boundary exploit.
+#   SAFE_PENALIZER=none SAFE_FOOT_OBS=1 sbatch cluster/ant_minefield_safe_b50.sbatch
+#
+#  A. shaping alone, obs 47, WARM-STARTED from the control.
+#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl/000050380800 \
+#   SAFE_NAME=ant_minefield_none_shaped_w0.3_warm \
 #   SAFE_PENALIZER=none SAFE_SHAPING_W=0.3 sbatch cluster/ant_minefield_safe_b50.sbatch
 #
-#  B. shaping + per-foot clearance obs (63 wide) -- the arm expected to work:
-#     the penalty is then a direct function of something the policy observes.
+#  B. shaping + foot obs, obs 63, resumed from C ONCE C HAS FINISHED.
+#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl_feet/000050380800 \
+#   SAFE_NAME=ant_minefield_none_shaped_w0.3_feet_warm \
 #   SAFE_PENALIZER=none SAFE_SHAPING_W=0.3 SAFE_FOOT_OBS=1 sbatch cluster/ant_minefield_safe_b50.sbatch
 #
-#  C. foot obs alone, no shaping -- completes the 2x2 with the control. The
-#     2026-08-24 foot-obs arm predates the walls, so it was confounded by the
-#     boundary exploit and is not a clean reading.
-#   SAFE_PENALIZER=none SAFE_FOOT_OBS=1 sbatch cluster/ant_minefield_safe_b50.sbatch
+# A from-scratch shaping arm is a side experiment, and needs SAFE_SHAPING_W=0.1
+# (penalty ~= earnings even at the 5M gait). The warm starts carry a small
+# "more training" confound: the Saute500 walker's cost kept drifting down
+# 85 -> 77 (old scale) over 100M extra steps with nothing pushing it, so
+# expect ~10% of any improvement to be that.
 #
 #  D. LEVER (a): Lagrangian WARM-STARTED from the finished control, obs 47
 #     (the checkpoint is 47 wide, so no foot obs here). Budget 15 on the new
@@ -68,10 +90,6 @@
 #     sbatch cluster/ant_minefield_safe_b50.sbatch
 #     (+ SAFE_SHAPING_W=0.3 and SAFE_NAME=..._b15_warm_shaped_w0.3 for the
 #     version with the gradient as well -- the one most likely to work.)
-#
-# 0.3, not 0.1: the shaping ramp uses the same touching gate as the cost, so
-# the control's shaped total fell ~3x too (~60 -> ~20 units/episode); 0.3
-# keeps the penalty at ~6, a third of the ~21 return.
 #
 # READ: cost per metre (episode_cost / displacement) with displacement held
 # near 10 m, against the re-evaluated control. If A/B move it but stop short,
