@@ -98,7 +98,7 @@ _ROBOT_DEFAULTS = {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
-        "terminate_on_goal": True, "foot_obstacle_obs": False,
+        "terminate_on_goal": True, "foot_obstacle_obs": False, "foot_hazard_grid": 0,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -175,7 +175,7 @@ _ROBOT_DEFAULTS = {
         # losing to a free exploit rather than on merit; what is measured is
         # that it does not lower hazard cost on the objective as it stands.
         # Pass --foot_obstacle_obs to get it back.
-        "foot_obstacle_obs": False,
+        "foot_obstacle_obs": False, "foot_hazard_grid": 0,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -279,7 +279,7 @@ _ROBOT_DEFAULTS = {
         # losing to a free exploit rather than on merit; what is measured is
         # that it does not lower hazard cost on the objective as it stands.
         # Pass --foot_obstacle_obs to get it back.
-        "foot_obstacle_obs": False,
+        "foot_obstacle_obs": False, "foot_hazard_grid": 0,
     },
 }
 
@@ -305,7 +305,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 # are not accepted by the env.
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
-    "goal_observation", "terminate_on_goal", "foot_obstacle_obs",
+    "goal_observation", "terminate_on_goal", "foot_obstacle_obs", "foot_hazard_grid",
 )
 
 
@@ -400,8 +400,12 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
     # moves. That is exactly how main.py's morphology branch broke: it assumed
     # the default and never consulted this list at all.
     alt_feet = {**current, "foot_obstacle_obs": not current.get("foot_obstacle_obs", False)}
+    # foot_hazard_grid (2026-09-17): +F*N*N, and 5 is the only N used so far.
+    alt_grid = 0 if current.get("foot_hazard_grid", 0) else 5
     return [
         current,
+        {**current, "foot_hazard_grid": alt_grid},
+        {**alt_feet, "foot_hazard_grid": alt_grid},
         # PER-FOOT CLEARANCE THE OTHER WAY. Load-bearing in both directions:
         # with the flag off by default this is what reaches the 63-wide
         # (64 under Saute) checkpoints trained on 2026-08-24.
@@ -977,19 +981,67 @@ def build_argparser() -> argparse.ArgumentParser:
         "centre, so 0.25 leaves them untouched.",
     )
     parser.add_argument(
+        "--hazard_cost_shape",
+        choices=["binary", "linear", "quadratic"],
+        default="linear",
+        help="How a grounded geom inside a hazard disc is charged. 'linear' "
+        "(default since 2026-09-17): cost = penetration depth, 0 at the rim, 1 "
+        "at the centre -- Safety Gym's own `cost * (size - dist)` normalised. "
+        "'quadratic': CRAX Pathway's (1 - d/r)^2. 'binary': 1 per hazard per "
+        "step, the pre-2026-09-17 rule. The binary count is ALWAYS logged as "
+        "eval/episode_hazard_steps whatever this is set to, so graded numbers "
+        "stay readable as steps-in-mines (graded <= binary, ~0.8x on a "
+        "careless walker). WHY: a step function gives the cost critic no "
+        "direction toward the free floor; every constrained arm on minefield "
+        "met its budget by doing less of the task instead. A graded cost is "
+        "what both references use, and the budget is then in penetration "
+        "units.",
+    )
+    parser.add_argument(
+        "--flip_cost",
+        type=float,
+        default=0.0,
+        help="[--task run/minefield] COST charged once when the torso goes "
+        "over (CRAX Pathway's unhealthy_termination_cost, 5.0 there). Closes "
+        "the exit every constrained arm took: under terminate_on_flip a policy "
+        "that walks 3 m and falls over stops paying and satisfied a "
+        "per-episode budget. Size it near a careless full crossing's cost so "
+        "falling is never cheaper than finishing. 0 = off (every earlier run).",
+    )
+    parser.add_argument(
+        "--foot_hazard_grid",
+        type=int,
+        default=0,
+        help="Per-foot N x N hazard map in the observation (0 = off). Each "
+        "cell is the linear penetration cost THAT foot would pay with its "
+        "centre there, laid out in the torso yaw frame around the foot's "
+        "current xy at --foot_hazard_grid_spacing. 5 adds 100 dims for the "
+        "ant (47 -> 147). The MLP-scale version of Hwang et al. 2026's foot "
+        "position map: feet and hazards in one representation, so the network "
+        "does not have to relate a torso lidar to joint angles. Independent of "
+        "--foot_obstacle_obs, which gives one nearest mine per foot and flips "
+        "discontinuously between equidistant mines.",
+    )
+    parser.add_argument(
+        "--foot_hazard_grid_spacing",
+        type=float,
+        default=0.08,
+        help="Cell pitch of --foot_hazard_grid in metres before arena scaling; "
+        "5 x 0.08 covers +-0.16 m around the foot, one hazard radius.",
+    )
+    parser.add_argument(
         "--ground_contact_eps",
         type=float,
         default=None,
         help="How far a robot geom's lowest point may sit above the floor and "
         "still count as ON THE GROUND for the hazard cost (and the shaping "
-        "ramp). Default None = 0.001 m x arena_scale, i.e. touching. WAS 0.02 "
-        "until 2026-09-14, and that was not a tolerance, it was most of the "
-        "cost: the trained gait skims (median ankle 1.45 cm up, 21%% of "
-        "foot-steps in contact), so hover over a mine was charged like "
-        "standing on it -- 84.0 cost/episode at 0.02 vs 26.9 at 0.001 on the "
-        "same trajectories, against 26.8 from MuJoCo's own floor contacts. "
-        "EVERY COST NUMBER BEFORE 2026-09-14 IS ON THE 0.02 SCALE (~3x this "
-        "one); pass 0.02 with --hazard_footprint shadow to reproduce them.",
+        "ramp). Default None = 0.05 m x arena_scale (user's call 2026-09-17; "
+        "CRAX charges below 0.10, Safety Gym has no gate). THE TOLERANCE IS "
+        "THE COST SCALE, because the trained gait skims: on the same "
+        "trajectories 0.02 gave 84.0 cost/episode, 0.005 gave 40.8, 0.001 gave "
+        "26.9 against 26.8 from MuJoCo's own floor contacts. Pass 0.02 with "
+        "--hazard_footprint shadow --hazard_cost_shape binary to reproduce "
+        "every number before 2026-09-14.",
     )
     parser.add_argument(
         "--hazard_footprint",
@@ -1304,7 +1356,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "body that will be reported. Upstream's steps_after_robot_update.",
     )
     parser.add_argument(
-        "--design_objective", choices=["time", "return"], default="time",
+        "--design_objective", choices=["time", "return", "safe_time"], default="time",
         help="What the REINFORCE step scores a design by. 'time' (default) is "
         "the time-to-goal fitness scripts/eval_morphology.py already uses -- "
         "arrival decision if it reached the goal, else a miss charge ordered by "
@@ -1315,7 +1367,17 @@ def build_argparser() -> argparse.ArgumentParser:
         "long it took (measured: arrival times spanned 1.87x while returns "
         "spanned std 0.003), and the one speed-dependent term left, the healthy "
         "bonus, actually pays SLOWER bodies more. 'time' requires "
-        "terminate_on_goal, which is the default.",
+        "terminate_on_goal, which is the default. 'safe_time' (2026-09-17) is "
+        "'time' plus --design_cost_weight x the episode's cost, so the search "
+        "asks which body crosses fast AND cleanly -- the morphology-safety "
+        "question -- rather than fast alone.",
+    )
+    parser.add_argument(
+        "--design_cost_weight", type=float, default=0.0,
+        help="[--design_objective safe_time] Decisions charged per unit of "
+        "episode cost. 1.0 makes a careless nominal-ant crossing (~58 cost "
+        "units under the 2026-09-17 linear cost) worth about half its arrival "
+        "time; a zero-cost body saves all of it.",
     )
     parser.add_argument(
         "--chop_freq", type=int, default=0,
@@ -1356,7 +1418,7 @@ def validate(args: argparse.Namespace) -> None:
             "sample becomes one body in the batch, so a population size is "
             "required. Try --num_morphologies 16."
         )
-    if args.design_optimization and args.design_objective == "time":
+    if args.design_optimization and args.design_objective in ("time", "safe_time"):
         if not args.terminate_on_goal:
             raise SystemExit(
                 "--design_objective time needs --terminate_on_goal (the "
@@ -1456,6 +1518,9 @@ def train(args: argparse.Namespace):
             hazard_size=args.hazard_size,
             ground_contact_eps=args.ground_contact_eps,
             hazard_footprint=args.hazard_footprint,
+            hazard_cost_shape=args.hazard_cost_shape,
+            foot_hazard_grid=args.foot_hazard_grid,
+            foot_hazard_grid_spacing=args.foot_hazard_grid_spacing,
         )
         if args.task in ("run", "minefield", "lasers"):
             corridor = dict(
@@ -1470,6 +1535,7 @@ def train(args: argparse.Namespace):
                 hazard_step_on=args.hazard_step_on,
                 hazard_shaping_weight=args.hazard_shaping_weight,
                 hazard_shaping_radius=args.hazard_shaping_radius,
+                flip_cost=args.flip_cost,
                 foot_obstacle_obs=args.foot_obstacle_obs,
                 healthy_reward=args.healthy_reward,
                 terminate_on_flip=args.terminate_on_flip,
@@ -1564,6 +1630,7 @@ def train(args: argparse.Namespace):
             steps_after_update=args.steps_after_design_update,
             chop_freq=args.chop_freq or None,
             objective=args.design_objective,
+            cost_weight=args.design_cost_weight,
             action_repeat=args.action_repeat,
             max_decisions=args.episode_length // args.action_repeat,
             # Both movement terms telescope, so a straight full traverse pays

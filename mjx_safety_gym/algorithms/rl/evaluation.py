@@ -27,8 +27,9 @@ class ConstraintEvalWrapper(EvalWrapper):
         # Optional graded-penalty total (RunForward hazard_shaping_weight > 0).
         # Present in reset and step under the same condition, so the metrics
         # pytree matches between them.
-        if "hazard_shaping" in reset_state.info:
-            reset_state.metrics["hazard_shaping"] = reset_state.info["hazard_shaping"]
+        for k in ("hazard_shaping", "hazard_steps"):
+            if k in reset_state.info:
+                reset_state.metrics[k] = reset_state.info[k]
         eval_metrics = EvalMetrics(
             episode_metrics=jax.tree_util.tree_map(jnp.zeros_like, reset_state.metrics),
             active_episodes=jnp.ones_like(reset_state.reward),
@@ -49,8 +50,9 @@ class ConstraintEvalWrapper(EvalWrapper):
             reward = nstate.reward
         nstate.metrics["reward"] = reward
         nstate.metrics["cost"] = nstate.info.get("cost", jnp.zeros_like(nstate.reward))
-        if "hazard_shaping" in nstate.info:
-            nstate.metrics["hazard_shaping"] = nstate.info["hazard_shaping"]
+        for k in ("hazard_shaping", "hazard_steps"):
+            if k in nstate.info:
+                nstate.metrics[k] = nstate.info[k]
         episode_steps = jnp.where(
             state_metrics.active_episodes,
             nstate.info.get("steps", jnp.zeros_like(state_metrics.episode_steps)),

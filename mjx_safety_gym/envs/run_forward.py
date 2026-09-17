@@ -199,6 +199,16 @@ class RunForward(GoToGoal):
         # SURFACE; None = the cost threshold itself (0 exactly at the rim). A
         # larger value also nudges legal stances in the ring outside the disc.
         hazard_shaping_radius: float | None = None,
+        # COST charged once on the step the torso goes over (is_flipped
+        # transitions 0 -> 1). CRAX Pathway's `unhealthy_termination_cost`
+        # (5.0 there). Closes the exit every constrained arm took on
+        # minefield: with terminate_on_flip an episode that flips at 3 m has
+        # paid for 3 m of mines and then stops paying, so "walk two columns
+        # and fall over" satisfied a per-episode budget (CRPO 2026-08-26,
+        # Lagrangian 2026-09-12). Charged on the TRANSITION only, because
+        # CostEpisodeWrapper keeps stepping the inner env after `done` within
+        # a decision and the ant stays flipped. 0.0 = off (every earlier run).
+        flip_cost: float = 0.0,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -231,6 +241,9 @@ class RunForward(GoToGoal):
             raise ValueError(f"hazard_shaping_weight must be >= 0, got {hazard_shaping_weight}")
         self._hazard_shaping_weight = float(hazard_shaping_weight)
         self._hazard_shaping_radius_arg = hazard_shaping_radius
+        if float(flip_cost) < 0.0:
+            raise ValueError(f"flip_cost must be >= 0, got {flip_cost}")
+        self._flip_cost = float(flip_cost)
         # Matches world.build_arena's goal cylinder, 0.3 * obstacle_scale, so
         # the capture radius is the thing you can actually see in the viewer.
         self._goal_radius = (
@@ -281,6 +294,7 @@ class RunForward(GoToGoal):
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
             hazard_size=self._hazard_size,
+            hazard_height=self._ground_contact_eps,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
         if self._corridor_walls:
@@ -758,6 +772,11 @@ class RunForward(GoToGoal):
             # clears it, because auto-reset leaves `info` untouched. Anyone
             # adding another consumer must not clear it a second time.
             "arrived": jp.zeros(()),
+            # Binary per-step hazard count, whatever hazard_cost_shape says the
+            # cost is. Summed by CostEpisodeWrapper, reported by eval as
+            # eval/episode_hazard_steps -- the pre-2026-09-17 cost, kept so a
+            # graded cost number can still be read as "steps in mines".
+            "hazard_steps": jp.zeros(()),
         }
         if self._hazard_shaping_weight:
             # Both keys in reset AND step, same gate, or the auto-reset wrapper
@@ -781,6 +800,10 @@ class RunForward(GoToGoal):
             reward = reward - self._ctrl_cost_weight * jp.sum(jp.square(action))
 
         cost = self.get_cost(data)
+        state.info["hazard_steps"] = jp.sum(self.hazard_contacts(data)).astype(jp.float32)
+        if self._flip_cost:
+            went_over = self.is_flipped(data) * (1.0 - self.is_flipped(state.data))
+            cost = cost + self._flip_cost * went_over
         if self._hazard_shaping_weight:
             # Shaping goes on the REWARD, not the cost. The metric the budget is
             # judged against must stay the binary count or nothing before this

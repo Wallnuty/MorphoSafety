@@ -106,6 +106,13 @@ _parser.add_argument(
     "overlay (viewer.user_scn); the model is untouched.",
 )
 _parser.add_argument(
+    "--hazard_cost_shape",
+    choices=["binary", "linear", "quadratic"],
+    default="linear",
+    help="Cost shape for the printed per-step cost; the highlight is binary "
+    "(any penetration) whichever is chosen.",
+)
+_parser.add_argument(
     "--hazard_highlight",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -289,6 +296,7 @@ if _args.num_morphologies:
                 draw_corridor_lines=True,
                 ground_contact_eps=_args.ground_contact_eps,
                 hazard_footprint=_args.hazard_footprint,
+                hazard_cost_shape=_args.hazard_cost_shape,
                 **kw,
             ),
             ROBOT,
@@ -391,7 +399,8 @@ else:
         lambda **kw: _TASKS[_args.task](
             robot=ROBOT, draw_corridor_lines=True,
             ground_contact_eps=_args.ground_contact_eps,
-            hazard_footprint=_args.hazard_footprint, **kw
+            hazard_footprint=_args.hazard_footprint,
+            hazard_cost_shape=_args.hazard_cost_shape, **kw
         ),
         ROBOT,
         _want,

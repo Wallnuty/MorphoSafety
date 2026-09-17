@@ -149,6 +149,7 @@ class Lasers(RunForward):
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
             hazard_size=self._hazard_size,
+            hazard_height=self._ground_contact_eps,
         )
         self._add_lasers(mjSpec)
         # MUST be repeated here -- this OVERRIDES RunForward._build_arena, so

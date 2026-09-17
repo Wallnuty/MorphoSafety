@@ -252,6 +252,13 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 STEPS="${STEPS:-300000000}"
 DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
 DESIGN_LR="${DESIGN_LR:-0.001}"
+# 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
+# DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
+# nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
+# is the morphology-safety question. Default keeps the time-only objective.
+DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-time}"
+DESIGN_COST_WEIGHT="${DESIGN_COST_WEIGHT:-0}"
+FLIP_COST="${FLIP_COST:-0}"
 RESUME="${RESUME:-}"
 
 # A RESUMED RUN MUST NOT WRITE INTO THE DIRECTORY IT IS RESUMING FROM. The
@@ -301,7 +308,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
   --corridor_walls --boundary_cost_weight 0 \
   --design_optimization \
-  --design_objective time \
+  --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
+  --flip_cost "$FLIP_COST" \
   --num_morphologies 16 \
   --design_components 8 \
   --design_updates_per_eval 8 \

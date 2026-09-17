@@ -193,3 +193,4 @@ cluster/download.md
 logs/
 # Vast.ai instance id (per-rental, machine-local)
 cluster/vast/.instance
+cluster/vast/.instance.*

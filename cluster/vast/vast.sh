@@ -13,6 +13,7 @@
 #   bash cluster/vast/vast.sh push-ckpt <dir> # send a checkpoint to resume FROM
 #   bash cluster/vast/vast.sh codesign        # morphology co-design run (+preflights)
 #   bash cluster/vast/vast.sh codesign-log    # follow the co-design run
+#   SAFE_PENALIZER=none bash cluster/vast/vast.sh safe   # any minefield arm (SAFE_* vars)
 #   bash cluster/vast/vast.sh crpo            # CRPO safety run (+preflights)
 #   bash cluster/vast/vast.sh lagrangian      # Lagrangian arm; queues behind crpo
 #   bash cluster/vast/vast.sh logs            # follow the remote log
@@ -412,7 +413,7 @@ codesign)
   # to have already set, so an inherited value is indistinguishable from an
   # intended one. A prefix nothing else uses removes the ambiguity.
   envs=""
-  for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME; do
+  for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME DESIGN_OBJECTIVE DESIGN_COST_WEIGHT FLIP_COST; do
     eval "val=\${CODESIGN_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
   done
   rexec "cd $REMOTE_DIR && mkdir -p logs && \
@@ -426,6 +427,30 @@ codesign)
 codesign-log)
   ssh_parts
   rexec "tail -n ${LINES:-60} -f $REMOTE_DIR/logs/vast_codesign.log"
+  ;;
+
+safe)
+  # Generic minefield run: cluster/vast/remote_safe.sh with the SAFE_* vars of
+  # cluster/ant_minefield_safe_b50.sbatch. SAFE_SESSION names the tmux session
+  # (default 'safe'); SAFE_AFTER queues behind another session on the same box.
+  shift || true
+  ssh_parts
+  envs=""
+  for v in $(env | sed -n 's/^\(SAFE_[A-Z_]*\)=.*/\1/p'); do
+    eval "val=\${$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
+  done
+  sess="${SAFE_SESSION:-safe}"
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t $sess 2>/dev/null; \
+         tmux new-session -d -s $sess \
+         '$envs bash cluster/vast/remote_safe.sh 2>&1 | tee logs/vast_session_$sess.log' && \
+         echo 'launched in tmux session: $sess'"
+  echo "Follow it with: ${VAST_TAG:+VAST_TAG=$VAST_TAG }SAFE_SESSION=$sess $0 safe-log"
+  ;;
+
+safe-log)
+  ssh_parts
+  rexec "tail -n \${LINES:-60} -f $REMOTE_DIR/logs/vast_session_${SAFE_SESSION:-safe}.log"
   ;;
 
 crpo)

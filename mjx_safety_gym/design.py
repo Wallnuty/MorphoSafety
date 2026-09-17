@@ -509,6 +509,7 @@ class DesignLoop:
         action_repeat: int = 1,
         max_decisions: int | None = None,
         return_ceiling: float | None = None,
+        cost_weight: float = 0.0,
     ) -> None:
         self.gmm = gmm
         self._spec_factory = spec_factory  # genes array -> MorphologySpec
@@ -521,11 +522,20 @@ class DesignLoop:
         self.steps_after_update = int(steps_after_update)
         self.chop_freq = chop_freq
         self.ema = float(ema)
-        if objective not in ("time", "return"):
+        if objective not in ("time", "return", "safe_time"):
             raise ValueError(f"unknown design objective {objective!r}")
         self.objective = objective
         self.action_repeat = int(action_repeat)
-        if objective == "time":
+        # "safe_time": time fitness PLUS cost_weight * episode cost, both in
+        # "decisions" (lower is better before negation). A body is then judged
+        # on how fast AND how cleanly it crosses -- the co-design question this
+        # project exists to ask, made askable once the cost is graded
+        # (2026-09-17). cost_weight 1.0 makes a careless crossing's ~58 cost
+        # units worth ~half an arrival time on the nominal ant.
+        self.cost_weight = float(cost_weight)
+        if objective == "safe_time" and self.cost_weight <= 0.0:
+            raise ValueError("objective='safe_time' needs cost_weight > 0")
+        if objective in ("time", "safe_time"):
             if not max_decisions or not return_ceiling:
                 raise ValueError(
                     "objective='time' needs max_decisions and return_ceiling"
@@ -678,16 +688,22 @@ class DesignLoop:
         fitness = np.where(
             arrived, decisions, self.max_decisions * (1.0 + shortfall)
         )
+        if self.objective == "safe_time":
+            cost = np.asarray(info["ep_cost_last"]).reshape(shape)
+            fitness = fitness + self.cost_weight * cost
+            self._aux = {"design/cost_mean": float(cost.mean())}
+        else:
+            self._aux = {}
         # Reported in the natural units as well as the negated score, because
         # "design/score_mean = -212" is not a number anyone can sanity-check
         # against a rollout, and 212 decisions is.
-        self._aux = {
+        self._aux.update({
             "design/fitness_decisions": float(fitness.mean()),
             "design/arrival_rate": float(arrived.mean()),
             "design/arrival_decisions": (
                 float(decisions[arrived].mean()) if arrived.any() else float("nan")
             ),
-        }
+        })
         return -fitness.mean(axis=1), counts
 
     def finish_iteration(self, env_state, step: int) -> dict:

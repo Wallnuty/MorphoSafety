@@ -169,6 +169,20 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         foot_obstacle_obs: bool = False,
         ground_contact_eps: float | None = None,
         hazard_footprint: str = "contact",
+        # How a grounded geom inside a hazard disc is charged. "linear" (the
+        # default since 2026-09-17) is Safety Gym's own rule -- cost grows
+        # linearly with penetration depth, 0 at the rim, 1 with the geom's
+        # surface at the centre; "quadratic" is CRAX Pathway's (1 - d/r)^2;
+        # "binary" is the 1-per-hazard-per-step count every number before
+        # 2026-09-17 used, and it is still reported alongside as
+        # info["hazard_steps"] whichever shape is chosen.
+        hazard_cost_shape: str = "linear",
+        # Per-foot local hazard map, N x N cells at `foot_hazard_grid_spacing`
+        # metres (x arena_scale) centred on each foot in the torso's yaw frame.
+        # Each cell holds the linear penetration cost THIS foot would pay if it
+        # landed there. 0 = off. See foot_hazard_grid_observations.
+        foot_hazard_grid: int = 0,
+        foot_hazard_grid_spacing: float = 0.08,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -253,6 +267,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         if hazard_footprint not in ("contact", "shadow"):
             raise ValueError(f"hazard_footprint must be 'contact' or 'shadow', got {hazard_footprint!r}")
         self._hazard_footprint = hazard_footprint
+        if hazard_cost_shape not in ("binary", "linear", "quadratic"):
+            raise ValueError(
+                f"hazard_cost_shape must be binary/linear/quadratic, got {hazard_cost_shape!r}")
+        self._hazard_cost_shape = hazard_cost_shape
+        if int(foot_hazard_grid) < 0 or float(foot_hazard_grid_spacing) <= 0.0:
+            raise ValueError("foot_hazard_grid must be >= 0 and its spacing > 0")
+        self._foot_hazard_grid = int(foot_hazard_grid)
+        self._foot_hazard_grid_spacing = float(foot_hazard_grid_spacing)
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
@@ -261,27 +283,31 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # as "on the ground", for --hazard_step_on. Scales with the robot.
         # Assigned AFTER _arena_scale, which it depends on.
         #
-        # 0.001 (1 mm) SINCE 2026-09-14; it was 0.02. That was not a tolerance,
-        # it was most of the cost. Measured on the 50M Saute500 policy, 32
-        # episodes, every variant on the SAME trajectory (session scratchpad
-        # cost_audit.py):
+        # 0.05 (5 cm) SINCE 2026-09-17, user's call. History: 0.02 until
+        # 2026-09-14, then 0.001 for three days. The 2026-09-14 audit (session
+        # scratchpad cost_audit.py; 50M Saute500 walker, 32 episodes, every
+        # variant on the SAME trajectory) is what all of these should be read
+        # against:
         #
         #     grounded means lowest point <= ...    hazard cost / episode
-        #       0.02  (old)                                84.0
+        #       0.02                                       84.0
         #       0.005                                      40.8
-        #       0.001 (new)                                26.9
-        #     MuJoCo's own floor contacts, dist <= 1 mm    26.8   <- reference
+        #       0.001                                      26.9
+        #     MuJoCo's own floor contacts, dist <= 1 mm    26.8
         #
-        # The trained gait skims: the median ankle sits 1.45 cm above the floor
-        # and only 21.5% of foot-steps are in penetrating contact, so at 2 cm
-        # a foot HOVERING over a mine was charged like one standing on it and
-        # ~65% of every cost number was hover. At 1 mm the geometric test and
-        # the physics contacts agree on every one of ~19k foot-steps (fractions
-        # 0.253 vs 0.253) and disagree on 4 of 856 charged (step, hazard)
-        # cells. Pass ground_contact_eps=0.02 (CLI --ground_contact_eps) with
-        # hazard_footprint="shadow" to reproduce anything measured before.
+        # The trained gait skims (median ankle 1.5-1.9 cm up, 14-21% of
+        # foot-steps in penetrating contact), so the tolerance IS the cost
+        # scale: at 1 mm the test reproduces the physics contacts exactly; at
+        # 2 cm ~65% of the cost was hover. 5 cm is looser than either and sits
+        # between them and the references -- CRAX Pathway charges a foot below
+        # 10 cm, Safety Gym has no gate at all -- chosen so a foot swinging LOW
+        # over a mine is charged and the signal is not starved by a bounding
+        # gait. Nothing below reads the value except this gate and
+        # _scaled_ground_gap, so it is a semantics knob, not a physics one.
+        # Pass ground_contact_eps explicitly (CLI --ground_contact_eps) to
+        # reproduce any earlier scale.
         self._ground_contact_eps = (
-            0.001 * self._arena_scale
+            0.05 * self._arena_scale
             if ground_contact_eps is None
             else float(ground_contact_eps)
         )
@@ -417,6 +443,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             obstacle_scale=self._arena_scale,
             lidar_groups=self._lidar_groups,
             hazard_size=self._hazard_size,
+            hazard_height=self._ground_contact_eps,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
 
@@ -642,9 +669,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         else:
             collision_cost = jp.zeros(())
 
-        return (collision_cost + jp.sum(self.hazard_contacts(data))).astype(
-            jp.float32
-        )
+        if self._hazard_cost_shape == "binary":
+            hazard_cost = jp.sum(self.hazard_contacts(data))
+        else:
+            depth = self.hazard_depths(data)
+            if self._hazard_cost_shape == "quadratic":
+                depth = depth * depth
+            hazard_cost = jp.sum(depth)
+        return (collision_cost + hazard_cost).astype(jp.float32)
 
     def _hazard_surface_matrix(self, data: mjx.Data, *, step_on: bool) -> jax.Array:
         """(H, G) distance from each hazard CENTRE to each robot geom's surface.
@@ -737,6 +769,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
     def hazard_contacts(self, data: mjx.Data) -> jax.Array:
         """Boolean (H,): which hazards are currently charging cost."""
         return self.hazard_distances(data) <= self._hazard_radius
+
+    def hazard_depths(self, data: mjx.Data) -> jax.Array:
+        """Penetration depth per hazard, (H,) in [0, 1]: 0 at the rim, 1 with a
+        grounded geom's surface at the centre. THE COST under
+        hazard_cost_shape="linear" (Safety Gym's `cost * (size - dist)`,
+        normalised by size) and, squared, under "quadratic" (CRAX Pathway).
+        `hazard_contacts` is exactly `hazard_depths > 0` up to the rim."""
+        return self.hazard_shaping(data, self._hazard_radius)
 
     def hazard_shaping(self, data: mjx.Data, radius: float) -> jax.Array:
         """Graded version of `hazard_contacts`, (H,) in [0, 1].
@@ -952,6 +992,63 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             return 0
         return 4 * int(self._foot_geom_cols.size)
 
+    def foot_hazard_grid_observations(self, data: mjx.Data) -> Optional[jax.Array]:
+        """Per-foot N x N map of the cost this foot would pay landing there.
+
+        WHY A MAP AND NOT THE NEAREST HAZARD. `foot_obstacle_observations`
+        reports one mine per foot: its edge distance and bearing. Moving away
+        from the nearest mine can walk into the next, and the bearing flips
+        discontinuously where two mines are equidistant. What placement needs
+        is where the FREE floor is. Hwang et al. 2026 (foot position maps on a
+        heightmap) make the point that feet and terrain must live in one
+        representation for a network to relate them; their encoder is
+        attention over a base-centred grid. The MLP-scale equivalent used here
+        centres a small grid on each foot instead, so the relation is explicit
+        in the input rather than learned.
+
+        Cells are laid out in the torso's YAW frame (x forward, y left), at
+        `_foot_hazard_grid_spacing * arena_scale` metres, centred on the foot's
+        current xy. Each cell holds the LINEAR penetration cost the foot would
+        incur with its centre at that cell -- `hazard_depths` evaluated for a
+        foot of this radius -- so 0 is free floor and 1 is a mine's centre,
+        the same units as the cost itself. Uses hazard BODY positions and the
+        foot geom's live radius, so it follows morphology changes.
+        """
+        if not self._foot_hazard_grid or self._foot_geom_cols.size == 0:
+            return None
+        n = self._foot_hazard_grid
+        spacing = self._foot_hazard_grid_spacing * self._arena_scale
+        radius, half_len = self._robot_geom_extent()
+        foot_ids = self._robot_collision_geom_ids_arr[self._foot_geom_cols]
+        # Centre the grid on the TOE -- the capsule's lower axis endpoint --
+        # not on geom_xpos, which is the capsule's midpoint and sits ~3-4 cm
+        # behind the toe and 7 cm up on a 60-degree lower leg. The toe is what
+        # touches the floor and what the cost is charged on.
+        gpos = data.geom_xpos[foot_ids]                                     # (F, 3)
+        axis = data.geom_xmat[foot_ids].reshape(-1, 3, 3)[:, :, 2]          # (F, 3)
+        h = half_len[self._foot_geom_cols]
+        toe = gpos - jp.sign(axis[:, 2:3]) * axis * h[:, None]
+        foot_xy = toe[:, :2]                                                # (F, 2)
+        r_foot = radius[self._foot_geom_cols]                               # (F,)
+        mat = data.xmat[self._robot_body_id].reshape(3, 3)
+        yaw = jp.arctan2(mat[1, 0], mat[0, 0])
+        c, s = jp.cos(yaw), jp.sin(yaw)
+        offs = (jp.arange(n, dtype=jp.float32) - (n - 1) / 2.0) * spacing
+        gx, gy = jp.meshgrid(offs, offs, indexing="ij")                     # (n, n)
+        lx, ly = gx.ravel(), gy.ravel()                                     # (n*n,)
+        world = jp.stack([c * lx - s * ly, s * lx + c * ly], axis=-1)       # (n*n, 2)
+        cells = foot_xy[:, None, :] + world[None, :, :]                     # (F, n*n, 2)
+        hazard_xy = data.xpos[jp.array(self._hazard_body_ids)][:, :2]      # (H, 2)
+        d = jp.linalg.norm(cells[:, :, None, :] - hazard_xy[None, None, :, :], axis=-1)
+        surface = jp.min(d, axis=-1) - r_foot[:, None]                      # (F, n*n)
+        depth = jp.clip(1.0 - surface / self._hazard_radius, 0.0, 1.0)
+        return depth.ravel()
+
+    def foot_hazard_grid_observation_size(self) -> int:
+        if not self._foot_hazard_grid or self._foot_geom_cols.size == 0:
+            return 0
+        return int(self._foot_geom_cols.size) * self._foot_hazard_grid ** 2
+
     def get_obs(self, data: mjx.Data) -> jax.Array:
         lidar = self.lidar_observations(data)
         other_sensors = self.sensor_observations(data)
@@ -962,6 +1059,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         feet = self.foot_obstacle_observations(data)
         if feet is not None:
             parts.append(feet)
+        grid = self.foot_hazard_grid_observations(data)
+        if grid is not None:
+            parts.append(grid)
         if self._morphology_conditioning:
             parts.append(self._morphology_genes)
         return jp.hstack(parts)
@@ -1181,6 +1281,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         size = len(self._lidar_groups) * lidar.NUM_LIDAR_BINS + self._obs_sensor_dim
         size += self.task_observation_size()
         size += self.foot_obstacle_observation_size()
+        size += self.foot_hazard_grid_observation_size()
         if self._morphology_conditioning:
             size += NUM_GENES
         return size

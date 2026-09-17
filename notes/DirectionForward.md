@@ -33,3 +33,9 @@ One thing the sources are looser on: grounding. CRAX charges a foot hovering up 
 The velocity-tracking warning doesn't apply: our reward is global +x with walls and a lattice spanning the corridor, so the field can't be dodged — the analogous exploit here is stopping/flipping, which is what item 3 closes.
 
 Items 1–3 are ~80 lines and change the budget's units (penetration units, ~0.8× hazard-steps on the walker), so the constrained arm's budget would be re-derived. Want me to build them before the cluster arms go out?
+
+6. Switch to CaT (constraints as terminations). This is the closest published method to what you're doing and it's about five lines on top of PPO. Instead of a hard budget, you compute a termination probability δ proportional to the magnitude of the constraint violation, normalized by an exponential moving average of the max violation in the recent batch, then multiply rewards by (1−δ) and write δ into the dones. Allowing δ strictly between 0 and 1 is what lets the agent learn to recover from violations and explore a little inside the violating region. They anneal soft constraints from p_max 0.05 up to 0.25 over training while keeping genuine no-go constraints at 1.0. They ran 60+ constraint terms this way on real hardware.
+
+If you want to stay closer to safe-RL-proper: PPO-Lagrangian with the PID multiplier update (Stooke et al.) is the standard strong baseline. Skip CPO — Ray et al. found it performs surprisingly poorly on Safety Gym relative to Lagrangian methods. In the legged world, Kim et al. use IPO with adaptive constraint thresholding and note that CPO's optimization cost grows linearly in the number of constraints. 
+OpenAI
+arxiv

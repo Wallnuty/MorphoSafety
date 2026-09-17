@@ -74,6 +74,7 @@ def build_arena(
     vase_mass: float | None = None,
     lidar_groups=None,
     hazard_size: float = 0.2,
+    hazard_height: float = 0.001,
 ):
     """Build the arena (currently, just adds Lidar rings). Future: dynamically add obstacles, hazards, objects, goal here
 
@@ -162,19 +163,19 @@ def build_arena(
             # VISUAL: _post_init reads the cost threshold off size[0], the
             # RADIUS, and nothing anywhere reads size[1] or this geom's pos.
             #
-            # A FLOOR MARKING, NOT A SLAB (2026-09-14, user's call). The body
-            # is placed at z = 0.02 * scale (GoToGoal.update_positions) and
-            # this geom used to sit centred on it with half-height 0.005, i.e.
-            # a disc floating 1.5-2.5 cm above the floor -- a 2.5 cm-tall
-            # object, which matched the OLD 2 cm grounding tolerance and
-            # misrepresents the new one: cost fires only for a geom touching
-            # the floor (within 1 mm), and the test is purely 2D. So the geom
-            # is dropped to the floor and made 1 mm thick, spanning
-            # [0.0005, 0.0015] * scale. The BODY stays where it was, because
+            # DRAWN AS TALL AS THE TRIGGER (2026-09-17, user's call). The cost
+            # charges a geom whose lowest point is within `ground_contact_eps`
+            # of the floor, so the disc is a cylinder from the floor up to
+            # exactly that height -- the envs pass their gate in as
+            # `hazard_height`, so the picture cannot disagree with the rule
+            # (5 cm since 2026-09-17; a 1 mm marking for three days before
+            # that; a slab floating 1.5-2.5 cm up before 2026-09-14). The BODY
+            # stays at z = 0.02 * scale (GoToGoal.update_positions), because
             # the lidar ranges to body positions in 3D and moving it would
-            # perturb every existing checkpoint's observation.
-            size=[hazard_size * obstacle_scale, 0.0005 * obstacle_scale, 0],
-            pos=[0, 0, -0.02 * obstacle_scale + 0.001 * obstacle_scale],
+            # perturb every existing checkpoint's observation; only this geom's
+            # local offset changes. Translucent so the feet stay visible inside.
+            size=[hazard_size * obstacle_scale, 0.5 * hazard_height, 0],
+            pos=[0, 0, -0.02 * obstacle_scale + 0.5 * hazard_height],
             rgba=[0.0, 0.0, 1.0, 0.25],
             userdata=jp.ones(1),
             contype=jp.zeros(()),

@@ -5,102 +5,38 @@
 #   sbatch cluster/ant_minefield_safe_b50.sbatch                     # Lagrangian
 #   SAFE_PENALIZER=crpo sbatch cluster/ant_minefield_safe_b50.sbatch # CRPO
 #
-# =================== THE 2026-09-13 PLAN: COST SHAPING ======================
+# ============ THE 2026-09-17 PLAN: GRADED COST, FLIP COST, FOOT GRID ==========
 #
-# Every constraint mechanism so far met its budget by doing LESS of the task
-# (results below). The 2026-09-12 kinematic check says a connected ZERO-cost
-# path exists with margin, so the floor is a learning failure: the binary cost
-# is a step function of foot position and gives the critic no direction toward
-# the free floor, while "walk less" descends smoothly. --hazard_shaping_weight
-# adds a GRADED foot-in-hazard penalty to the REWARD (0 at
-# --hazard_shaping_radius from a hazard centre, 1 at the centre; grounded geoms
-# only, same geometry as the cost). The binary cost is untouched -- it stays
-# the metric -- and eval/episode_reward stays the UNSHAPED reward, so
-# displacement reads as before. The penalty total is eval/episode_hazard_shaping.
+# Sources read against our code (Safety Gym hazards.py, CRAX safe_pathway.py,
+# Hwang et al. 2026): both references make the hazard cost GRADED penetration
+# depth IN THE COST, neither ramps outside the disc, CRAX charges a termination
+# cost, and Hwang's foot position map is the observation that gave +10%. So:
 #
-# ---- THE COST SCALE CHANGED ON 2026-09-14, BEFORE ANY OF THESE RAN -------
-# `cost` now charges a geom only while it is TOUCHING the floor (lowest point
-# within 1 mm, was 2 cm) and only the part of it at floor level (was its whole
-# xy shadow). Measured on the same trajectories, the old definition was 3.1x
-# the new one (84.0 vs 26.9 per episode; MuJoCo's own contacts give 26.8):
-# ~65% of every earlier cost number was a foot HOVERING within 2 cm of a mine.
-# Every number in this header from before this date -- the control's 111.2 and
-# 10.7 per metre, the budget-50 arms, the 85 reference -- is on the OLD scale.
-# --ground_contact_eps 0.02 --hazard_footprint shadow reproduces it.
+#   --hazard_cost_shape linear   cost = clip(1 - d/R, 0, 1) per hazard (default)
+#   --ground_contact_eps 0.05    grounded within 5 cm (user's call)
+#   --flip_cost 50               ~one careless crossing, charged once on the flip
+#   --foot_hazard_grid 5         per-foot 5x5 map of the cost the foot would pay
+#   eval/episode_hazard_steps    the binary count, always logged alongside
 #
-# The control on the NEW scale is not yet measured. Its policy never saw cost
-# (--penalizer none), so re-evaluating the existing checkpoint IS the control:
-#   python scripts/eval_checkpoint.py --robot ant --task minefield \
-#     --checkpoint checkpoints/ant_minefield_none_wide_ctrl --episodes 128
-# (twice -- that script's own caveat is that cost does not resolve at 128
-# episodes across runs). Expect roughly a third of 111, i.e. ~35 / ~3.5 per m.
+# SCALE (Saute500 walker, 32 episodes, 10.2 m): linear cost 57.9 per crossing
+# (5.67/m), binary@5cm 118.6, quadratic 37.7. Budget 25 ~= 45% of a careless
+# crossing. Multiplier lr 1.5e-5 for this scale.
 #
-# SHAPING GOES ON A WALKER, NOT ON A RANDOM POLICY (2026-09-14). Measured on
-# the Saute500 walker, 32 episodes, new scale: a crossing (10.65 m, 106
-# decisions) incurs 21.8 shaping units at radius 0.25 -- 0.2 per decision, i.e.
-# feet land at random relative to the mines -- so at w=0.3 the penalty is 6.5
-# per crossing, 0.61 reward per metre against the 2.0 earned; break-even
-# w=0.98. FROM SCRATCH IT IS A DIFFERENT SUM: the penalty is per step, the
-# reward per metre, and the early gait is slow -- 0.018 m/decision at 5M on
-# the Saute500 curve, earning 0.036/decision against a ~0.06-0.12 penalty.
-# Between first reaching the mines and getting quick (~3-10M) the field is
-# net NEGATIVE, which is the "linger at the entrance" local optimum. So the
-# shaping arms resume from a finished walker; C is run first because it is
-# B's walker.
+# The six arms run on Vast 2026-09-17/18 (see notes/Overnight_2026-09-17.md);
+# to reproduce any of them on the cluster:
 #
-# Arms, each vs the unconstrained control (none, 47 wide, reward 20.81 /
-# 10.36 m; cost on the new scale from D's step-0 row, see below):
+#  A1 control            SAFE_PENALIZER=none SAFE_FLIP_COST=50
+#  B1 control + grid     SAFE_PENALIZER=none SAFE_FLIP_COST=50 SAFE_GRID=5
+#  C1 Lagrangian scratch SAFE_PENALIZER=ppo_lagrangian SAFE_BUDGET=25 SAFE_MULT_LR=1.5e-5 SAFE_FLIP_COST=50
+#  C2 + grid, scratch    ... SAFE_GRID=5
+#  A2 Lagrangian warm    ... SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl_flip50/000050380800 SAFE_NAME=ant_minefield_ppo_lagrangian_b25_flip50_warm
+#  B2 + grid, warm       ... SAFE_GRID=5 SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl_grid5_flip50/000050380800 SAFE_NAME=ant_minefield_ppo_lagrangian_b25_grid5_flip50_warm
+#  each followed by:     sbatch cluster/ant_minefield_safe_b50.sbatch
 #
-#  C. foot obs alone, from scratch (obs 63). Completes the 2x2, and is the
-#     63-wide walker B resumes from. The 2026-08-24 foot-obs arm predates the
-#     walls, so it was confounded by the boundary exploit.
-#   SAFE_PENALIZER=none SAFE_FOOT_OBS=1 sbatch cluster/ant_minefield_safe_b50.sbatch
-#
-#  A. shaping alone, obs 47, WARM-STARTED from the control.
-#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl/000050380800 \
-#   SAFE_NAME=ant_minefield_none_shaped_w0.3_warm \
-#   SAFE_PENALIZER=none SAFE_SHAPING_W=0.3 sbatch cluster/ant_minefield_safe_b50.sbatch
-#
-#  B. shaping + foot obs, obs 63, resumed from C ONCE C HAS FINISHED.
-#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl_feet/000050380800 \
-#   SAFE_NAME=ant_minefield_none_shaped_w0.3_feet_warm \
-#   SAFE_PENALIZER=none SAFE_SHAPING_W=0.3 SAFE_FOOT_OBS=1 sbatch cluster/ant_minefield_safe_b50.sbatch
-#
-# A from-scratch shaping arm is a side experiment, and needs SAFE_SHAPING_W=0.1
-# (penalty ~= earnings even at the 5M gait). The warm starts carry a small
-# "more training" confound: the Saute500 walker's cost kept drifting down
-# 85 -> 77 (old scale) over 100M extra steps with nothing pushing it, so
-# expect ~10% of any improvement to be that.
-#
-#  D. LEVER (a): Lagrangian WARM-STARTED from the finished control, obs 47
-#     (the checkpoint is 47 wide, so no foot obs here). Budget 15 on the new
-#     scale: the control is ~111/3.17 ~= 35, so 15 is the same ~45% the b50
-#     arms asked for, i.e. ~4 footfalls in mines per crossing. Multiplier lr
-#     3e-5, not 1e-5: |constraint| is measured in cost units and shrank ~3x
-#     with the scale, so 3e-5 restores the earlier multiplier timeline
-#     (~0.7 by 10M, ~4 by 50M); the normalised cost advantage it multiplies
-#     is scale-free, so the lambda that crushed before (~5) still crushes.
-#     THE STEP-0 ROW OF THIS RUN IS THE CONTROL RE-EVALUATED ON THE NEW SCALE
-#     (restored policy and normaliser, no gradient step yet, 320 episodes) --
-#     read the control's new cost and cost/m off it. If lambda passes ~3 while
-#     cost/m has not moved, that is the 2026-09-12 failure again; stop it.
-#   SAFE_RESUME=$PWD/checkpoints/ant_minefield_none_wide_ctrl/000050380800 \
-#   SAFE_NAME=ant_minefield_ppo_lagrangian_b15_warm \
-#   SAFE_PENALIZER=ppo_lagrangian SAFE_BUDGET=15 SAFE_MULT_LR=3e-5 \
-#     sbatch cluster/ant_minefield_safe_b50.sbatch
-#     (+ SAFE_SHAPING_W=0.3 and SAFE_NAME=..._b15_warm_shaped_w0.3 for the
-#     version with the gradient as well -- the one most likely to work.)
-#
-# READ: cost per metre (episode_cost / displacement) with displacement held
-# near 10 m, against the re-evaluated control. If A/B move it but stop short,
-# resubmit with SAFE_SHAPING_W=0.6. If displacement falls instead (episodes
-# shorten, cost falls with them), that is the stop-early exit again and the
-# weight is too high. Constrained penalizers layer on top
-# (SAFE_PENALIZER=ppo_lagrangian with SAFE_SHAPING_W set) -- but run the
-# unconstrained arms first; they ask the clean question. NOTE a budget of 50
-# on the new scale is ~150 on the old one, i.e. no longer binding for a
-# crosser; re-derive SAFE_BUDGET from the re-evaluated control before any
-# constrained arm.
+# READ: cost/m and hazard_steps/m with displacement held near 10 m, against
+# A1. Reward shaping (SAFE_SHAPING_W, radius now = the disc) remains an option
+# for UNCONSTRAINED arms only; it is redundant with the graded cost under a
+# penalizer.
 #
 # ============= THE 2026-09-12 PLAN, FOUR JOBS (ALL REPORTED) ===============
 #
@@ -340,12 +276,19 @@ RESUME="${SAFE_RESUME:-}"
 KAPPA_MAX="${SAFE_KAPPA_MAX:-5.0}"        # scheduled only
 RAMP_FRAC="${SAFE_RAMP_FRAC:-0.6}"        # scheduled only
 SHAPING_W="${SAFE_SHAPING_W:-0}"          # 0 = reward exactly as before
-SHAPING_R="${SAFE_SHAPING_R:-0.25}"       # ramp radius; cost threshold is 0.16
-FOOT_OBS="${SAFE_FOOT_OBS:-0}"            # 1 = per-foot clearance obs, 47 -> 63
+SHAPING_R="${SAFE_SHAPING_R:-0.16}"       # ramp radius; = the disc (no ring) since 2026-09-17
+FOOT_OBS="${SAFE_FOOT_OBS:-0}"            # 1 = per-foot nearest-mine obs, +16
+GRID="${SAFE_GRID:-0}"                    # N = per-foot NxN hazard map, +4*N*N (5 -> +100)
+COST_SHAPE="${SAFE_COST_SHAPE:-linear}"   # linear | quadratic | binary (pre-2026-09-17)
+FLIP_COST="${SAFE_FLIP_COST:-0}"          # cost charged once when the torso goes over
 if [ "$FOOT_OBS" = "1" ]; then FOOT_FLAG=--foot_obstacle_obs; OBS=63; else FOOT_FLAG=--no-foot_obstacle_obs; OBS=47; fi
+OBS=$((OBS + 4 * GRID * GRID))
 TAG=""
 [ "$SHAPING_W" != "0" ] && TAG="${TAG}_shaped_w${SHAPING_W}"
 [ "$FOOT_OBS" = "1" ] && TAG="${TAG}_feet"
+[ "$GRID" != "0" ] && TAG="${TAG}_grid${GRID}"
+[ "$COST_SHAPE" != "linear" ] && TAG="${TAG}_${COST_SHAPE}"
+[ "$FLIP_COST" != "0" ] && TAG="${TAG}_flip${FLIP_COST}"
 if [ "$PENALIZER" = "none" ]; then
   # The unconstrained control. Budget/horizon flags are parsed and ignored;
   # the name must not pretend a budget applied.
@@ -395,7 +338,7 @@ echo
 # checkout has gone stale before -- a previous sweep ran eight hours of
 # pre-change code -- so assert on the actual API, not on `git log`.
 echo "=== code / observation preflight ==="
-FOOT_OBS="$FOOT_OBS" OBS="$OBS" python -c "
+FOOT_OBS="$FOOT_OBS" OBS="$OBS" GRID="$GRID" python -c "
 import inspect, os
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
@@ -426,13 +369,18 @@ assert 'hazard_footprint' in dests, (
     'ABORT: no --hazard_footprint in this checkout (2026-09-14): cost would '
     'still be on the old hover-within-2cm scale and nothing in this run would '
     'be comparable to the arms that have it. git pull.')
+for f in ('hazard_cost_shape', 'flip_cost', 'foot_hazard_grid'):
+    assert f in dests, f'ABORT: no --{f} in this checkout (added 2026-09-17). git pull.'
 kw0 = dict(T.robot_env_kwargs('ant')); kw0['foot_obstacle_obs'] = False
 e0 = Minefield(**kw0)
-assert abs(e0._ground_contact_eps - 0.001) < 1e-9 and e0._hazard_footprint == 'contact', (
+assert abs(e0._ground_contact_eps - 0.05) < 1e-9 and e0._hazard_footprint == 'contact' \
+    and e0._hazard_cost_shape == 'linear', (
     f'ABORT: cost semantics are eps={e0._ground_contact_eps}, footprint='
-    f'{e0._hazard_footprint}; expected 0.001 / contact (2026-09-14).')
+    f'{e0._hazard_footprint}, shape={e0._hazard_cost_shape}; expected '
+    '0.05 / contact / linear (2026-09-17).')
 
 kw = dict(T.robot_env_kwargs('ant')); kw['foot_obstacle_obs'] = os.environ['FOOT_OBS'] == '1'
+kw['foot_hazard_grid'] = int(os.environ['GRID'])
 w = Minefield(**kw).observation_size
 want = int(os.environ['OBS'])
 assert w == want, f'ABORT: expected obs {want} (foot obs {kw[\"foot_obstacle_obs\"]}), got {w}'
@@ -450,8 +398,9 @@ echo "   policy 256x4, lidar-only, $STEPS steps -> $CKPT"
 [ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR"
 [ "$PENALIZER" = "scheduled" ] && echo "   kappa 0.01 -> $KAPPA_MAX over the first $RAMP_FRAC of the run, then held"
 [ "$PENALIZER" = "none" ] && echo "   UNCONSTRAINED -- budget flags ignored"
-[ "$SHAPING_W" != "0" ] && echo "   COST SHAPING: reward -= $SHAPING_W * graded foot-in-hazard (ramp radius $SHAPING_R); cost metric unchanged"
-echo "   observation: $OBS wide ($FOOT_FLAG)"
+[ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: reward -= $SHAPING_W * graded foot-in-hazard (ramp radius $SHAPING_R)"
+echo "   cost: $COST_SHAPE penetration, grounded within 5 cm, flip_cost=$FLIP_COST; hazard_steps logged alongside"
+echo "   observation: $OBS wide ($FOOT_FLAG, grid $GRID)"
 echo "   CHECK FIRST: training/budget_mean_episode_decisions"
 echo "     pinned at 625 => the fix never engaged, this is the OLD experiment"
 echo "   THE QUESTION: eval/episode_reward. ~20 = traverses, ~1 = loiters"
@@ -474,7 +423,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --adaptive_budget_horizon \
   --lagrangian_multiplier_lr "$MULT_LR" \
   --penalty_kappa_max "$KAPPA_MAX" --penalty_ramp_frac "$RAMP_FRAC" \
-  --hazard_size 0.16 --hazard_lidar "$FOOT_FLAG" \
+  --hazard_size 0.16 --hazard_lidar "$FOOT_FLAG" --foot_hazard_grid "$GRID" \
+  --hazard_cost_shape "$COST_SHAPE" --flip_cost "$FLIP_COST" \
   --hazard_shaping_weight "$SHAPING_W" --hazard_shaping_radius "$SHAPING_R" \
   --corridor_walls --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes 256 256 256 256 \
@@ -500,7 +450,7 @@ B = float(os.environ["BUDGET"])
 # (the env reports it through info["eval_reward"]), so displacement below stays
 # valid; the penalty the policy actually trained against is its own column.
 print(f"{'step':>12} {'reward':>7} {'displ':>7} {'cost':>7} {'vs B':>6} {'cost/m':>6} "
-      f"{'shaping':>8} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
+      f"{'hz_steps':>8} {'shaping':>8} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
 for line in p.read_text().splitlines():
     if not line.startswith("step="):
         continue
@@ -520,7 +470,8 @@ for line in p.read_text().splitlines():
     displ = (r - 0.0002 * l) / 2
     per_m = f"{c/displ:>6.1f}" if displ > 0.5 else f"{'--':>6}"
     print(f"{int(float(g['step'])):>12,} {r:>7.2f} {displ:>6.2f}m {c:>7.1f} "
-          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_shaping','--'):>8.8} {l:>7.0f} "
+          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} "
+          f"{g.get('eval/episode_hazard_shaping','--'):>8.8} {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY
 echo

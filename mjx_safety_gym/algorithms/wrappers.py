@@ -34,7 +34,7 @@ class CostEpisodeWrapper(brax_training.EpisodeWrapper):
     # scan, like reward -- anything left out reads as its last inner step only.
     # `hazard_shaping` (RunForward, 2026-09-13) is the graded foot-in-hazard
     # term; it is here so eval/episode_hazard_shaping is an exact episode total.
-    _SUMMED_INFO_KEYS = ("cost", "eval_reward", "hazard_shaping")
+    _SUMMED_INFO_KEYS = ("cost", "eval_reward", "hazard_shaping", "hazard_steps")
 
     def step(self, state: State, action: jax.Array) -> State:
         def f(state, _):
@@ -356,6 +356,12 @@ class EpisodeStatsWrapper(Wrapper):
         zero = jp.zeros_like(state.reward)
         state.info["ep_return"] = zero
         state.info["ep_return_last"] = zero
+        # Episode COST, latched like the return (2026-09-17), so a design can
+        # be scored on safety as well as time -- design.py objective
+        # "safe_time". Reads info["cost"] as summed per decision by
+        # CostEpisodeWrapper; zero when the env carries no cost.
+        state.info["ep_cost"] = zero
+        state.info["ep_cost_last"] = zero
         state.info["ep_len_last"] = zero
         state.info["ep_arrived_last"] = zero
         state.info["ep_count"] = zero
@@ -396,6 +402,12 @@ class EpisodeStatsWrapper(Wrapper):
             state.info["arrived"] = jp.where(
                 finished, jp.zeros_like(arrived), arrived
             )
+
+        running_cost = state.info["ep_cost"] + state.info.get("cost", jp.zeros_like(running))
+        state.info["ep_cost_last"] = jp.where(
+            finished, running_cost, state.info["ep_cost_last"]
+        )
+        state.info["ep_cost"] = jp.where(finished, jp.zeros_like(running), running_cost)
 
         state.info["ep_count"] = state.info["ep_count"] + done
         state.info["ep_return"] = jp.where(finished, jp.zeros_like(running), running)

@@ -101,6 +101,13 @@ echo
 STEPS="${STEPS:-240000000}"
 DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
 DESIGN_LR="${DESIGN_LR:-0.03}"
+# 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
+# DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
+# nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
+# is the morphology-safety question. Default keeps the time-only objective.
+DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-time}"
+DESIGN_COST_WEIGHT="${DESIGN_COST_WEIGHT:-0}"
+FLIP_COST="${FLIP_COST:-0}"
 NUM_EVALS="${NUM_EVALS:-9}"
 RESUME="${RESUME:-/root/MorphoSafety/checkpoints/codesign_resume_src/000060293120}"
 NAME="${NAME:-ant_codesign_r$(date -u +%m%d%H%M)}"
@@ -210,7 +217,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
   --corridor_walls --boundary_cost_weight 0 \
   --design_optimization \
-  --design_objective time \
+  --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
+  --flip_cost "$FLIP_COST" \
   --num_morphologies 16 \
   --design_components 8 \
   --design_updates_per_eval 8 \
