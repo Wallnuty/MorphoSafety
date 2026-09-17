@@ -39,3 +39,5 @@ Items 1–3 are ~80 lines and change the budget's units (penetration units, ~0.8
 If you want to stay closer to safe-RL-proper: PPO-Lagrangian with the PID multiplier update (Stooke et al.) is the standard strong baseline. Skip CPO — Ray et al. found it performs surprisingly poorly on Safety Gym relative to Lagrangian methods. In the legged world, Kim et al. use IPO with adaptive constraint thresholding and note that CPO's optimization cost grows linearly in the number of constraints. 
 OpenAI
 arxiv
+
+7. . The per-foot encoder is the cheap upgrade if we ever want one — 100 inputs is small enough that it hasn't been needed.

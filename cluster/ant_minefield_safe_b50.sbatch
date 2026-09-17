@@ -281,6 +281,7 @@ FOOT_OBS="${SAFE_FOOT_OBS:-0}"            # 1 = per-foot nearest-mine obs, +16
 GRID="${SAFE_GRID:-0}"                    # N = per-foot NxN hazard map, +4*N*N (5 -> +100)
 COST_SHAPE="${SAFE_COST_SHAPE:-linear}"   # linear | quadratic | binary (pre-2026-09-17)
 FLIP_COST="${SAFE_FLIP_COST:-0}"          # cost charged once when the torso goes over
+NUM_EVALS="${SAFE_NUM_EVALS:-11}"         # evals per run; 11 = every 5M of a 50M run
 if [ "$FOOT_OBS" = "1" ]; then FOOT_FLAG=--foot_obstacle_obs; OBS=63; else FOOT_FLAG=--no-foot_obstacle_obs; OBS=47; fi
 OBS=$((OBS + 4 * GRID * GRID))
 TAG=""
@@ -429,7 +430,7 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --corridor_walls --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes 256 256 256 256 \
   --num_envs 1024 --num_minibatches 32 \
-  --num_timesteps "$STEPS" --num_evals 11 \
+  --num_timesteps "$STEPS" --num_evals "$NUM_EVALS" \
   --checkpoint_logdir "$CKPT" "$@"
 status=$?
 
