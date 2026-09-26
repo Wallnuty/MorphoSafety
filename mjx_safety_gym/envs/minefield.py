@@ -120,3 +120,5 @@ class Minefield(RunForward):
         # override on a corridor task has to end with this line too.
         if self._corridor_walls:
             self._add_corridor_walls(mjSpec)
+        if self._finish_line:
+            self._add_finish_line(mjSpec)

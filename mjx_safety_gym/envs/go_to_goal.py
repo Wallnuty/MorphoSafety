@@ -183,6 +183,14 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # landed there. 0 = off. See foot_hazard_grid_observations.
         foot_hazard_grid: int = 0,
         foot_hazard_grid_spacing: float = 0.08,
+        # Per-foot map on concentric RINGS with doubling radii instead of a
+        # square grid (Miki et al. 2022's foot-centred sampling): `rings`
+        # circles of `ring_points` samples each at radii r0, 2 r0, 4 r0, ...
+        # (x arena_scale), plus the foot's own point. Same value per sample as
+        # the grid. 0 = off. 4 rings x 8 points + 1 = 33 per foot.
+        foot_hazard_rings: int = 0,
+        foot_hazard_ring_points: int = 8,
+        foot_hazard_ring_r0: float = 0.08,
     ):
         if robot not in _ROBOT_XMLS:
             raise ValueError(
@@ -275,6 +283,11 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             raise ValueError("foot_hazard_grid must be >= 0 and its spacing > 0")
         self._foot_hazard_grid = int(foot_hazard_grid)
         self._foot_hazard_grid_spacing = float(foot_hazard_grid_spacing)
+        if int(foot_hazard_rings) < 0 or int(foot_hazard_ring_points) < 1 or float(foot_hazard_ring_r0) <= 0:
+            raise ValueError("foot_hazard_rings >= 0, ring_points >= 1, ring_r0 > 0")
+        self._foot_hazard_rings = int(foot_hazard_rings)
+        self._foot_hazard_ring_points = int(foot_hazard_ring_points)
+        self._foot_hazard_ring_r0 = float(foot_hazard_ring_r0)
 
         # Keepouts scale with the arena, otherwise a large robot spawns
         # overlapping the obstacles it is supposed to avoid.
@@ -770,6 +783,13 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         """Boolean (H,): which hazards are currently charging cost."""
         return self.hazard_distances(data) <= self._hazard_radius
 
+    @property
+    def sim_dt(self) -> float:
+        """Simulated seconds per env step: `step` integrates n_substeps=2 model
+        timesteps. 0.02 s for the ants (timestep 0.01). Used to turn
+        episode length into seconds for eval/episode_speed."""
+        return 2.0 * float(self._mj_model.opt.timestep)
+
     def hazard_depths(self, data: mjx.Data) -> jax.Array:
         """Penetration depth per hazard, (H,) in [0, 1]: 0 at the rim, 1 with a
         grounded geom's surface at the centre. THE COST under
@@ -1018,12 +1038,23 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             return None
         n = self._foot_hazard_grid
         spacing = self._foot_hazard_grid_spacing * self._arena_scale
+        offs = (jp.arange(n, dtype=jp.float32) - (n - 1) / 2.0) * spacing
+        gx, gy = jp.meshgrid(offs, offs, indexing="ij")                     # (n, n)
+        local = jp.stack([gx.ravel(), gy.ravel()], axis=-1)                 # (n*n, 2)
+        return self._foot_cost_samples(data, local).ravel()
+
+    def _foot_cost_samples(self, data: mjx.Data, local: jax.Array) -> jax.Array:
+        """(F, P): the linear penetration cost each foot would pay with its
+        centre at each of P offsets, given in the torso YAW frame (x forward,
+        y left) relative to that foot's TOE. Shared by the grid and the rings.
+
+        The toe -- the capsule's lower axis endpoint -- not geom_xpos, which is
+        the capsule's midpoint and sits ~3-4 cm behind the toe and 7 cm up on a
+        60-degree lower leg. Uses hazard BODY positions and the foot geom's
+        live radius, so it follows morphology changes.
+        """
         radius, half_len = self._robot_geom_extent()
         foot_ids = self._robot_collision_geom_ids_arr[self._foot_geom_cols]
-        # Centre the grid on the TOE -- the capsule's lower axis endpoint --
-        # not on geom_xpos, which is the capsule's midpoint and sits ~3-4 cm
-        # behind the toe and 7 cm up on a 60-degree lower leg. The toe is what
-        # touches the floor and what the cost is charged on.
         gpos = data.geom_xpos[foot_ids]                                     # (F, 3)
         axis = data.geom_xmat[foot_ids].reshape(-1, 3, 3)[:, :, 2]          # (F, 3)
         h = half_len[self._foot_geom_cols]
@@ -1033,16 +1064,33 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         mat = data.xmat[self._robot_body_id].reshape(3, 3)
         yaw = jp.arctan2(mat[1, 0], mat[0, 0])
         c, s = jp.cos(yaw), jp.sin(yaw)
-        offs = (jp.arange(n, dtype=jp.float32) - (n - 1) / 2.0) * spacing
-        gx, gy = jp.meshgrid(offs, offs, indexing="ij")                     # (n, n)
-        lx, ly = gx.ravel(), gy.ravel()                                     # (n*n,)
-        world = jp.stack([c * lx - s * ly, s * lx + c * ly], axis=-1)       # (n*n, 2)
-        cells = foot_xy[:, None, :] + world[None, :, :]                     # (F, n*n, 2)
+        lx, ly = local[:, 0], local[:, 1]
+        world = jp.stack([c * lx - s * ly, s * lx + c * ly], axis=-1)       # (P, 2)
+        cells = foot_xy[:, None, :] + world[None, :, :]                     # (F, P, 2)
         hazard_xy = data.xpos[jp.array(self._hazard_body_ids)][:, :2]      # (H, 2)
         d = jp.linalg.norm(cells[:, :, None, :] - hazard_xy[None, None, :, :], axis=-1)
-        surface = jp.min(d, axis=-1) - r_foot[:, None]                      # (F, n*n)
-        depth = jp.clip(1.0 - surface / self._hazard_radius, 0.0, 1.0)
-        return depth.ravel()
+        surface = jp.min(d, axis=-1) - r_foot[:, None]                      # (F, P)
+        return jp.clip(1.0 - surface / self._hazard_radius, 0.0, 1.0)
+
+    def foot_hazard_ring_observations(self, data: mjx.Data) -> Optional[jax.Array]:
+        """Per-foot samples on rings of doubling radius (see __init__)."""
+        if not self._foot_hazard_rings or self._foot_geom_cols.size == 0:
+            return None
+        k = self._foot_hazard_ring_points
+        ang = 2.0 * jp.pi * jp.arange(k, dtype=jp.float32) / k
+        radii = self._foot_hazard_ring_r0 * self._arena_scale * (
+            2.0 ** jp.arange(self._foot_hazard_rings, dtype=jp.float32)
+        )
+        pts = [jp.zeros((1, 2), dtype=jp.float32)]                          # the toe itself
+        for r in radii:
+            pts.append(jp.stack([r * jp.cos(ang), r * jp.sin(ang)], axis=-1))
+        local = jp.concatenate(pts, axis=0)                                 # (1 + rings*k, 2)
+        return self._foot_cost_samples(data, local).ravel()
+
+    def foot_hazard_ring_observation_size(self) -> int:
+        if not self._foot_hazard_rings or self._foot_geom_cols.size == 0:
+            return 0
+        return int(self._foot_geom_cols.size) * (1 + self._foot_hazard_rings * self._foot_hazard_ring_points)
 
     def foot_hazard_grid_observation_size(self) -> int:
         if not self._foot_hazard_grid or self._foot_geom_cols.size == 0:
@@ -1062,6 +1110,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         grid = self.foot_hazard_grid_observations(data)
         if grid is not None:
             parts.append(grid)
+        rings = self.foot_hazard_ring_observations(data)
+        if rings is not None:
+            parts.append(rings)
         if self._morphology_conditioning:
             parts.append(self._morphology_genes)
         return jp.hstack(parts)
@@ -1282,6 +1333,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         size += self.task_observation_size()
         size += self.foot_obstacle_observation_size()
         size += self.foot_hazard_grid_observation_size()
+        size += self.foot_hazard_ring_observation_size()
         if self._morphology_conditioning:
             size += NUM_GENES
         return size

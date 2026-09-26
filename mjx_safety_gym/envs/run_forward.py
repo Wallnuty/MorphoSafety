@@ -209,6 +209,17 @@ class RunForward(GoToGoal):
         # CostEpisodeWrapper keeps stepping the inner env after `done` within
         # a decision and the ant stays flipped. 0.0 = off (every earlier run).
         flip_cost: float = 0.0,
+        # FINISH LINE instead of a goal point (2026-09-20, user's call). The
+        # goal cylinder at (finish_x, 0) is replaced by a green line across the
+        # corridor at x = finish_x: arrival is x >= finish_x at ANY y, the goal
+        # observation becomes heading error to the +x axis plus distance to
+        # the line, and the goal-distance reward term is dropped so the reward
+        # is displacement in x alone (plus the healthy bonus). Observation
+        # WIDTH is unchanged (still 3 task dims), so checkpoints trained with
+        # the point goal load as-is -- near the centreline the two bearings
+        # differ by the lateral offset over 5-11 m of range, under ~10 deg.
+        # Return for a full crossing halves (~10.5 instead of ~21).
+        finish_line: bool = False,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -251,7 +262,10 @@ class RunForward(GoToGoal):
             if goal_radius is None
             else float(goal_radius)
         )
-        self._goal_reward_weight = float(goal_reward_weight)
+        self._finish_line = bool(finish_line)
+        # Under a finish line the reward is dx only: the goal-distance term is
+        # the Euclidean distance to a POINT and would pull the ant toward y=0.
+        self._goal_reward_weight = 0.0 if self._finish_line else float(goal_reward_weight)
         self._goal_observation = bool(goal_observation)
 
         # Robots start at -L/2 + margin and run toward +L/2. Obstacles fill the
@@ -299,6 +313,27 @@ class RunForward(GoToGoal):
         )
         if self._corridor_walls:
             self._add_corridor_walls(mjSpec)
+        if self._finish_line:
+            self._add_finish_line(mjSpec)
+
+    def _add_finish_line(self, spec: mj.MjSpec) -> None:
+        """A green strip across the corridor at x = finish_x, and the goal
+        cylinder made invisible. Visual only (contype 0); arrival is decided
+        by `at_goal` on the robot's x, not by touching this geom."""
+        a = self._arena_scale
+        spec.worldbody.add_geom(
+            name="finish_line_geom",
+            type=mj.mjtGeom.mjGEOM_BOX,
+            pos=[self._finish_x, 0.0, 0.001 * a],
+            size=[0.03 * a, self._corridor_half_width, 0.001 * a],
+            rgba=[0.1, 0.9, 0.2, 0.9],
+            contype=jp.zeros(()),
+            conaffinity=jp.zeros(()),
+        )
+        goal = next((b for b in spec.worldbody.bodies if b.name == "goal"), None)
+        if goal is not None:
+            for g in goal.geoms:
+                g.rgba = [0, 1, 0, 0.0]
 
     def _add_corridor_walls(self, spec: mj.MjSpec) -> None:
         """Two static boxes that make the corridor PHYSICAL rather than a cost.
@@ -603,6 +638,8 @@ class RunForward(GoToGoal):
         knife edge either: the trained conditioned policy closed to within
         0.01-0.09 m of the centre on all eight bodies.
         """
+        if self._finish_line:
+            return (data.site_xpos[self._robot_site_id][0] >= self._finish_x).astype(jp.float32)
         return (self.goal_distance(data) <= self._goal_radius).astype(jp.float32)
 
     def task_observations(self, data: mjx.Data) -> jax.Array | None:
@@ -619,9 +656,15 @@ class RunForward(GoToGoal):
         """
         if not self._goal_observation:
             return None
-        delta = self._goal_xy(data) - data.site_xpos[self._robot_site_id][:2]
         mat = data.xmat[self._robot_body_id].reshape(3, 3)
         yaw = jp.arctan2(mat[1, 0], mat[0, 0])
+        if self._finish_line:
+            # The nearest point of the line is always straight ahead in +x, so
+            # the bearing is simply minus the heading, and the range is the
+            # remaining x. Same three slots, same scaling, as the point goal.
+            remaining = self._finish_x - data.site_xpos[self._robot_site_id][0]
+            return jp.array([jp.cos(-yaw), jp.sin(-yaw), remaining / self._corridor_length])
+        delta = self._goal_xy(data) - data.site_xpos[self._robot_site_id][:2]
         rel = jp.arctan2(delta[1], delta[0]) - yaw
         # Range is normalised by the corridor length so it stays O(1) --
         # observations are NOT normalised anywhere in this stack
@@ -777,6 +820,13 @@ class RunForward(GoToGoal):
             # eval/episode_hazard_steps -- the pre-2026-09-17 cost, kept so a
             # graded cost number can still be read as "steps in mines".
             "hazard_steps": jp.zeros(()),
+            # Exact +x displacement THIS step (from data, never carried), summed
+            # by CostEpisodeWrapper and latched per episode by
+            # EpisodeStatsWrapper. Basis of eval/episode_dx and
+            # eval/episode_speed -- the walking metric (2026-09-18, user's
+            # call): displacement over episode time, reported alongside return
+            # always, and the default co-design objective.
+            "dx": jp.zeros(()),
         }
         if self._hazard_shaping_weight:
             # Both keys in reset AND step, same gate, or the auto-reset wrapper
@@ -801,6 +851,9 @@ class RunForward(GoToGoal):
 
         cost = self.get_cost(data)
         state.info["hazard_steps"] = jp.sum(self.hazard_contacts(data)).astype(jp.float32)
+        state.info["dx"] = (
+            data.site_xpos[self._robot_site_id][0] - state.data.site_xpos[self._robot_site_id][0]
+        )
         if self._flip_cost:
             went_over = self.is_flipped(data) * (1.0 - self.is_flipped(state.data))
             cost = cost + self._flip_cost * went_over

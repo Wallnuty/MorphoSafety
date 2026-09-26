@@ -522,7 +522,7 @@ class DesignLoop:
         self.steps_after_update = int(steps_after_update)
         self.chop_freq = chop_freq
         self.ema = float(ema)
-        if objective not in ("time", "return", "safe_time"):
+        if objective not in ("time", "return", "safe_time", "speed"):
             raise ValueError(f"unknown design objective {objective!r}")
         self.objective = objective
         self.action_repeat = int(action_repeat)
@@ -535,7 +535,7 @@ class DesignLoop:
         self.cost_weight = float(cost_weight)
         if objective == "safe_time" and self.cost_weight <= 0.0:
             raise ValueError("objective='safe_time' needs cost_weight > 0")
-        if objective in ("time", "safe_time"):
+        if objective in ("time", "safe_time", "speed"):
             if not max_decisions or not return_ceiling:
                 raise ValueError(
                     "objective='time' needs max_decisions and return_ceiling"
@@ -684,6 +684,29 @@ class DesignLoop:
         decisions = (
             np.asarray(info["ep_len_last"]).reshape(shape) / self.action_repeat
         )
+        if self.objective == "speed":
+            # THE DEFAULT SINCE 2026-09-18 (user's call): distance travelled per
+            # decision. Net +x displacement of the episode over its duration --
+            # but a NON-arrival is charged the full horizon, not the time it
+            # actually lasted, or "dash two metres and fall over" would score
+            # like a crossing. With that charge it is monotone in both distance
+            # and time and needs no arrival/miss special-casing: an arrival at
+            # 100 decisions scores 10.5/100, a 3 m flip 3/625. Higher is better,
+            # so it is returned un-negated. Requires info["ep_dx_last"], which
+            # the corridor tasks provide (RunForward info["dx"]).
+            if "ep_dx_last" not in info:
+                raise KeyError("objective='speed' needs info['ep_dx_last'] (corridor tasks only)")
+            dx = np.asarray(info["ep_dx_last"]).reshape(shape)
+            charged = np.where(arrived, decisions, float(self.max_decisions))
+            speed = dx / np.maximum(charged, 1.0)
+            self._aux = {
+                "design/speed_mean": float(speed.mean()),
+                "design/arrival_rate": float(arrived.mean()),
+                "design/arrival_decisions": (
+                    float(decisions[arrived].mean()) if arrived.any() else float("nan")
+                ),
+            }
+            return speed.mean(axis=1), counts
         shortfall = np.clip(1.0 - ret / self.return_ceiling, 0.0, 1.0)
         fitness = np.where(
             arrived, decisions, self.max_decisions * (1.0 + shortfall)

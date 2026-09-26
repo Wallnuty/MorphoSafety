@@ -24,6 +24,7 @@ from brax.envs.wrappers import training as brax_training
 from mujoco_playground import wrapper as playground_wrapper
 
 from mjx_safety_gym import jax_cache
+from mjx_safety_gym import numerics
 from mjx_safety_gym import design as design_lib
 from mjx_safety_gym import morphology as morphology_lib
 from mjx_safety_gym.algorithms.penalizers import get_penalizer
@@ -98,7 +99,7 @@ _ROBOT_DEFAULTS = {
         "action_repeat": 4, "episode_length": 1000, "discounting": 0.9,
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
-        "terminate_on_goal": True, "foot_obstacle_obs": False, "foot_hazard_grid": 0,
+        "terminate_on_goal": True, "foot_obstacle_obs": False, "foot_hazard_grid": 0, "finish_line": True,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -175,7 +176,13 @@ _ROBOT_DEFAULTS = {
         # losing to a free exploit rather than on merit; what is measured is
         # that it does not lower hazard cost on the objective as it stands.
         # Pass --foot_obstacle_obs to get it back.
-        "foot_obstacle_obs": False, "foot_hazard_grid": 0,
+        #
+        # PER-FOOT 7x7 HAZARD GRID ON (2026-09-25, final recipe). The grid is
+        # what let the Lagrangian act on foot placement (2026-09-18: cost -35%
+        # with the traverse intact; without it, nothing), and 7x7 beat 5x5 in
+        # the 2026-09-21 A/B (cost 43.3 vs 53.8, speed 1.08 vs 0.99). Obs
+        # 47 -> 243. Older checkpoints load through _env_kwarg_candidates.
+        "foot_obstacle_obs": False, "foot_hazard_grid": 7, "finish_line": True,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -279,7 +286,7 @@ _ROBOT_DEFAULTS = {
         # losing to a free exploit rather than on merit; what is measured is
         # that it does not lower hazard cost on the objective as it stands.
         # Pass --foot_obstacle_obs to get it back.
-        "foot_obstacle_obs": False, "foot_hazard_grid": 0,
+        "foot_obstacle_obs": False, "foot_hazard_grid": 0, "finish_line": True,
     },
 }
 
@@ -306,6 +313,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
     "goal_observation", "terminate_on_goal", "foot_obstacle_obs", "foot_hazard_grid",
+    "finish_line",
 )
 
 
@@ -392,6 +400,12 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
     checkpoint in the repo predates both changes at 76.
     """
     current = robot_env_kwargs(robot)
+    # Every variant below the grid entries predates the foot grid (2026-09-17),
+    # so it is built on a grid-free copy. Built on `current` it would carry the
+    # 7x7 grid (the default since 2026-09-25) and every pre-grid checkpoint --
+    # 44/47/63/76/79 wide -- would become unreachable.
+    gridded = current
+    current = {**current, "foot_hazard_grid": 0}
     legacy_reward = {**current, "goal_observation": False, "goal_reward_weight": 0.0}
     # THE FEET FLAG, FLIPPED -- written as "the opposite of whatever is
     # current" rather than a hardcoded False, because it has now defaulted each
@@ -400,12 +414,18 @@ def _env_kwarg_candidates(robot: str) -> list[dict]:
     # moves. That is exactly how main.py's morphology branch broke: it assumed
     # the default and never consulted this list at all.
     alt_feet = {**current, "foot_obstacle_obs": not current.get("foot_obstacle_obs", False)}
-    # foot_hazard_grid (2026-09-17): +F*N*N, and 5 is the only N used so far.
-    alt_grid = 0 if current.get("foot_hazard_grid", 0) else 5
+    # foot_hazard_grid (2026-09-17): +F*N*N. N has been 0 (everything before
+    # 2026-09-17), 5 (2026-09-17 to 09-24) and 7 (default since 2026-09-25),
+    # so every grid size other than the current one is tried explicitly.
+    other_grids = [n for n in (0, 5, 7) if n != gridded.get("foot_hazard_grid", 0)]
     return [
-        current,
-        {**current, "foot_hazard_grid": alt_grid},
-        {**alt_feet, "foot_hazard_grid": alt_grid},
+        gridded,
+        *({**current, "foot_hazard_grid": n} for n in other_grids),
+        *({**alt_feet, "foot_hazard_grid": n} for n in (0, 5, 7)),
+        # 2026-09-21 A/B arms: rings 4x8+1 (+132), and the 5x5 grid without
+        # the torso lidar.
+        {**current, "foot_hazard_rings": 4},
+        {**current, "foot_hazard_grid": 5, "lidar_groups": ()},
         # PER-FOOT CLEARANCE THE OTHER WAY. Load-bearing in both directions:
         # with the flag off by default this is what reaches the 63-wide
         # (64 under Saute) checkpoints trained on 2026-08-24.
@@ -629,34 +649,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--penalizer",
         choices=["crpo", "ppo_lagrangian", "scheduled", "saute", "none"],
-        default="crpo",
+        default="ppo_lagrangian",
+        help="Final recipe default since 2026-09-25 (was crpo). CRPO ended "
+        "episodes to satisfy the budget; Saute's budget was not a lever; "
+        "Lagrangian + the per-foot grid is what cut cost with the traverse "
+        "intact (2026-09-18).",
     )
     parser.add_argument(
         "--safety_budget",
         type=float,
-        default=150.0,
-        help="Raised from ss2r's own reference value of 25: that number was "
-        "calibrated for Saute+terminate=true (go_to_goal_simple_ppo.yaml), "
-        "where hitting the budget ends the episode immediately, implicitly "
-        "bounding cost. Under CRPO/Lagrangian (no early termination) cost "
-        "runs for the full episode -- porting 25 across that mechanism "
-        "change, on top of this repo's stricter surface-based (not centre-"
-        "based) hazard cost, measurably produced a degenerate policy for the "
-        "point (0.19 goals/ep vs a 3.94 unconstrained ceiling, even with a "
-        "well-tuned multiplier). 150 sits above the untrained ant's step-0 "
-        "cost of 108.94; still an extrapolation, not a measurement -- pair "
-        "the first real run with a short unconstrained baseline to check it.",
+        default=25.0,
+        help="Per-episode TOTAL cost allowed (with --adaptive_budget_horizon, "
+        "the default). Linear-cost units at the 5 cm gate: one careless "
+        "crossing costs ~50-58, so 25 is about half a careless crossing. "
+        "Final recipe default since 2026-09-25 (was 150, a per-decision-rate "
+        "number from before the adaptive horizon). b10 reached its budget "
+        "at 250M; b25 is what the design loop trains at.",
     )
     parser.add_argument(
         "--adaptive_budget_horizon",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Divide --safety_budget by the episode length the batch ACTUALLY "
         "shows, instead of by the episode-length cap (episode_length // "
         "action_repeat = 625 for the ants). AFFECTS crpo AND ppo_lagrangian "
         "ONLY -- saute carries its own budget scalar and never touches this "
-        "path. OFF by default so every run before 2026-09-05 reproduces "
-        "bit-identically. WHAT IT FIXES: the normalised budget is a per-"
+        "path. ON by default since 2026-09-25 (every run since 2026-09-05 "
+        "passed it); --no-adaptive_budget_horizon reproduces the older "
+        "runs. WHAT IT FIXES: the normalised budget is a per-"
         "decision RATE, so with --terminate_on_goal (default on for the ants) "
         "a policy that crosses and stops in ~123 decisions is really allowed "
         "123 * B/625 = 0.20 B of total cost, while one that loiters to the cap "
@@ -704,8 +724,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lagrangian_multiplier_lr",
         type=float,
-        default=7e-7,
-        help="ss2r's own default (agent/penalizer/ppo_lagrangian.yaml). The "
+        default=1.5e-5,
+        help="1.5e-5 since 2026-09-25 = what every arm since 2026-09-17 ran "
+        "(the linear 5 cm cost's |constraint| is ~0.7x the old 2 cm scale's). "
+        "Before that: 7e-7, ss2r's own default (agent/penalizer/ppo_lagrangian.yaml). The "
         "previous default of 1e-2 traces to ss2r's go1_sim_to_real "
         "experiment, an unrelated robot/task -- not validated for "
         "go_to_goal (whose own ss2r reference config uses Saute, not "
@@ -713,6 +735,19 @@ def build_argparser() -> argparse.ArgumentParser:
         "move far more slowly than the 90-273 range measured at 1e-2 -- "
         "watch training logs for it staying near its initial value "
         "(under-enforcing) rather than assuming this is well-calibrated.",
+    )
+    parser.add_argument(
+        "--lagrangian_multiplier_max",
+        type=float,
+        default=3.0,
+        help="[--penalizer ppo_lagrangian] Cap on the multiplier (anti-windup). "
+        "The update is a pure integral of the violation and cannot tell that "
+        "the policy has stopped responding: lambda ~5 crushed a crossing gait "
+        "on 2026-09-12 and budget 5 was climbing the same way. Every arm that "
+        "settled did so at 1.3-1.9, so 3.0 is the recommended cap: an "
+        "infeasible budget then reads as 'pinned at the cap with cost still "
+        "high' instead of a collapse. Default 3.0 since 2026-09-25; pass 0 "
+        "or a negative value for unbounded (every run before 2026-09-21).",
     )
     parser.add_argument(
         "--initial_lagrange_multiplier",
@@ -893,13 +928,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--boundary_cost_weight",
         type=float,
-        default=1.0,
+        default=0.0,
         help="[--task run] Cost per step for leaving the corridor. LARGELY "
         "SUPERSEDED by --corridor_walls, which makes the corridor physical -- "
         "with walls on, a robot cannot leave, so this term is near-dead and "
         "0.0 keeps `cost` as pure hazard proximity. Measured 2026-08-22 on the "
         "50M unconstrained minefield policy: cost was 91%% hazard / 9%% "
-        "boundary, so this is no longer the dominant term it once was.",
+        "boundary, so this is no longer the dominant term it once was. "
+        "Default 0.0 since 2026-09-25 (every walls run passed 0; was 1.0).",
     )
     parser.add_argument(
         "--start_y_jitter",
@@ -981,6 +1017,18 @@ def build_argparser() -> argparse.ArgumentParser:
         "centre, so 0.25 leaves them untouched.",
     )
     parser.add_argument(
+        "--finish_line",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="[--task run/minefield] A green FINISH LINE across the corridor at "
+        "the goal's x instead of a goal point (default ON for the ants since "
+        "2026-09-20). Arrival = x past the line at any y; the goal observation "
+        "becomes heading error to +x plus remaining distance (same 3 slots, so "
+        "point-goal checkpoints load unchanged); reward = x displacement only "
+        "(the goal-distance term is dropped), so a crossing returns ~10.5 "
+        "instead of ~21. --no-finish_line reproduces the point goal.",
+    )
+    parser.add_argument(
         "--hazard_cost_shape",
         choices=["binary", "linear", "quadratic"],
         default="linear",
@@ -1000,28 +1048,44 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flip_cost",
         type=float,
-        default=0.0,
+        default=50.0,
         help="[--task run/minefield] COST charged once when the torso goes "
         "over (CRAX Pathway's unhealthy_termination_cost, 5.0 there). Closes "
         "the exit every constrained arm took: under terminate_on_flip a policy "
         "that walks 3 m and falls over stops paying and satisfied a "
         "per-episode budget. Size it near a careless full crossing's cost so "
-        "falling is never cheaper than finishing. 0 = off (every earlier run).",
+        "falling is never cheaper than finishing. Default 50 since 2026-09-25 "
+        "(every arm since 2026-09-17); 0 = off (every run before that).",
     )
     parser.add_argument(
         "--foot_hazard_grid",
         type=int,
-        default=0,
-        help="Per-foot N x N hazard map in the observation (0 = off). Each "
+        default=None,
+        help="Per-foot N x N hazard map in the observation (0 = off). Unset "
+        "= the robot default: 7 for the ant since 2026-09-25 (won the "
+        "2026-09-21 A/B over 5: cost 43.3 vs 53.8, same speed), 0 for the "
+        "point. Each "
         "cell is the linear penetration cost THAT foot would pay with its "
         "centre there, laid out in the torso yaw frame around the foot's "
         "current xy at --foot_hazard_grid_spacing. 5 adds 100 dims for the "
-        "ant (47 -> 147). The MLP-scale version of Hwang et al. 2026's foot "
+        "ant (47 -> 147), 7 adds 196 (47 -> 243). The MLP-scale version of Hwang et al. 2026's foot "
         "position map: feet and hazards in one representation, so the network "
         "does not have to relate a torso lidar to joint angles. Independent of "
         "--foot_obstacle_obs, which gives one nearest mine per foot and flips "
         "discontinuously between equidistant mines.",
     )
+    parser.add_argument(
+        "--foot_hazard_rings", type=int, default=0,
+        help="Per-foot hazard map on concentric RINGS of doubling radius "
+        "(Miki et al. 2022's foot-centred sampling) instead of / as well as "
+        "the square grid: N rings at r0, 2r0, 4r0 ... with "
+        "--foot_hazard_ring_points samples each, plus the toe itself. 4 rings "
+        "x 8 points = 33 per foot, +132 dims. Same per-sample value as the grid. "
+        "0 = off.",
+    )
+    parser.add_argument("--foot_hazard_ring_points", type=int, default=8)
+    parser.add_argument("--foot_hazard_ring_r0", type=float, default=0.08,
+                        help="innermost ring radius in metres before arena scaling")
     parser.add_argument(
         "--foot_hazard_grid_spacing",
         type=float,
@@ -1270,6 +1334,16 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--matmul_precision",
+        choices=numerics.CHOICES,
+        default=None,
+        help="highest = true float32 matmuls (the default since 2026-09-26); "
+        "default = JAX's own, which is TF32 on RTX 30/40-series GPUs -- what "
+        "every run before 2026-09-26 trained with. Pass default to continue or "
+        "reproduce one of those. Unset keeps $JAX_DEFAULT_MATMUL_PRECISION if "
+        "exported, else highest. See mjx_safety_gym/numerics.py.",
+    )
+    parser.add_argument(
         "--checkpoint_logdir",
         type=str,
         default=None,
@@ -1356,8 +1430,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "body that will be reported. Upstream's steps_after_robot_update.",
     )
     parser.add_argument(
-        "--design_objective", choices=["time", "return", "safe_time"], default="time",
-        help="What the REINFORCE step scores a design by. 'time' (default) is "
+        "--design_objective", choices=["speed", "time", "return", "safe_time"], default="speed",
+        help="What the REINFORCE step scores a design by. 'speed' (DEFAULT since "
+        "2026-09-18): net +x displacement per decision, with a non-arrival "
+        "charged the full horizon so an early flip cannot score like a "
+        "crossing -- the same quantity eval reports as episode_speed. 'time' is "
         "the time-to-goal fitness scripts/eval_morphology.py already uses -- "
         "arrival decision if it reached the goal, else a miss charge ordered by "
         "how far short it fell -- so the training signal and the offline "
@@ -1418,7 +1495,7 @@ def validate(args: argparse.Namespace) -> None:
             "sample becomes one body in the batch, so a population size is "
             "required. Try --num_morphologies 16."
         )
-    if args.design_optimization and args.design_objective in ("time", "safe_time"):
+    if args.design_optimization and args.design_objective in ("time", "safe_time", "speed"):
         if not args.terminate_on_goal:
             raise SystemExit(
                 "--design_objective time needs --terminate_on_goal (the "
@@ -1521,6 +1598,9 @@ def train(args: argparse.Namespace):
             hazard_cost_shape=args.hazard_cost_shape,
             foot_hazard_grid=args.foot_hazard_grid,
             foot_hazard_grid_spacing=args.foot_hazard_grid_spacing,
+            foot_hazard_rings=args.foot_hazard_rings,
+            foot_hazard_ring_points=args.foot_hazard_ring_points,
+            foot_hazard_ring_r0=args.foot_hazard_ring_r0,
         )
         if args.task in ("run", "minefield", "lasers"):
             corridor = dict(
@@ -1542,6 +1622,7 @@ def train(args: argparse.Namespace):
                 terminate_on_goal=args.terminate_on_goal,
                 goal_reward_weight=args.goal_reward_weight,
                 goal_observation=args.goal_observation,
+                finish_line=args.finish_line,
                 **common,
             )
             if args.task == "minefield":
@@ -1638,7 +1719,9 @@ def train(args: argparse.Namespace):
             # that orders NON-arrivals, so it wants to be the achievable
             # maximum, not a padded one. `_finish_x`/`_start_x` are read through
             # the wrapper chain, which forwards attribute access.
-            return_ceiling=2.0 * float(base_env._finish_x - base_env._start_x),
+            return_ceiling=(
+                float(base_env._forward_reward_weight) + float(base_env._goal_reward_weight)
+            ) * float(base_env._finish_x - base_env._start_x),
         )
         # EVAL KEEPS A FIXED, INDEPENDENTLY-SAMPLED POPULATION on purpose, so
         # `episode_reward` stays a stable held-out reference while the training
@@ -1733,6 +1816,9 @@ def train(args: argparse.Namespace):
         burnin=args.crpo_burnin,
         multiplier_lr=args.lagrangian_multiplier_lr,
         initial_lagrange_multiplier=args.initial_lagrange_multiplier,
+        # <= 0 means unbounded (the default is now a 3.0 cap).
+        multiplier_max=(args.lagrangian_multiplier_max
+                        if (args.lagrangian_multiplier_max or 0) > 0 else None),
         penalty_kappa_init=args.penalty_kappa_init,
         penalty_kappa_max=args.penalty_kappa_max,
         penalty_ramp_updates=_ramp_updates,
@@ -1799,4 +1885,5 @@ if __name__ == "__main__":
     apply_robot_defaults(args)
     validate(args)
     print(f"JAX compilation cache: {jax_cache.configure()}")
+    print(f"matmul precision: {numerics.configure_matmul_precision(args.matmul_precision)}")
     train(args)

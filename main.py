@@ -12,7 +12,7 @@ import mujoco.viewer
 import orbax.checkpoint as ocp
 from brax.training.acme import running_statistics
 
-from mjx_safety_gym import jax_cache
+from mjx_safety_gym import jax_cache, numerics
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import (
     _ROBOT_DEFAULTS,
@@ -93,6 +93,15 @@ _parser.add_argument(
     default="contact",
     help="'contact' charges only the floor-level part of a grounded geom; "
     "'shadow' its whole xy projection (pre-2026-09-14). Viewer A/B knob.",
+)
+_parser.add_argument(
+    "--finish_line",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Green finish line (the default task since 2026-09-20) or, with "
+    "--no-finish_line, the point goal every earlier checkpoint was trained "
+    "on. Default None = the robot's default (line). Width is identical, so "
+    "either loads any checkpoint; use the one the policy trained under.",
 )
 _parser.add_argument(
     "--shaping_ring",
@@ -182,6 +191,15 @@ _parser.add_argument(
     "--seed, which has nothing to do with the design the search converged on. "
     "The A/B is this flag against --morphology 0 (nominal), same --seed.",
 )
+_parser.add_argument(
+    "--matmul_precision",
+    choices=numerics.CHOICES,
+    default=None,
+    help="highest = float32 matmuls (default; what training uses since "
+    "2026-09-26); default = TF32 on RTX 30/40-series GPUs, what older "
+    "checkpoints trained with. Only changes the GPU path -- the CPU is float32 "
+    "either way. See mjx_safety_gym/numerics.py.",
+)
 _args = _parser.parse_args()
 
 # --design_from is meaningless outside the morphology branch, and that branch is
@@ -198,6 +216,8 @@ DETERMINISTIC = _args.deterministic
 
 # Compile once, and every later run loads the cached kernel from disk
 jax_cache.configure()
+print(f"matmul precision: {numerics.configure_matmul_precision(_args.matmul_precision)} "
+      f"({jax.default_backend()})")
 
 def resolve_checkpoint(robot: str) -> Optional[Path]:
     """The checkpoint directory to replay, or None if nothing is trained."""
@@ -266,6 +286,8 @@ def _report_reconciliation(want, default_width, task_kwargs, robot):
 
 
 _want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
+# --finish_line / --no-finish_line overrides the robot default; None keeps it.
+_finish_override = {} if _args.finish_line is None else {"finish_line": _args.finish_line}
 if _args.num_morphologies:
     # A morphology-conditioned checkpoint is NUM_GENES wider than the task obs
     # it was trained against, so the width to reconcile is the checkpoint's --
@@ -297,7 +319,7 @@ if _args.num_morphologies:
                 ground_contact_eps=_args.ground_contact_eps,
                 hazard_footprint=_args.hazard_footprint,
                 hazard_cost_shape=_args.hazard_cost_shape,
-                **kw,
+                **{**kw, **_finish_override},
             ),
             ROBOT,
             _want,
@@ -400,7 +422,7 @@ else:
             robot=ROBOT, draw_corridor_lines=True,
             ground_contact_eps=_args.ground_contact_eps,
             hazard_footprint=_args.hazard_footprint,
-            hazard_cost_shape=_args.hazard_cost_shape, **kw
+            hazard_cost_shape=_args.hazard_cost_shape, **{**kw, **_finish_override}
         ),
         ROBOT,
         _want,

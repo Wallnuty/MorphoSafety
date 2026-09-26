@@ -570,6 +570,7 @@ def train(
         key=eval_key,
         budget=original_safety_budget,
         num_episodes=num_eval_episodes,
+        sim_dt=getattr(getattr(eval_env, "unwrapped", eval_env), "sim_dt", None),
     )
 
     # Run initial eval

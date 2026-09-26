@@ -1,6 +1,10 @@
 #!/bin/bash
 # Schaff et al. (ICRA 2019) co-design: train the DESIGN DISTRIBUTION jointly
-# with the policy. 300M env steps, ant on minefield, Saute at budget 500.
+# with the policy. 300M env steps, ant on minefield, FINAL SAFE-RL RECIPE
+# (2026-09-25): PPO-Lagrangian at budget 25, per-foot 7x7 hazard grid, linear
+# cost at the 5 cm gate, flip cost 50, finish line. These are the trainer's
+# defaults now; they are also passed explicitly below so a later default
+# change cannot silently alter this run.
 #
 #   Schaff, Yunis, Chakrabarti & Walter, "Jointly Learning to Construct and
 #   Control Agents using Deep Reinforcement Learning", arXiv 1801.01432.
@@ -135,21 +139,25 @@
 #   design/components           8 -> 4 -> 2 -> 1 across the chops. If it is
 #                               still 8 at the end, chopping never fired and
 #                               the mixture never committed -- check chop_freq.
-#   design/score_mean           negated time-to-goal in DECISIONS, so -212
-#                               means 212 decisions to arrive. Higher = better.
-#   design/fitness_decisions    the same number un-negated, for sanity.
-#   design/arrival_rate         fraction of episodes that reached the goal.
-#                               0.0 early is expected and not a failure.
+#   design/score_mean           SPEED (DESIGN_OBJECTIVE=speed, the default):
+#                               net +x metres per episode second, non-arrivals
+#                               charged the full 625 decisions. Higher = better.
+#   design/speed_mean           the same, for sanity.
+#   design/arrival_rate         fraction of episodes that crossed the finish
+#                               line. 0.0 early is expected and not a failure.
 #   design/UNSCORED_DESIGNS     should be absent. If it appears, iterations are
 #                               too short -- see WHY 8 DESIGN UPDATES above.
 #   design/SKIPPED_UPDATE       appears when fewer than 2 designs were scored;
 #                               a lone sample standardises to 0 and carries no
 #                               gradient.
 #   eval/episode_cost           LOGGED, NOT OPTIMISED BY THE SEARCH. The score
-#                               is time-to-arrival only. Safety enters through
-#                               Saute shaping the reward the policy sees, not
-#                               through the design objective. That is a
-#                               deliberate staging choice, not an oversight.
+#                               is speed only. Safety enters through the
+#                               Lagrangian constraining the policy on every
+#                               body, so a design is scored on how fast it
+#                               goes WHILE its controller keeps the budget.
+#                               DESIGN_OBJECTIVE=safe_time scores cost too.
+#   training/lagrange_multiplier  settles ~1.3-1.9 in the single-body arms;
+#                               pinned at the 3.0 cap = budget infeasible.
 #
 # ============================ RESUMING ====================================
 #
@@ -211,12 +219,12 @@ echo
 # PREFLIGHT 2: the checkout is new enough, and the observation is the width
 # this run is FOR.
 #
-# 55 = 47 (lidar-only) + 7 genes + 1 Saute budget scalar. A silent 71 would
-# mean --foot_obstacle_obs leaked back on and this is no longer the lidar-only
-# run that was asked for; a silent 47 would mean morphology conditioning is not
-# reaching the observation at all, which would train a policy that cannot see
-# which body it is driving -- the whole method, gone, with a log that looks
-# completely normal.
+# 250 = 47 (proprio + goal + lidar) + 196 (4 feet x 7x7 grid) + 7 genes; no
+# budget scalar (that was Saute's). A silent 54 would mean the foot grid is
+# off -- the thing that makes the constraint act on placement; a silent 243
+# would mean morphology conditioning is not reaching the observation, which
+# would train a policy that cannot see which body it is driving -- the whole
+# method, gone, with a log that looks completely normal.
 echo "=== code / observation preflight ==="
 python -c "
 from mjx_safety_gym import design, morphology
@@ -232,12 +240,30 @@ assert 'design_tmax' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no --design_tmax in this checkout; resumes would anneal the design '
     'lr against the wrong horizon. git pull.')
 
+p = T.build_argparser().parse_args(['--robot', 'ant', '--task', 'minefield'])
+T.apply_robot_defaults(p)
+assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost) == (
+    'ppo_lagrangian', 25.0, 7, 50.0), (
+    f'ABORT: trainer defaults are not the 2026-09-25 recipe: {p.penalizer} '
+    f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. git pull.')
 kw = dict(T.robot_env_kwargs('ant'))
-kw['foot_obstacle_obs'] = False
 kw['morphology_conditioning'] = True
-w = Minefield(**kw).observation_size
-assert w == 47 + morphology.NUM_GENES, f'expected 54 pre-Saute, got {w}'
-print(f'PASS: obs {w} + 1 Saute = {w+1}, design checkpointing present')
+env = Minefield(**kw)
+assert env._ground_contact_eps == 0.05 and env._hazard_cost_shape == 'linear', (
+    'ABORT: cost is not linear at the 5 cm gate. git pull.')
+w = env.observation_size
+assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+print(f'PASS: obs {w} (grid 7 + genes), 5 cm linear cost, design checkpointing present')
+import jax, numpy as np, jax.numpy as jp
+a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
+ref = a.astype(np.float64) @ a.astype(np.float64)
+err = float(np.abs(np.asarray(jax.jit(jp.matmul)(a, a), np.float64) - ref).max() / np.abs(ref).max())
+prec = jax.config.jax_default_matmul_precision
+assert prec == 'highest' and err < 1e-5, (
+    f'ABORT: matmuls are not float32 here (precision={prec}, rel err {err:.1e}; '
+    f'TF32 is ~3e-4). Unset JAX_DEFAULT_MATMUL_PRECISION, or the checkout predates '
+    f'mjx_safety_gym/numerics.py (2026-09-26).')
+print(f'PASS: float32 matmuls on {jax.default_backend()} (rel err {err:.1e})')
 " || { echo "=== code preflight FAILED, nothing spent ==="; exit 1; }
 echo
 
@@ -251,14 +277,23 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 #      these reach the job without editing the file.
 STEPS="${STEPS:-300000000}"
 DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
-DESIGN_LR="${DESIGN_LR:-0.001}"
+# 0.03, not 1e-3: at 1e-3 the 2026-08 run's distribution moved 2% of the gene
+# space in 60M steps (sigma 0.5763 vs 0.577 init) -- inert. See
+# cluster/vast/remote_codesign.sh's DESIGN_LR section for the arithmetic.
+DESIGN_LR="${DESIGN_LR:-0.03}"
 # 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
 # DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
 # nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
 # is the morphology-safety question. Default keeps the time-only objective.
-DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-time}"
+DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-speed}"
 DESIGN_COST_WEIGHT="${DESIGN_COST_WEIGHT:-0}"
-FLIP_COST="${FLIP_COST:-0}"
+FLIP_COST="${FLIP_COST:-50}"
+PENALIZER="${PENALIZER:-ppo_lagrangian}"   # none = the Schaff baseline
+BUDGET="${BUDGET:-25}"
+MULT_LR="${MULT_LR:-1.5e-5}"
+MULT_MAX="${MULT_MAX:-3.0}"
+MULT_INIT="${MULT_INIT:-0.01}"
+GRID="${GRID:-7}"
 RESUME="${RESUME:-}"
 
 # A RESUMED RUN MUST NOT WRITE INTO THE DIRECTORY IT IS RESUMING FROM. The
@@ -266,9 +301,9 @@ RESUME="${RESUME:-}"
 # it would write 000000030146560 again and OVERWRITE the checkpoint that is the
 # only copy of the design state -- destroying the thing being resumed from,
 # halfway through the run that depends on it. Distinct name by default.
-NAME="${NAME:-ant_codesign_lidar_300M}"
-if [ -n "$RESUME" ] && [ "$NAME" = "ant_codesign_lidar_300M" ]; then
-  NAME="ant_codesign_lidar_300M_r$(date -u +%m%d%H%M)"
+NAME="${NAME:-ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_300M}"
+if [ -n "$RESUME" ] && [ "$NAME" = "ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_300M" ]; then
+  NAME="${NAME}_r$(date -u +%m%d%H%M)"
 fi
 CKPT="${SLURM_SUBMIT_DIR:-$PWD}/checkpoints/$NAME"
 
@@ -286,16 +321,17 @@ else
   set --
 fi
 echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
+echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  finish line  float32"
 
 # python -u is NOT optional: Python block-buffers stdout when redirected, and a
 # segfault never flushes it. A laptop run once reached 573k steps -- proven by
 # checkpoints on disk -- and left a completely empty log.
 #
-# PENALIZER. Saute at budget 500 matches every other run this project has done
-# on minefield, so cost here is comparable to them. For the FAITHFUL Schaff
-# baseline (unconstrained, cost logged but never shaping anything) change the
-# three saute flags to `--penalizer none` and nothing else -- the design
-# objective is time-to-arrival either way and does not read cost.
+# PENALIZER. PPO-Lagrangian at budget 25 (per-episode total, adaptive
+# horizon) -- the recipe the 2026-09-17..21 single-body arms converged on. For
+# the FAITHFUL Schaff baseline (unconstrained, cost logged but never shaping
+# anything) submit with PENALIZER=none and nothing else; the design objective
+# is speed either way and does not read cost.
 #
 # action_repeat / episode_length / discounting / healthy_reward /
 # terminate_on_flip / terminate_on_goal are deliberately NOT passed: they
@@ -304,8 +340,12 @@ echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
 # written.
 time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant --task minefield \
-  --penalizer saute --safety_budget 500 --saute_terminate \
+  --penalizer "$PENALIZER" --safety_budget "$BUDGET" --adaptive_budget_horizon \
+  --lagrangian_multiplier_lr "$MULT_LR" --lagrangian_multiplier_max "$MULT_MAX" \
+  --initial_lagrange_multiplier "$MULT_INIT" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
+  --foot_hazard_grid "$GRID" --hazard_cost_shape linear --finish_line \
+  --matmul_precision highest \
   --corridor_walls --boundary_cost_weight 0 \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \

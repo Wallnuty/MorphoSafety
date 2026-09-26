@@ -93,14 +93,15 @@ crossing cheap.
 
 ## RESULT TABLE (50M each; cost = linear penetration @5cm + flip 50; budget 25; 1024/32; 256x4)
 
-    arm  obs   penalizer     start      reward  displ   cost   cost/m  hz_steps  lambda@50M
-    A1   47    none          scratch    20.9    10.4    63.1    6.1     138        --
-    B1   147   none          scratch    21.2    10.6    51.1    4.8     116        --
-    C1   47    Lagrangian    scratch    21.2    10.6    78.6    7.5     179       4.08 rising
-    C2   147   Lagrangian    scratch    21.1    10.5    44.8    4.3     106       2.49
-    A2   47    Lagrangian    warm(A1)   20.6    10.2    52.8    5.2     112       2.80
-    B2   147   Lagrangian    warm(B1)   21.5    10.7    33.0    3.1      81       1.49
-    B3   147   Lagrangian    B2 +50M    (running; 24.99 at 65M -- AT the budget, reward 21.2)
+    arm  obs   penalizer     start      reward  speed m/s  displ   cost   cost/m  hz_steps  lambda@50M
+    A1   47    none          scratch    20.9    1.04       10.4    63.1    6.1     138        --
+    B1   147   none          scratch    21.2    1.32       10.6    51.1    4.8     116        --
+    C1   47    Lagrangian    scratch    21.2    0.82       10.6    78.6    7.5     179       4.08 rising
+    C2   147   Lagrangian    scratch    21.1    1.03       10.5    44.8    4.3     106       2.49
+    A2   47    Lagrangian    warm(A1)   20.6    1.11       10.3    52.8    5.2     112       2.80
+    B2   147   Lagrangian    warm(B1)   21.5    1.01       10.7    33.0    3.1      81       1.49
+    B3   147   Lagrangian    B2 +50M    21.3    1.12       10.6    23.6    2.2      64       1.33 falling
+    (speed = displacement / episode duration, derived for these logs; eval/episode_speed is logged directly since 2026-09-18)
 
     Every arm crosses the full corridor (reward 20.6-21.5). Read cost/m.
 
@@ -135,3 +136,17 @@ crossing cheap.
            2.2 cost/m vs the control's 6.1. Checkpoint pulled:
            checkpoints/vast/ant_minefield_ppo_lagrangian_b25_grid5_flip50_warm_100M/000050380800
     07:22  box b destroyed. No live instances. Credit left $1.89 (started $5.73).
+
+## 2026-09-21: A/B batch (user's plan)
+Laptop (sequential, point goal): b5 resumed 70M -> 100M (lambda 2.72, cap 3.0);
+then b0 100M from B3 (lambda restored 1.33; reaches the cap and stays -- "minimise cost, ever harder").
+Vast box d (51828915), one 3090, 25M each, sequential, POINT GOAL, lr 1.5e-5, cap 3.0, init 0.01,
+flip 50, 6 evals; compare the mean of the 20M+25M evals against the reference's 20M/25M rows:
+    wide      512x4 policy, grid 5, b25, scratch            vs C2 @25M (cost 53, hz 120, speed 0.97)
+    rings     rings 4x8+1 (r0 0.08 doubling), no grid, b25, scratch   vs C2
+    grid7     7x7 grid, b25, scratch                        vs C2
+    gate1/4   eps 0.0125, grid 5, warm from B1, budget 13   vs B2 @25M (cost 50, hz 102, speed 0.83)
+    quadratic cost shape quadratic, grid 5, warm from B1, budget 15   vs B2
+Budgets 13 and 15 = 25 x (B1's cost under that rule / B1's cost under the linear 5 cm rule),
+measured on the same 32 trajectories: linear@5cm 50.3, quadratic 31.2, linear@1.25cm 25.5.
+No-lidar arm dropped (credit). Cap 3.0 is inert for these comparisons (no reference passed 1.5 by 25M).

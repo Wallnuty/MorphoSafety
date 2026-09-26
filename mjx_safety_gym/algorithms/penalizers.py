@@ -72,9 +72,20 @@ class LagrangianParams(NamedTuple):
 
 
 class Lagrangian:
-    def __init__(self, multiplier_lr: float) -> None:
+    def __init__(self, multiplier_lr: float, multiplier_max: float | None = None) -> None:
         self.optimizer = optax.adam(learning_rate=multiplier_lr)
         self.learning_rate = multiplier_lr
+        # ANTI-WINDUP CLAMP (2026-09-21). The update below is a pure integral
+        # of the violation: nothing in it knows when the policy has stopped
+        # responding, so an infeasible budget drives the multiplier up without
+        # bound until the cost term swamps the reward term -- lambda ~5 crushed
+        # a crossing gait on 2026-09-12, and budget 5 was heading the same way
+        # (2.7 and rising with cost flat). Every arm that settled did so at
+        # 1.3-1.9. A cap turns "infeasible -> collapse" into "infeasible ->
+        # best effort at the maximum tolerable pressure", and a run pinned at
+        # the cap with cost still high says the same thing a runaway multiplier
+        # did, while the ant keeps walking. None = the old unbounded rule.
+        self.multiplier_max = None if multiplier_max is None else float(multiplier_max)
 
     def __call__(
         self,
@@ -97,6 +108,8 @@ class Lagrangian:
         new_lagrange_multiplier = update_lagrange_multiplier(
             constraint, params.lagrange_multiplier, self.learning_rate
         )
+        if self.multiplier_max is not None:
+            new_lagrange_multiplier = jnp.minimum(new_lagrange_multiplier, self.multiplier_max)
         aux = {"lagrange_multiplier": new_lagrange_multiplier}
         return aux, LagrangianParams(new_lagrange_multiplier, params.optimizer_state)
 
@@ -198,6 +211,7 @@ def get_penalizer(
     burnin: int = 0,
     multiplier_lr: float = 7e-7,
     initial_lagrange_multiplier: float = 0.01,
+    multiplier_max: float | None = None,
     penalty_kappa_init: float = 0.01,
     penalty_kappa_max: float = 5.0,
     penalty_ramp_updates: int = 1,
@@ -219,7 +233,7 @@ def get_penalizer(
         penalizer = CRPO(eta)
         penalizer_state = CRPOParams(burnin)
     elif name == "ppo_lagrangian":
-        penalizer = Lagrangian(multiplier_lr)
+        penalizer = Lagrangian(multiplier_lr, multiplier_max=multiplier_max)
         penalizer_state = LagrangianParams(
             jnp.asarray(initial_lagrange_multiplier),
             penalizer.optimizer.init(jnp.asarray(initial_lagrange_multiplier)),

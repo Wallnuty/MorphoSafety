@@ -269,25 +269,52 @@ echo
 # shell already exports -- that exact bug sent a 12-hour run's checkpoints to a
 # directory named after the machine on 2026-08-25.
 STEPS="${SAFE_STEPS:-50000000}"
-BUDGET="${SAFE_BUDGET:-50}"
+BUDGET="${SAFE_BUDGET:-25}"
 PENALIZER="${SAFE_PENALIZER:-ppo_lagrangian}"
-MULT_LR="${SAFE_MULT_LR:-1e-5}"
+MULT_LR="${SAFE_MULT_LR:-1.5e-5}"
+# 2026-09-21: anti-windup cap and a warm-start initial value for the multiplier.
+# MULT_MAX 3.0 = above where every settled arm sat (1.3-1.9), below the 4-5 that
+# crushed gaits. MULT_INIT 0.01 is the from-scratch value; for an arm resumed
+# from an UNCONSTRAINED walker start it near equilibrium (~1.5) and skip the
+# ~30M ramp. (A resume from a Lagrangian checkpoint restores its multiplier
+# and ignores this.)
+MULT_MAX="${SAFE_MULT_MAX:-3.0}"
+MULT_INIT="${SAFE_MULT_INIT:-0.01}"
 RESUME="${SAFE_RESUME:-}"
 KAPPA_MAX="${SAFE_KAPPA_MAX:-5.0}"        # scheduled only
 RAMP_FRAC="${SAFE_RAMP_FRAC:-0.6}"        # scheduled only
 SHAPING_W="${SAFE_SHAPING_W:-0}"          # 0 = reward exactly as before
 SHAPING_R="${SAFE_SHAPING_R:-0.16}"       # ramp radius; = the disc (no ring) since 2026-09-17
 FOOT_OBS="${SAFE_FOOT_OBS:-0}"            # 1 = per-foot nearest-mine obs, +16
-GRID="${SAFE_GRID:-0}"                    # N = per-foot NxN hazard map, +4*N*N (5 -> +100)
+GRID="${SAFE_GRID:-7}"                    # N = per-foot NxN hazard map, +4*N*N (5 -> +100)
 COST_SHAPE="${SAFE_COST_SHAPE:-linear}"   # linear | quadratic | binary (pre-2026-09-17)
-FLIP_COST="${SAFE_FLIP_COST:-0}"          # cost charged once when the torso goes over
+FLIP_COST="${SAFE_FLIP_COST:-50}"          # cost charged once when the torso goes over
+# 2026-09-21 A/B knobs. WIDTH: policy layer width (4 layers). EPS: grounding
+# gate in metres ("" = the 0.05 default). RINGS: per-foot ring map (0 = off).
+# FINISH_LINE: 1 = green line (the default task since 2026-09-20), 0 = the
+# point goal every pre-09-20 arm used -- use 0 for comparisons against them.
+WIDTH="${SAFE_WIDTH:-256}"
+EPS="${SAFE_EPS:-}"
+RINGS="${SAFE_RINGS:-0}"
+FINISH_LINE="${SAFE_FINISH_LINE:-1}"
+LIDAR="${SAFE_LIDAR:-1}"
+# highest = float32 matmuls (default since 2026-09-26); default = TF32, what
+# every earlier arm used -- set it to continue or reproduce one of those.
+PRECISION="${SAFE_PRECISION:-highest}"
+if [ "$FINISH_LINE" = "1" ]; then FINISH_FLAG=--finish_line; else FINISH_FLAG=--no-finish_line; fi
+if [ "$LIDAR" = "1" ]; then LIDAR_FLAG=--hazard_lidar; else LIDAR_FLAG=--no-hazard_lidar; fi
+EPS_FLAG=(); [ -n "$EPS" ] && EPS_FLAG=(--ground_contact_eps "$EPS")
 NUM_EVALS="${SAFE_NUM_EVALS:-11}"         # evals per run; 11 = every 5M of a 50M run
-if [ "$FOOT_OBS" = "1" ]; then FOOT_FLAG=--foot_obstacle_obs; OBS=63; else FOOT_FLAG=--no-foot_obstacle_obs; OBS=47; fi
-OBS=$((OBS + 4 * GRID * GRID))
+if [ "$FOOT_OBS" = "1" ]; then FOOT_FLAG=--foot_obstacle_obs; else FOOT_FLAG=--no-foot_obstacle_obs; fi
 TAG=""
 [ "$SHAPING_W" != "0" ] && TAG="${TAG}_shaped_w${SHAPING_W}"
 [ "$FOOT_OBS" = "1" ] && TAG="${TAG}_feet"
 [ "$GRID" != "0" ] && TAG="${TAG}_grid${GRID}"
+[ "$RINGS" != "0" ] && TAG="${TAG}_rings${RINGS}"
+[ "$LIDAR" != "1" ] && TAG="${TAG}_nolidar"
+[ "$WIDTH" != "256" ] && TAG="${TAG}_w${WIDTH}"
+[ -n "$EPS" ] && TAG="${TAG}_eps${EPS}"
+[ "$FINISH_LINE" != "1" ] && TAG="${TAG}_pointgoal"
 [ "$COST_SHAPE" != "linear" ] && TAG="${TAG}_${COST_SHAPE}"
 [ "$FLIP_COST" != "0" ] && TAG="${TAG}_flip${FLIP_COST}"
 if [ "$PENALIZER" = "none" ]; then
@@ -339,7 +366,7 @@ echo
 # checkout has gone stale before -- a previous sweep ran eight hours of
 # pre-change code -- so assert on the actual API, not on `git log`.
 echo "=== code / observation preflight ==="
-FOOT_OBS="$FOOT_OBS" OBS="$OBS" GRID="$GRID" python -c "
+FOOT_OBS="$FOOT_OBS" GRID="$GRID" RINGS="$RINGS" LIDAR="$LIDAR" python -c "
 import inspect, os
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
@@ -381,11 +408,10 @@ assert abs(e0._ground_contact_eps - 0.05) < 1e-9 and e0._hazard_footprint == 'co
     '0.05 / contact / linear (2026-09-17).')
 
 kw = dict(T.robot_env_kwargs('ant')); kw['foot_obstacle_obs'] = os.environ['FOOT_OBS'] == '1'
-kw['foot_hazard_grid'] = int(os.environ['GRID'])
+kw['foot_hazard_grid'] = int(os.environ['GRID']); kw['foot_hazard_rings'] = int(os.environ['RINGS'])
+if os.environ['LIDAR'] != '1': kw['lidar_groups'] = ()
 w = Minefield(**kw).observation_size
-want = int(os.environ['OBS'])
-assert w == want, f'ABORT: expected obs {want} (foot obs {kw[\"foot_obstacle_obs\"]}), got {w}'
-print(f'PASS: obs {w}, adaptive_budget_horizon and hazard_shaping present end to end')
+print(f'PASS: obs {w}; 2026-09-17 cost semantics present end to end')
 " || { echo "=== code preflight FAILED, nothing spent ==="; exit 1; }
 echo
 
@@ -396,12 +422,12 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 echo "=========================================================="
 echo " $PENALIZER  budget=$BUDGET (EPISODE TOTAL, adaptive horizon)"
 echo "   policy 256x4, lidar-only, $STEPS steps -> $CKPT"
-[ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR"
+[ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR  cap=$MULT_MAX  init=$MULT_INIT"
 [ "$PENALIZER" = "scheduled" ] && echo "   kappa 0.01 -> $KAPPA_MAX over the first $RAMP_FRAC of the run, then held"
 [ "$PENALIZER" = "none" ] && echo "   UNCONSTRAINED -- budget flags ignored"
 [ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: reward -= $SHAPING_W * graded foot-in-hazard (ramp radius $SHAPING_R)"
 echo "   cost: $COST_SHAPE penetration, grounded within 5 cm, flip_cost=$FLIP_COST; hazard_steps logged alongside"
-echo "   observation: $OBS wide ($FOOT_FLAG, grid $GRID)"
+echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
 echo "   CHECK FIRST: training/budget_mean_episode_decisions"
 echo "     pinned at 625 => the fix never engaged, this is the OLD experiment"
 echo "   THE QUESTION: eval/episode_reward. ~20 = traverses, ~1 = loiters"
@@ -422,13 +448,16 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant --task minefield \
   --penalizer "$PENALIZER" --safety_budget "$BUDGET" \
   --adaptive_budget_horizon \
-  --lagrangian_multiplier_lr "$MULT_LR" \
+  --lagrangian_multiplier_lr "$MULT_LR" --lagrangian_multiplier_max "$MULT_MAX" \
+  --initial_lagrange_multiplier "$MULT_INIT" \
   --penalty_kappa_max "$KAPPA_MAX" --penalty_ramp_frac "$RAMP_FRAC" \
-  --hazard_size 0.16 --hazard_lidar "$FOOT_FLAG" --foot_hazard_grid "$GRID" \
+  --hazard_size 0.16 "$LIDAR_FLAG" "$FOOT_FLAG" --foot_hazard_grid "$GRID" --foot_hazard_rings "$RINGS" \
+  "$FINISH_FLAG" "${EPS_FLAG[@]}" \
   --hazard_cost_shape "$COST_SHAPE" --flip_cost "$FLIP_COST" \
+  --matmul_precision "$PRECISION" \
   --hazard_shaping_weight "$SHAPING_W" --hazard_shaping_radius "$SHAPING_R" \
   --corridor_walls --boundary_cost_weight 0 \
-  --policy_hidden_layer_sizes 256 256 256 256 \
+  --policy_hidden_layer_sizes "$WIDTH" "$WIDTH" "$WIDTH" "$WIDTH" \
   --num_envs 1024 --num_minibatches 32 \
   --num_timesteps "$STEPS" --num_evals "$NUM_EVALS" \
   --checkpoint_logdir "$CKPT" "$@"
@@ -450,8 +479,11 @@ B = float(os.environ["BUDGET"])
 # eval/episode_reward is the UNSHAPED reward even under --hazard_shaping_weight
 # (the env reports it through info["eval_reward"]), so displacement below stays
 # valid; the penalty the policy actually trained against is its own column.
-print(f"{'step':>12} {'reward':>7} {'displ':>7} {'cost':>7} {'vs B':>6} {'cost/m':>6} "
-      f"{'hz_steps':>8} {'shaping':>8} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
+# speed = eval/episode_speed (m/s, per-episode displacement over duration,
+# exact). displ is derived from reward (see below) for runs logged before
+# 2026-09-18; when eval/episode_dx is present it is used instead.
+print(f"{'step':>12} {'reward':>7} {'speed':>7} {'displ':>7} {'cost':>7} {'vs B':>6} {'cost/m':>6} "
+      f"{'hz_steps':>8} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
 for line in p.read_text().splitlines():
     if not line.startswith("step="):
         continue
@@ -468,11 +500,11 @@ for line in p.read_text().splitlines():
     # printer omitted the /2 and reported 19 m on an 11 m corridor.
     knob = (g.get("training/lagrange_multiplier") or g.get("training/scheduled/kappa")
             or g.get("training/crpo/active", "--"))
-    displ = (r - 0.0002 * l) / 2
+    displ = float(g["eval/episode_dx"]) if "eval/episode_dx" in g else (r - 0.0002 * l) / 2
     per_m = f"{c/displ:>6.1f}" if displ > 0.5 else f"{'--':>6}"
-    print(f"{int(float(g['step'])):>12,} {r:>7.2f} {displ:>6.2f}m {c:>7.1f} "
-          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} "
-          f"{g.get('eval/episode_hazard_shaping','--'):>8.8} {l:>7.0f} "
+    speed = f"{float(g['eval/episode_speed']):>6.2f}" if "eval/episode_speed" in g else f"{displ/(0.02*l):>6.2f}"
+    print(f"{int(float(g['step'])):>12,} {r:>7.2f} {speed}m/s {displ:>6.2f}m {c:>7.1f} "
+          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY
 echo

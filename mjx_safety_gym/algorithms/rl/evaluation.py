@@ -27,7 +27,7 @@ class ConstraintEvalWrapper(EvalWrapper):
         # Optional graded-penalty total (RunForward hazard_shaping_weight > 0).
         # Present in reset and step under the same condition, so the metrics
         # pytree matches between them.
-        for k in ("hazard_shaping", "hazard_steps"):
+        for k in ("hazard_shaping", "hazard_steps", "dx"):
             if k in reset_state.info:
                 reset_state.metrics[k] = reset_state.info[k]
         eval_metrics = EvalMetrics(
@@ -50,7 +50,7 @@ class ConstraintEvalWrapper(EvalWrapper):
             reward = nstate.reward
         nstate.metrics["reward"] = reward
         nstate.metrics["cost"] = nstate.info.get("cost", jnp.zeros_like(nstate.reward))
-        for k in ("hazard_shaping", "hazard_steps"):
+        for k in ("hazard_shaping", "hazard_steps", "dx"):
             if k in nstate.info:
                 nstate.metrics[k] = nstate.info[k]
         episode_steps = jnp.where(
@@ -84,8 +84,12 @@ class ConstraintsEvaluator(Evaluator):
         key: jax.Array,
         budget: float,
         num_episodes: int = 10,
+        sim_dt: float | None = None,
     ):
         self._key = key
+        # Simulated seconds per env step, for eval/episode_speed in m/s. None
+        # (an env without one) reports speed per env step instead.
+        self._sim_dt = sim_dt
         self._eval_walltime = 0.0
         eval_env = ConstraintEvalWrapper(eval_env)
         self.budget = budget
@@ -126,6 +130,15 @@ class ConstraintsEvaluator(Evaluator):
         eval_state.info["eval_metrics"].episode_metrics["safe"] = safe
         eval_metrics = eval_state.info["eval_metrics"]
         eval_metrics.active_episodes.block_until_ready()
+        if "dx" in eval_metrics.episode_metrics:
+            # THE WALKING METRIC (2026-09-18): net +x displacement over the
+            # episode's own duration, PER EPISODE then averaged -- not mean
+            # displacement over mean length, which mixes fast and slow
+            # episodes. m/s when the env supplies sim_dt.
+            steps = np.maximum(np.asarray(eval_metrics.episode_steps), 1.0)
+            dx = np.asarray(eval_metrics.episode_metrics["dx"])
+            seconds = steps * (self._sim_dt if self._sim_dt else 1.0)
+            eval_metrics.episode_metrics["speed"] = dx / seconds
         epoch_eval_time = time.time() - t
         metrics = {}
         for fn in [np.mean, np.std]:

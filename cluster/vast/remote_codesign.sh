@@ -18,7 +18,12 @@
 #
 # ========================= DIFFERENCES FROM THE SBATCH ====================
 #
-# 1. RESUMING IS THE DEFAULT HERE, not the exception. This run continues
+# 0. 2026-09-25: FRESH RUN ON THE FINAL SAFE-RL RECIPE BY DEFAULT (PPO-
+#    Lagrangian b25, 7x7 foot grid, 5 cm linear cost, flip 50, finish line).
+#    The Saute-era checkpoints below cannot resume into it (obs 55 -> 250), so
+#    RESUME is now empty by default; points 1-3 apply only when you set it.
+#
+# 1. RESUMING (RESUME=<remote step dir>) continued, on 2026-08,
 #    checkpoints/cluster/ant_codesign_lidar_300M/000060293120 -- 60.29M steps
 #    from mscluster job 46267, whose design search was measured to be moving
 #    far too slowly to commit (see DESIGN_LR below).
@@ -29,7 +34,7 @@
 #    script REFUSES to start without it rather than silently beginning a fresh
 #    search dressed as a continuation.
 #
-# 3. --num_evals 9, not 11. Design iterations are
+# 3. (resume only) --num_evals 9, not 11. Design iterations are
 #    (num_evals-1) * design_updates_per_eval, and the quantity that must not
 #    change is EPISODES PER LANE PER ITERATION:
 #
@@ -98,19 +103,27 @@ df -h / | tail -1
 echo
 
 # ---- overridable at launch, e.g. DESIGN_LR=0.05 bash cluster/vast/vast.sh codesign
-STEPS="${STEPS:-240000000}"
+STEPS="${STEPS:-300000000}"
 DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
 DESIGN_LR="${DESIGN_LR:-0.03}"
 # 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
 # DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
 # nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
 # is the morphology-safety question. Default keeps the time-only objective.
-DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-time}"
+DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-speed}"
 DESIGN_COST_WEIGHT="${DESIGN_COST_WEIGHT:-0}"
-FLIP_COST="${FLIP_COST:-0}"
-NUM_EVALS="${NUM_EVALS:-9}"
-RESUME="${RESUME:-/root/MorphoSafety/checkpoints/codesign_resume_src/000060293120}"
-NAME="${NAME:-ant_codesign_r$(date -u +%m%d%H%M)}"
+FLIP_COST="${FLIP_COST:-50}"
+PENALIZER="${PENALIZER:-ppo_lagrangian}"   # none = the Schaff baseline
+BUDGET="${BUDGET:-25}"
+MULT_LR="${MULT_LR:-1.5e-5}"
+MULT_MAX="${MULT_MAX:-3.0}"
+MULT_INIT="${MULT_INIT:-0.01}"
+GRID="${GRID:-7}"
+# 11 evals over 300M = 80 design iterations at 1.46 episodes/lane (see 3.);
+# for a resume of the 2026-08 run use NUM_EVALS=9 STEPS=240000000.
+NUM_EVALS="${NUM_EVALS:-11}"
+RESUME="${RESUME:-}"
+NAME="${NAME:-ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_r$(date -u +%m%d%H%M)}"
 CKPT="/root/MorphoSafety/checkpoints/$NAME"
 
 # PREFLIGHT 1: a GPU that JAX can actually SEE -- assert on device.platform,
@@ -129,11 +142,11 @@ echo
 # PREFLIGHT 2: the synced code is new enough, and the observation is the width
 # this run is FOR.
 #
-# 55 = 47 (lidar-only) + 7 genes + 1 Saute budget scalar. A silent 71 would
-# mean --foot_obstacle_obs leaked back on; a silent 47 would mean morphology
-# conditioning never reaches the observation, training a policy that cannot
-# see which body it is driving -- the whole method gone, with a normal-looking
-# log. rsync makes a stale checkout unlikely here, unlike the git-clone path
+# 250 = 47 (proprio + goal + lidar) + 196 (4 feet x 7x7 grid) + 7 genes; no
+# budget scalar (that was Saute's). A silent 54 would mean the foot grid is
+# off; a silent 243 would mean morphology conditioning never reaches the
+# observation, training a policy that cannot see which body it is driving --
+# the whole method gone, with a normal-looking log. rsync makes a stale checkout unlikely here, unlike the git-clone path
 # on mscluster, but the assert is free.
 echo "=== code / observation preflight ==="
 python -c "
@@ -149,12 +162,30 @@ assert 'design_tmax' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no --design_tmax; a resume would anneal the design lr against the '
     'wrong horizon. Re-sync.')
 
+p = T.build_argparser().parse_args(['--robot', 'ant', '--task', 'minefield'])
+T.apply_robot_defaults(p)
+assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost) == (
+    'ppo_lagrangian', 25.0, 7, 50.0), (
+    f'ABORT: trainer defaults are not the 2026-09-25 recipe: {p.penalizer} '
+    f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. Re-sync.')
 kw = dict(T.robot_env_kwargs('ant'))
-kw['foot_obstacle_obs'] = False
 kw['morphology_conditioning'] = True
-w = Minefield(**kw).observation_size
-assert w == 47 + morphology.NUM_GENES, f'expected 54 pre-Saute, got {w}'
-print(f'PASS: obs {w} + 1 Saute = {w+1}, design checkpointing present')
+env = Minefield(**kw)
+assert env._ground_contact_eps == 0.05 and env._hazard_cost_shape == 'linear', (
+    'ABORT: cost is not linear at the 5 cm gate. Re-sync.')
+w = env.observation_size
+assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+print(f'PASS: obs {w} (grid 7 + genes), 5 cm linear cost, design checkpointing present')
+import jax, numpy as np, jax.numpy as jp
+a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
+ref = a.astype(np.float64) @ a.astype(np.float64)
+err = float(np.abs(np.asarray(jax.jit(jp.matmul)(a, a), np.float64) - ref).max() / np.abs(ref).max())
+prec = jax.config.jax_default_matmul_precision
+assert prec == 'highest' and err < 1e-5, (
+    f'ABORT: matmuls are not float32 here (precision={prec}, rel err {err:.1e}; '
+    f'TF32 is ~3e-4). Unset JAX_DEFAULT_MATMUL_PRECISION, or the checkout predates '
+    f'mjx_safety_gym/numerics.py (2026-09-26).')
+print(f'PASS: float32 matmuls on {jax.default_backend()} (rel err {err:.1e})')
 " || { echo "=== code preflight FAILED, no compute spent ==="; exit 1; }
 echo
 
@@ -164,6 +195,7 @@ echo
 # search silently restarts from its init while the log reads like a
 # continuation. train.py warns, but a warning 12 hours into a paid run is not
 # a control. Refuse instead.
+if [ -n "$RESUME" ]; then
 echo "=== resume preflight ==="
 [ -d "$RESUME" ] || {
   echo "ABORT: RESUME=$RESUME is not a directory."
@@ -185,6 +217,11 @@ sig = np.exp(z['gmm_log_stds'][lm > -1e5]).mean()
 print(f'      mean sigma of live components: {sig:.4f}  (init 0.577)')
 " || exit 1
 [ "$CKPT" = "$RESUME" ] && { echo "ABORT: output dir == resume dir"; exit 1; }
+  set -- --restore_checkpoint_path "$RESUME"
+else
+  echo "=== fresh run (no RESUME) ==="
+  set --
+fi
 echo
 
 # 0.75 of 24 GB -- the same fraction the mscluster jobs use, left alone so a
@@ -192,12 +229,12 @@ echo
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
 
 echo "=========================================================="
-echo " co-design RESUME"
-echo "   from        $RESUME"
-echo "   steps       $STEPS  (design axis $(python -c "
-import numpy as np;print(f'{int(np.load(\"$RESUME/design_state.npz\")[\"last_step\"]):,}')") -> $DESIGN_TMAX)"
-echo "   design_lr   $DESIGN_LR   (was 0.001 -- see this file's header)"
-echo "   num_evals   $NUM_EVALS   (keeps 1.46 episodes/lane/iteration)"
+echo " co-design $([ -n "$RESUME" ] && echo "RESUME from $RESUME" || echo FRESH)"
+echo "   steps       $STEPS  (design_tmax $DESIGN_TMAX)"
+echo "   design_lr   $DESIGN_LR   objective $DESIGN_OBJECTIVE"
+echo "   safe RL     $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT"
+echo "   env         grid $GRID  flip $FLIP_COST  linear 5 cm  finish line  float32 matmuls"
+echo "   num_evals   $NUM_EVALS"
 echo "   out         $CKPT"
 echo "=========================================================="
 echo
@@ -210,11 +247,15 @@ echo
 # terminate_on_flip / terminate_on_goal are deliberately NOT passed: they
 # resolve from _ROBOT_DEFAULTS and print on the first line of the log. Pinning
 # them here would freeze this run to whatever was correct the day it was
-# written -- and this run must match the one it continues.
+# written.
 time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant --task minefield \
-  --penalizer saute --safety_budget 500 --saute_terminate \
+  --penalizer "$PENALIZER" --safety_budget "$BUDGET" --adaptive_budget_horizon \
+  --lagrangian_multiplier_lr "$MULT_LR" --lagrangian_multiplier_max "$MULT_MAX" \
+  --initial_lagrange_multiplier "$MULT_INIT" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
+  --foot_hazard_grid "$GRID" --hazard_cost_shape linear --finish_line \
+  --matmul_precision highest \
   --corridor_walls --boundary_cost_weight 0 \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
@@ -229,8 +270,7 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --num_timesteps "$STEPS" \
   --design_tmax "$DESIGN_TMAX" \
   --num_evals "$NUM_EVALS" \
-  --checkpoint_logdir "$CKPT" \
-  --restore_checkpoint_path "$RESUME"
+  --checkpoint_logdir "$CKPT" "$@"
 status=$?
 
 echo

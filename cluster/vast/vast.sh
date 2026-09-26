@@ -413,7 +413,8 @@ codesign)
   # to have already set, so an inherited value is indistinguishable from an
   # intended one. A prefix nothing else uses removes the ambiguity.
   envs=""
-  for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME DESIGN_OBJECTIVE DESIGN_COST_WEIGHT FLIP_COST; do
+  for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME DESIGN_OBJECTIVE DESIGN_COST_WEIGHT FLIP_COST \
+           PENALIZER BUDGET MULT_LR MULT_MAX MULT_INIT GRID; do
     eval "val=\${CODESIGN_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
   done
   rexec "cd $REMOTE_DIR && mkdir -p logs && \
