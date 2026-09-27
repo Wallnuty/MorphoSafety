@@ -183,6 +183,19 @@ _ROBOT_DEFAULTS = {
         # the 2026-09-21 A/B (cost 43.3 vs 53.8, speed 1.08 vs 0.99). Obs
         # 47 -> 243. Older checkpoints load through _env_kwarg_candidates.
         "foot_obstacle_obs": False, "foot_hazard_grid": 7, "finish_line": True,
+        #
+        # SOLVER CAPS 4/8 (2026-09-27), was the XML's MuJoCo defaults 100/50.
+        # MJX runs every line-search step for every env, so ls_iterations was
+        # the dominant cost of training. Measured on the laptop, 512 envs, no
+        # walls: 3821 -> 13317 training sps (10/10: 10075). Physics check
+        # against 100/50: one-step velocity error median 4e-8 (the GPU's own
+        # run-to-run noise), p99 2e-3 over 1024 states; the b10 policy over
+        # 256 episodes unchanged (return 21.29 vs 21.00, speed 1.14 vs 1.12,
+        # cost 9.8 vs 12.4, flips 4.7% vs 6.6%, same foot penetration and
+        # torso height). 1/4 broke it (flips 20%, cost 3x). Pass
+        # --solver_iterations 100 --solver_ls_iterations 50 to reproduce
+        # earlier ant runs. See world.apply_solver.
+        "solver_iterations": 4, "solver_ls_iterations": 8,
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -313,7 +326,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
     "goal_observation", "terminate_on_goal", "foot_obstacle_obs", "foot_hazard_grid",
-    "finish_line",
+    "finish_line", "solver_iterations", "solver_ls_iterations",
 )
 
 
@@ -1139,14 +1152,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--corridor_walls",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="[--task run/minefield] Physical walls at +-corridor_half_width. "
-        "ON by default since 2026-08-22; --no-corridor_walls reproduces earlier "
-        "results. Without them, a cost-constrained policy's best move is to bow "
-        "out to |y|~1.4 where no hazard is ever sampled and cross at zero cost "
-        "for ~4%% extra path -- the constraint becomes cheap rather than a "
-        "trade-off. Walls make that impossible instead of merely expensive, and "
-        "cost nothing in nq/nv (static geoms, no joints).",
+        "OFF by default since 2026-09-26 (on 2026-08-22..09-25; pass "
+        "--corridor_walls to reproduce those runs). They cost 27%% of training "
+        "throughput (2787 vs 3824 sps measured, laptop, 512 envs): 34 extra "
+        "contact slots per ant, 188 -> 324 solver rows, every step. "
+        "--terminate_out_of_bounds now keeps the task a minefield crossing.",
+    )
+    parser.add_argument(
+        "--terminate_out_of_bounds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--task run/minefield] End the episode when the torso centre "
+        "leaves the corridor (|y| > corridor_half_width). ON by default since "
+        "2026-09-26, replacing the walls: without either, a cost-constrained "
+        "policy's best move is to step out to where no hazard is ever placed "
+        "and cross at zero cost for ~4%% extra path. A task failure, not a "
+        "per-step cost -- see --exit_cost.",
+    )
+    parser.add_argument(
+        "--exit_cost",
+        type=float,
+        default=50.0,
+        help="[--terminate_out_of_bounds] COST charged once when the torso "
+        "leaves the corridor -- --flip_cost's twin, for the same reason: an "
+        "exit ends the episode, so without it 'walk 3 m and step out' stops "
+        "the cost meter and satisfies a per-episode budget. 50 = the flip "
+        "cost, ~one careless crossing.",
     )
     parser.add_argument(
         "--healthy_reward",
@@ -1238,6 +1271,22 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_minibatches", type=int, default=16)
     parser.add_argument("--unroll_length", type=int, default=10)
+    parser.add_argument(
+        "--solver_iterations",
+        type=int,
+        default=None,
+        help="Constraint-solver iteration cap. Unset = the robot default "
+        "(see _ROBOT_DEFAULTS; the XML's own value where there is none). "
+        "Pass 100 with --solver_ls_iterations 50 to reproduce ant runs from "
+        "before 2026-09-27. See world.apply_solver for the measurements.",
+    )
+    parser.add_argument(
+        "--solver_ls_iterations",
+        type=int,
+        default=None,
+        help="Line-search steps per solver iteration -- the dominant cost: "
+        "MJX runs all of them for every env. See --solver_iterations.",
+    )
     parser.add_argument(
         "--integrator",
         choices=["rk4", "implicitfast", "euler"],
@@ -1592,6 +1641,8 @@ def train(args: argparse.Namespace):
             robot=args.robot,
             morphology_conditioning=bool(args.num_morphologies),
             integrator=args.integrator,
+            solver_iterations=args.solver_iterations,
+            solver_ls_iterations=args.solver_ls_iterations,
             hazard_size=args.hazard_size,
             ground_contact_eps=args.ground_contact_eps,
             hazard_footprint=args.hazard_footprint,
@@ -1611,6 +1662,8 @@ def train(args: argparse.Namespace):
                 ctrl_cost_weight=args.ctrl_cost_weight,
                 boundary_cost_weight=args.boundary_cost_weight,
                 corridor_walls=args.corridor_walls,
+                terminate_out_of_bounds=args.terminate_out_of_bounds,
+                exit_cost=args.exit_cost,
                 start_y_jitter=args.start_y_jitter,
                 hazard_step_on=args.hazard_step_on,
                 hazard_shaping_weight=args.hazard_shaping_weight,

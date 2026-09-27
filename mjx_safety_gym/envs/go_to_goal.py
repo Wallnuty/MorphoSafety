@@ -19,6 +19,7 @@ from mjx_safety_gym.world import (
     ObjectSpec,
     _sample_layout,
     apply_integrator,
+    apply_solver,
     build_arena,
     draw_until_valid,
 )
@@ -161,6 +162,9 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         vision_config=None,
         morphology_conditioning: bool = False,
         integrator: str | None = None,
+        # Constraint-solver caps; None keeps the XML's. See world.apply_solver.
+        solver_iterations: int | None = None,
+        solver_ls_iterations: int | None = None,
         num_hazards: int = 10,
         num_vases: int = 10,
         lidar_groups: Optional[Sequence[str]] = None,
@@ -349,9 +353,11 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # integrator would silently step different physics from the nominal env
         # while being stacked into the same batch.
         self._integrator = integrator
+        self._solver_caps = (solver_iterations, solver_ls_iterations)
 
         mjSpec: mj.MjSpec = mj.MjSpec.from_file(filename=str(self._xml_path), assets={})
         apply_integrator(mjSpec, integrator)
+        apply_solver(mjSpec, *self._solver_caps)
         self._build_arena(mjSpec)
         self._mj_model = mjSpec.compile()
 
@@ -435,6 +441,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             filename=str(self._xml_path), assets={}
         )
         apply_integrator(mjSpec, self._integrator)
+        apply_solver(mjSpec, *self._solver_caps)
         morphology_lib.apply_morphology(mjSpec, spec)
         self._build_arena(mjSpec)
         model = mjSpec.compile()

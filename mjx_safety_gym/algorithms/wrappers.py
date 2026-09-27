@@ -34,7 +34,11 @@ class CostEpisodeWrapper(brax_training.EpisodeWrapper):
     # scan, like reward -- anything left out reads as its last inner step only.
     # `hazard_shaping` (RunForward, 2026-09-13) is the graded foot-in-hazard
     # term; it is here so eval/episode_hazard_shaping is an exact episode total.
-    _SUMMED_INFO_KEYS = ("cost", "eval_reward", "hazard_shaping", "hazard_steps", "dx")
+    # `flipped` / `out_of_bounds` (2026-09-27) are per-step EVENT flags.
+    _SUMMED_INFO_KEYS = (
+        "cost", "eval_reward", "hazard_shaping", "hazard_steps", "dx",
+        "flipped", "out_of_bounds",
+    )
 
     def step(self, state: State, action: jax.Array) -> State:
         def f(state, _):

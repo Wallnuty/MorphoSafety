@@ -144,12 +144,12 @@ def rollout_many(env, policy_fn, seeds, n_decisions, action_repeat):
                 # is exactly what made the first run of this script unreadable.
                 d = ns.data.site_xpos[site][:2] - s.data.site_xpos[site][:2]
                 # .get, because the two tasks carry different info keys:
-                # out_of_bounds is RunForward-only and goal_reached is
+                # outside_corridor is RunForward-only and goal_reached is
                 # GoToGoal-only. Indexing either directly makes --task goal
                 # raise KeyError, which is what it used to do.
                 zero = jp.zeros(())
                 return ns, (ns.reward, ns.info["cost"],
-                            ns.info.get("out_of_bounds", zero),
+                            ns.info.get("outside_corridor", zero),
                             ns.info.get("goal_reached", zero),
                             jp.linalg.norm(d), d[1], ns.done)
 

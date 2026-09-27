@@ -697,6 +697,8 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
                 why = f"REACHED GOAL in {decisions} decisions ({decisions * CTRL_DT:.1f}s)"
             elif hasattr(env, "is_flipped") and float(env.is_flipped(state.data)) > 0:
                 why = f"flipped over after {decisions} decisions"
+            elif float(state.info.get("outside_corridor", 0.0)) > 0:
+                why = f"LEFT THE CORRIDOR after {decisions} decisions"
             print(f"  episode {episode}: {why}")
             rng, rng_ep = jax.random.split(rng)
             state = reset_fn(rng_ep)

@@ -164,8 +164,10 @@ assert 'design_tmax' in {a.dest for a in T.build_argparser()._actions}, (
 
 p = T.build_argparser().parse_args(['--robot', 'ant', '--task', 'minefield'])
 T.apply_robot_defaults(p)
-assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost) == (
-    'ppo_lagrangian', 25.0, 7, 50.0), (
+assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost,
+        p.corridor_walls, p.terminate_out_of_bounds, p.exit_cost,
+        p.solver_iterations, p.solver_ls_iterations) == (
+    'ppo_lagrangian', 25.0, 7, 50.0, False, True, 50.0, 4, 8), (
     f'ABORT: trainer defaults are not the 2026-09-25 recipe: {p.penalizer} '
     f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. Re-sync.')
 kw = dict(T.robot_env_kwargs('ant'))
@@ -175,6 +177,8 @@ assert env._ground_contact_eps == 0.05 and env._hazard_cost_shape == 'linear', (
     'ABORT: cost is not linear at the 5 cm gate. Re-sync.')
 w = env.observation_size
 assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+o = env.mj_model.opt
+assert (o.iterations, o.ls_iterations) == (4, 8), f'ABORT: solver caps {o.iterations}/{o.ls_iterations}, expected 4/8'
 print(f'PASS: obs {w} (grid 7 + genes), 5 cm linear cost, design checkpointing present')
 import jax, numpy as np, jax.numpy as jp
 a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
@@ -255,8 +259,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --initial_lagrange_multiplier "$MULT_INIT" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
   --foot_hazard_grid "$GRID" --hazard_cost_shape linear --finish_line \
-  --matmul_precision highest \
-  --corridor_walls --boundary_cost_weight 0 \
+  --matmul_precision highest --solver_iterations 4 --solver_ls_iterations 8 \
+  --no-corridor_walls --terminate_out_of_bounds --exit_cost 50 --boundary_cost_weight 0 \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
   --flip_cost "$FLIP_COST" \

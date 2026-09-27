@@ -160,8 +160,18 @@ class RunForward(GoToGoal):
         start_margin: float | None = None,
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.0,
-        boundary_cost_weight: float = 1.0,
-        corridor_walls: bool = True,
+        boundary_cost_weight: float = 0.0,  # 0 since 2026-09-26, matching the CLI
+        corridor_walls: bool = False,
+        # CORRIDOR EXIT ENDS THE EPISODE (2026-09-26), replacing the walls as
+        # what keeps the task a minefield crossing. Without either, the safe
+        # optimum is to step out past |y| = corridor_half_width, where no hazard
+        # is ever placed, and walk the mines' flank at zero cost. Leaving is a
+        # task failure, not a safety event, so it ends the episode like a flip
+        # rather than accruing per-step cost. `exit_cost` is charged once on the
+        # exit, for the same reason `flip_cost` is: otherwise "walk 3 m, step
+        # out" stops the cost meter and would satisfy a per-episode budget.
+        terminate_out_of_bounds: bool = True,
+        exit_cost: float = 0.0,
         draw_corridor_lines: bool = False,
         healthy_reward: float = 0.0,
         terminate_on_flip: bool = False,
@@ -241,6 +251,10 @@ class RunForward(GoToGoal):
         self._ctrl_cost_weight = float(ctrl_cost_weight)
         self._boundary_cost_weight = float(boundary_cost_weight)
         self._corridor_walls = bool(corridor_walls)
+        self._terminate_out_of_bounds = bool(terminate_out_of_bounds)
+        if float(exit_cost) < 0.0:
+            raise ValueError(f"exit_cost must be >= 0, got {exit_cost}")
+        self._exit_cost = float(exit_cost)
         self._draw_corridor_lines = bool(draw_corridor_lines)
         self._healthy_reward = float(healthy_reward)
         self._terminate_on_flip = bool(terminate_on_flip)
@@ -311,8 +325,7 @@ class RunForward(GoToGoal):
             hazard_height=self._ground_contact_eps,
             vase_mass=_ROBOT_CONFIGS[self._robot]["vase_mass"],
         )
-        if self._corridor_walls:
-            self._add_corridor_walls(mjSpec)
+        self._add_corridor_walls(mjSpec)
         if self._finish_line:
             self._add_finish_line(mjSpec)
 
@@ -338,8 +351,15 @@ class RunForward(GoToGoal):
     def _add_corridor_walls(self, spec: mj.MjSpec) -> None:
         """Two static boxes that make the corridor PHYSICAL rather than a cost.
 
-        ON BY DEFAULT since 2026-08-22. Pass corridor_walls=False (CLI:
-        --no-corridor_walls) to reproduce anything measured before that date.
+        OFF BY DEFAULT since 2026-09-26 (on from 2026-08-22). They were the
+        whole of the throughput loss since then: 34 extra contact slots per
+        ant, 188 -> 324 solver rows, measured 2787 -> 3824 training sps with
+        them removed (laptop, 512 envs); every other addition measured ~0.
+        terminate_out_of_bounds replaces them. Pass corridor_walls=True (CLI:
+        --corridor_walls) to reproduce 2026-08-22..09-25 runs.
+
+        Also draws the viewer's lane stripes (draw_corridor_lines) with or
+        without the walls, so every _build_arena calls this unconditionally.
 
         WHY THIS REPLACES THE BOUNDARY COST. Leaving a corridor is a task-scope
         violation, not a safety violation, and charging it as `cost` put it in
@@ -399,20 +419,21 @@ class RunForward(GoToGoal):
         half_thick_line = 0.02 * a
         half_height_line = 0.002 * a
         for sign, side in ((1.0, "left"), (-1.0, "right")):
-            spec.worldbody.add_geom(
-                name=f"corridor_wall_{side}",
-                type=mj.mjtGeom.mjGEOM_BOX,
-                size=[half_len, half_thick, half_height],
-                # Inner FACE sits exactly on +-corridor_half_width, so the wall
-                # stands where the boundary cost used to be charged rather than
-                # a wall-thickness away from it.
-                pos=[
-                    0.0,
-                    sign * (self._corridor_half_width + half_thick),
-                    half_height,
-                ],
-                rgba=wall_rgba,
-            )
+            if self._corridor_walls:
+                spec.worldbody.add_geom(
+                    name=f"corridor_wall_{side}",
+                    type=mj.mjtGeom.mjGEOM_BOX,
+                    size=[half_len, half_thick, half_height],
+                    # Inner FACE sits exactly on +-corridor_half_width, so the wall
+                    # stands where the boundary cost used to be charged rather than
+                    # a wall-thickness away from it.
+                    pos=[
+                        0.0,
+                        sign * (self._corridor_half_width + half_thick),
+                        half_height,
+                    ],
+                    rgba=wall_rgba,
+                )
             if not self._draw_corridor_lines:
                 continue
             # Centred ON the boundary, not on the wall's centre, so the stripe
@@ -795,6 +816,12 @@ class RunForward(GoToGoal):
             # Recomputed fresh every step, never carried. A key present in only
             # one of reset/step is a pytree structure mismatch for the
             # auto-reset wrapper, so both must list all of them.
+            # outside_corridor: torso past the edge NOW (a state, per step).
+            # flipped / out_of_bounds: 1 on the step the torso went over / left
+            # the corridor (events), summed per episode into
+            # eval/episode_flipped and eval/episode_out_of_bounds (2026-09-27).
+            "outside_corridor": jp.zeros(()),
+            "flipped": jp.zeros(()),
             "out_of_bounds": jp.zeros(()),
             "upright": self.is_upright(data),
             # ARRIVAL LATCH, and it has to live in the env rather than be read
@@ -854,9 +881,18 @@ class RunForward(GoToGoal):
         state.info["dx"] = (
             data.site_xpos[self._robot_site_id][0] - state.data.site_xpos[self._robot_site_id][0]
         )
+        went_over = self.is_flipped(data) * (1.0 - self.is_flipped(state.data))
         if self._flip_cost:
-            went_over = self.is_flipped(data) * (1.0 - self.is_flipped(state.data))
             cost = cost + self._flip_cost * went_over
+        # Torso centre past the corridor edge. See terminate_out_of_bounds.
+        # Charged on the TRANSITION, like the flip, because CostEpisodeWrapper
+        # keeps stepping the inner env after `done` within a decision.
+        half_w = self._corridor_half_width
+        out_now = jp.abs(data.site_xpos[self._robot_site_id][1]) > half_w
+        out_prev = jp.abs(state.data.site_xpos[self._robot_site_id][1]) > half_w
+        left = (out_now & ~out_prev).astype(jp.float32)
+        if self._terminate_out_of_bounds and self._exit_cost:
+            cost = cost + self._exit_cost * left
         if self._hazard_shaping_weight:
             # Shaping goes on the REWARD, not the cost. The metric the budget is
             # judged against must stay the binary count or nothing before this
@@ -874,6 +910,8 @@ class RunForward(GoToGoal):
         # of every batch was that (see is_upright's note).
         if self._terminate_on_flip:
             done = jp.maximum(done, self.is_flipped(data))
+        if self._terminate_out_of_bounds:
+            done = jp.maximum(done, out_now.astype(jp.float32))
 
         # Arrival termination. ON by default since 2026-08-18. Pass
         # terminate_on_goal=False (CLI: --no-terminate_on_goal) to reproduce
@@ -894,15 +932,23 @@ class RunForward(GoToGoal):
         if self._terminate_on_goal:
             done = jp.maximum(done, at_goal)
 
+        # STICKY WITHIN A DECISION (2026-09-27). CostEpisodeWrapper reads `done`
+        # off the LAST of its action_repeat inner steps, so an event that does
+        # not persist -- the torso brushing past the corridor edge and back, or
+        # tumbling over and upright again -- was charged its cost but did not
+        # end the episode. BraxAutoResetWrapper zeroes `done` before every
+        # decision, so this cannot leak across episodes.
+        done = jp.maximum(done, state.done)
+
         # Latched unconditionally, including when terminate_on_goal is off, so
         # "did this episode ever reach the goal" is answerable either way. One
         # extra float per lane; the distance it needs was already computed.
         state.info["arrived"] = jp.maximum(state.info["arrived"], at_goal)
         state.info["cost"] = cost
         state.info["upright"] = self.is_upright(data)
-        state.info["out_of_bounds"] = (
-            jp.abs(data.site_xpos[self._robot_site_id][1]) > self._corridor_half_width
-        ).astype(jp.float32)
+        state.info["outside_corridor"] = out_now.astype(jp.float32)
+        state.info["flipped"] = went_over
+        state.info["out_of_bounds"] = left
 
         return State(
             data=data,

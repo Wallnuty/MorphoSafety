@@ -57,6 +57,8 @@ export SAFE_MULT_LR=1.5e-5
 export SAFE_FLIP_COST=50
 export SAFE_GRID=5
 export SAFE_PRECISION=default   # TF32, as the runs these continue (2026-09-26)
+export SAFE_WALLS=1              # walls, as the runs these continue (2026-09-26)
+export SAFE_SOLVER_IT=100 SAFE_SOLVER_LS=50   # solver, as the runs these continue
 export SAFE_STEPS=100000000
 export SAFE_NUM_EVALS=21           # every 5M, same cadence as the 50M runs
 

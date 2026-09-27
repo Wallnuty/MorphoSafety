@@ -301,6 +301,17 @@ LIDAR="${SAFE_LIDAR:-1}"
 # highest = float32 matmuls (default since 2026-09-26); default = TF32, what
 # every earlier arm used -- set it to continue or reproduce one of those.
 PRECISION="${SAFE_PRECISION:-highest}"
+# 2026-09-26: walls OFF (they cost 27% of throughput); leaving the corridor
+# ends the episode and costs EXIT_COST instead. SAFE_WALLS=1 reproduces the
+# 2026-08-22..09-25 arms.
+WALLS="${SAFE_WALLS:-0}"
+EXIT_COST="${SAFE_EXIT_COST:-50}"
+if [ "$WALLS" = "1" ]; then WALLS_FLAG=--corridor_walls; else WALLS_FLAG=--no-corridor_walls; fi
+# Solver caps: empty = the robot default (ant 4/8 since 2026-09-27); 100/50
+# reproduces earlier arms.
+SOLVER_IT="${SAFE_SOLVER_IT:-}"; SOLVER_LS="${SAFE_SOLVER_LS:-}"
+SOLVER_FLAGS=(); [ -n "$SOLVER_IT" ] && SOLVER_FLAGS+=(--solver_iterations "$SOLVER_IT")
+[ -n "$SOLVER_LS" ] && SOLVER_FLAGS+=(--solver_ls_iterations "$SOLVER_LS")
 if [ "$FINISH_LINE" = "1" ]; then FINISH_FLAG=--finish_line; else FINISH_FLAG=--no-finish_line; fi
 if [ "$LIDAR" = "1" ]; then LIDAR_FLAG=--hazard_lidar; else LIDAR_FLAG=--no-hazard_lidar; fi
 EPS_FLAG=(); [ -n "$EPS" ] && EPS_FLAG=(--ground_contact_eps "$EPS")
@@ -366,7 +377,7 @@ echo
 # checkout has gone stale before -- a previous sweep ran eight hours of
 # pre-change code -- so assert on the actual API, not on `git log`.
 echo "=== code / observation preflight ==="
-FOOT_OBS="$FOOT_OBS" GRID="$GRID" RINGS="$RINGS" LIDAR="$LIDAR" python -c "
+FOOT_OBS="$FOOT_OBS" GRID="$GRID" RINGS="$RINGS" LIDAR="$LIDAR" PRECISION="$PRECISION" python -c "
 import inspect, os
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
@@ -399,6 +410,21 @@ assert 'hazard_footprint' in dests, (
     'be comparable to the arms that have it. git pull.')
 for f in ('hazard_cost_shape', 'flip_cost', 'foot_hazard_grid'):
     assert f in dests, f'ABORT: no --{f} in this checkout (added 2026-09-17). git pull.'
+for f in ('matmul_precision', 'corridor_walls', 'terminate_out_of_bounds', 'exit_cost',
+          'solver_iterations', 'solver_ls_iterations'):
+    assert f in dests, f'ABORT: no --{f} in this checkout (added 2026-09-26/27). git pull.'
+from mjx_safety_gym.algorithms.wrappers import CostEpisodeWrapper
+assert {'flipped', 'out_of_bounds'} <= set(CostEpisodeWrapper._SUMMED_INFO_KEYS), (
+    'ABORT: no flipped / out-of-bounds eval metrics in this checkout (2026-09-27). git pull.')
+if os.environ.get('PRECISION', 'highest') == 'highest':
+    import jax, numpy as np, jax.numpy as jp
+    from mjx_safety_gym.numerics import configure_matmul_precision
+    configure_matmul_precision('highest')
+    a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
+    ref = a.astype(np.float64) @ a.astype(np.float64)
+    err = float(np.abs(np.asarray(jax.jit(jp.matmul)(a, a), np.float64) - ref).max() / np.abs(ref).max())
+    assert err < 1e-5, f'ABORT: highest precision is not float32 on this GPU (rel err {err:.1e}).'
+    print(f'PASS: float32 matmuls (rel err {err:.1e})')
 kw0 = dict(T.robot_env_kwargs('ant')); kw0['foot_obstacle_obs'] = False
 e0 = Minefield(**kw0)
 assert abs(e0._ground_contact_eps - 0.05) < 1e-9 and e0._hazard_footprint == 'contact' \
@@ -427,6 +453,7 @@ echo "   policy 256x4, lidar-only, $STEPS steps -> $CKPT"
 [ "$PENALIZER" = "none" ] && echo "   UNCONSTRAINED -- budget flags ignored"
 [ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: reward -= $SHAPING_W * graded foot-in-hazard (ramp radius $SHAPING_R)"
 echo "   cost: $COST_SHAPE penetration, grounded within 5 cm, flip_cost=$FLIP_COST; hazard_steps logged alongside"
+echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION"
 echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
 echo "   CHECK FIRST: training/budget_mean_episode_decisions"
 echo "     pinned at 625 => the fix never engaged, this is the OLD experiment"
@@ -454,9 +481,9 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_size 0.16 "$LIDAR_FLAG" "$FOOT_FLAG" --foot_hazard_grid "$GRID" --foot_hazard_rings "$RINGS" \
   "$FINISH_FLAG" "${EPS_FLAG[@]}" \
   --hazard_cost_shape "$COST_SHAPE" --flip_cost "$FLIP_COST" \
-  --matmul_precision "$PRECISION" \
+  --matmul_precision "$PRECISION" "${SOLVER_FLAGS[@]}" \
   --hazard_shaping_weight "$SHAPING_W" --hazard_shaping_radius "$SHAPING_R" \
-  --corridor_walls --boundary_cost_weight 0 \
+  "$WALLS_FLAG" --terminate_out_of_bounds --exit_cost "$EXIT_COST" --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes "$WIDTH" "$WIDTH" "$WIDTH" "$WIDTH" \
   --num_envs 1024 --num_minibatches 32 \
   --num_timesteps "$STEPS" --num_evals "$NUM_EVALS" \
@@ -483,7 +510,7 @@ B = float(os.environ["BUDGET"])
 # exact). displ is derived from reward (see below) for runs logged before
 # 2026-09-18; when eval/episode_dx is present it is used instead.
 print(f"{'step':>12} {'reward':>7} {'speed':>7} {'displ':>7} {'cost':>7} {'vs B':>6} {'cost/m':>6} "
-      f"{'hz_steps':>8} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
+      f"{'hz_steps':>8} {'flip%':>6} {'oob%':>5} {'ep_len':>7} {'mean_dec':>9} {'mult/active':>12}")
 for line in p.read_text().splitlines():
     if not line.startswith("step="):
         continue
@@ -501,10 +528,13 @@ for line in p.read_text().splitlines():
     knob = (g.get("training/lagrange_multiplier") or g.get("training/scheduled/kappa")
             or g.get("training/crpo/active", "--"))
     displ = float(g["eval/episode_dx"]) if "eval/episode_dx" in g else (r - 0.0002 * l) / 2
+    # Fraction of eval episodes that went over / left the corridor (logged
+    # since 2026-09-27; '--' for older runs).
+    pct = lambda k: (f"{100 * float(g['eval/episode_' + k]):.0f}%" if 'eval/episode_' + k in g else "--")
     per_m = f"{c/displ:>6.1f}" if displ > 0.5 else f"{'--':>6}"
     speed = f"{float(g['eval/episode_speed']):>6.2f}" if "eval/episode_speed" in g else f"{displ/(0.02*l):>6.2f}"
     print(f"{int(float(g['step'])):>12,} {r:>7.2f} {speed}m/s {displ:>6.2f}m {c:>7.1f} "
-          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {l:>7.0f} "
+          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {pct('flipped'):>6} {pct('out_of_bounds'):>5} {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY
 echo

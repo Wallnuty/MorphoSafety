@@ -156,8 +156,7 @@ class Lasers(RunForward):
         # that method's own trailing call does not run. This is the exact trap
         # that made the corridor walls silently absent on Minefield's first
         # test (ngeom 35 with and without them).
-        if self._corridor_walls:
-            self._add_corridor_walls(mjSpec)
+        self._add_corridor_walls(mjSpec)  # walls and/or viewer stripes
         if self._finish_line:
             self._add_finish_line(mjSpec)
 

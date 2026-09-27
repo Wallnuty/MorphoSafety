@@ -64,6 +64,34 @@ def apply_integrator(spec: mj.MjSpec, integrator: str | None) -> None:
     spec.option.integrator = INTEGRATORS[key]
 
 
+def apply_solver(
+    spec: mj.MjSpec, iterations: int | None, ls_iterations: int | None
+) -> None:
+    """Override the XML's constraint-solver caps, in place, before compile().
+
+    The ant XML declares none, so it ran MuJoCo's defaults (Newton, 100
+    iterations, 50 line-search steps). Under vmap MJX's line search is a
+    fixed-length scan -- all 50 steps run for every env on every solver
+    iteration -- which made it the dominant cost of the whole workload.
+    Measured 2026-09-26 (laptop, 512 envs, no walls), env-stepping throughput
+    and one-step velocity error against 100/50 over 1024 states:
+
+        100/50   4757 steps/s   (reference)
+         10/10  14392           median 4e-8, p99 3e-7  -- identical physics
+          4/8   21718           median 4e-8, p99 2e-3
+          2/6   35064           median 4e-3, p99 8e-2
+          1/4   61204           median 4e-2, p99 2e-1  -- breaks the b10 policy
+
+    Same reason as apply_integrator for acting on the spec: every compile path
+    (GoToGoal.__init__ and build_morphology_model) must agree, or morphology
+    lanes would step different physics from the base env. None keeps the XML's.
+    """
+    if iterations is not None:
+        spec.option.iterations = int(iterations)
+    if ls_iterations is not None:
+        spec.option.ls_iterations = int(ls_iterations)
+
+
 # sample_layout(vase: [10, 5], hazard: [20, 2], goal : []): [-2, -2, 2, 2]-> (vase: [x y theta])
 def build_arena(
     spec: mj.MjSpec,

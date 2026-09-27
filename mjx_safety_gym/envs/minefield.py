@@ -118,7 +118,6 @@ class Minefield(RunForward):
         # which is exactly how the walls silently failed to appear on their
         # first test (ngeom 35 with and without them). Any future _build_arena
         # override on a corridor task has to end with this line too.
-        if self._corridor_walls:
-            self._add_corridor_walls(mjSpec)
+        self._add_corridor_walls(mjSpec)  # walls and/or viewer stripes
         if self._finish_line:
             self._add_finish_line(mjSpec)

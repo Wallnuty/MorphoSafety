@@ -75,7 +75,7 @@ run_arm () {  # run_arm <budget> [resume dir] [steps] [run name]
       --lagrangian_multiplier_lr 1.5e-5 --lagrangian_multiplier_max 3.0 \
       --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs --foot_hazard_grid 5 \
       --hazard_cost_shape linear --flip_cost 50 --no-finish_line \
-      --matmul_precision default \
+      --matmul_precision default --solver_iterations 100 --solver_ls_iterations 50 \
       --corridor_walls --boundary_cost_weight 0 \
       --policy_hidden_layer_sizes 256 256 256 256 \
       --num_envs 512 --num_minibatches 16 \
