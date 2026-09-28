@@ -187,8 +187,13 @@ def train(
     design_updates_per_eval: int = 1,
     unnormalized_obs_tail: int = 0,
     unnormalized_obs_tail_offset: int = 0,
+    # >1: one Lagrange multiplier per design-distribution component (co-design
+    # only; penalizer_params must then hold a vector of that length).
+    lagrange_components: int = 1,
 ):
     assert batch_size * num_minibatches % num_envs == 0
+    if lagrange_components > 1 and design_loop is None:
+        raise ValueError("lagrange_components > 1 needs the co-design loop")
     if not safe:
         penalizer = None
         penalizer_params = None
@@ -278,8 +283,8 @@ def train(
     design_reset_fn = None
     if design_loop is not None:
 
-        def _reset_with_design(rng, fields, genes):
-            design_loop.install(fields, genes)
+        def _reset_with_design(rng, fields, genes, components):
+            design_loop.install(fields, genes, components)
             return env.reset(rng)
 
         design_reset_fn = jax.jit(jax.vmap(_reset_with_design))
@@ -344,6 +349,7 @@ def train(
         use_disagreement=use_disagreement,
         adaptive_budget_horizon=adaptive_budget_horizon,
         budget_decision_steps=num_decision_steps,
+        lagrange_components=lagrange_components,
     )
     training_step = update_step_factory(
         policy_loss,
@@ -363,6 +369,9 @@ def train(
         env_step_per_training_step,
         safe,
         use_disagreement,
+        lagrange_components=lagrange_components,
+        adaptive_budget_horizon=adaptive_budget_horizon,
+        budget_decision_steps=num_decision_steps,
     )
 
     def training_epoch(
@@ -605,7 +614,7 @@ def train(
                 # captures `first_state` at reset and replays it on every
                 # subsequent `done`, so a new body would otherwise keep being
                 # respawned into the previous body's initial pose.
-                fields, genes = design_loop.sample(
+                fields, genes, components = design_loop.sample(
                     local_devices_to_use, num_envs // process_count
                 )
                 key_env, design_key = jax.random.split(key_env)
@@ -613,7 +622,7 @@ def train(
                     jax.random.split(design_key, num_envs // process_count),
                     (local_devices_to_use, -1, 2),
                 )
-                env_state = design_reset_fn(design_keys, fields, genes)
+                env_state = design_reset_fn(design_keys, fields, genes, components)
 
             # optimization
             epoch_key, local_key = jax.random.split(local_key)
@@ -654,6 +663,14 @@ def train(
                     )
                     if k in _dm
                 )
+                if lagrange_components > 1:
+                    # Lambda of each LIVE component, epoch-averaged.
+                    _lam = " ".join(
+                        f"c{k}:{float(training_metrics[f'training/lagrange_multiplier_c{k}']):.2f}"
+                        for k in np.flatnonzero(design_loop.gmm.alive)
+                        if f"training/lagrange_multiplier_c{k}" in training_metrics
+                    )
+                    _flags += f" lam=[{_lam}]"
                 print(
                     f"design it={len(design_loop.history):>4}/"
                     f"{_total_design_iters} step={current_step:>12,} "

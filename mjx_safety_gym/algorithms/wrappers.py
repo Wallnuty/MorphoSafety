@@ -275,7 +275,7 @@ class MorphologyDesignWrapper(Wrapper):
         state, the vmap over lanes is plain `in_axes=0` -- no pytree of axis
         specs to keep in sync with `_BATCHED_FIELDS`.
       * `reset` needs the design BEFORE a state exists, so the real entry point
-        is `reset_with_design(rng, fields, genes)`. Plain `reset(rng)` replays
+        is `reset_with_design(rng, fields, genes, components)`. Plain `reset(rng)` replays
         whatever design was installed last, which is what brax's own
         `reset_fn` path needs.
 
@@ -290,6 +290,10 @@ class MorphologyDesignWrapper(Wrapper):
         self._base_model = base_model
         self._fields = fields  # only the initial design; steps read from state
         self._genes = genes
+        # Which design-distribution component each lane's body was drawn from,
+        # carried in info["design_component"] for the per-component Lagrange
+        # multipliers. Zeros until the design loop installs a population.
+        self._components = jp.zeros(genes.shape[0], dtype=jp.int32)
 
     def _env_fn(self, fields, genes) -> Env:
         env = self.env
@@ -297,7 +301,9 @@ class MorphologyDesignWrapper(Wrapper):
         env.unwrapped._morphology_genes = genes
         return env
 
-    def reset_with_design(self, rng: jax.Array, fields, genes: jax.Array) -> State:
+    def reset_with_design(
+        self, rng: jax.Array, fields, genes: jax.Array, components: jax.Array
+    ) -> State:
         """Reset every lane onto a NEW design. `fields`/`genes` lead with num_envs.
 
         Schaff resets the runner whenever the design changes
@@ -308,16 +314,17 @@ class MorphologyDesignWrapper(Wrapper):
         height, possibly interpenetrating the floor.
         """
 
-        def reset(fields, genes, rng):
+        def reset(fields, genes, component, rng):
             state = self._env_fn(fields, genes).reset(rng)
             state.info["morph_fields"] = fields
             state.info["morph_genes"] = genes
+            state.info["design_component"] = component
             return state
 
-        return jax.vmap(reset)(fields, genes, rng)
+        return jax.vmap(reset)(fields, genes, components.astype(jp.int32), rng)
 
     def reset(self, rng: jax.Array) -> State:
-        return self.reset_with_design(rng, self._fields, self._genes)
+        return self.reset_with_design(rng, self._fields, self._genes, self._components)
 
     def step(self, state: State, action: jax.Array) -> State:
         def step(s, a):

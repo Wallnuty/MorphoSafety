@@ -103,8 +103,8 @@ df -h / | tail -1
 echo
 
 # ---- overridable at launch, e.g. DESIGN_LR=0.05 bash cluster/vast/vast.sh codesign
-STEPS="${STEPS:-300000000}"
-DESIGN_TMAX="${DESIGN_TMAX:-300000000}"
+STEPS="${STEPS:-2000000000}"
+DESIGN_TMAX="${DESIGN_TMAX:-2000000000}"
 DESIGN_LR="${DESIGN_LR:-0.03}"
 # 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
 # DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
@@ -114,14 +114,34 @@ DESIGN_OBJECTIVE="${DESIGN_OBJECTIVE:-speed}"
 DESIGN_COST_WEIGHT="${DESIGN_COST_WEIGHT:-0}"
 FLIP_COST="${FLIP_COST:-50}"
 PENALIZER="${PENALIZER:-ppo_lagrangian}"   # none = the Schaff baseline
-BUDGET="${BUDGET:-25}"
+# Budget 2 (2026-09-28, user's call): at the 2 cm gate the single-ant runs
+# reached cost 2.7 at budget 5 and 1.9 at budget 0, so 25 would barely bind.
+BUDGET="${BUDGET:-2}"
 MULT_LR="${MULT_LR:-1.5e-5}"
 MULT_MAX="${MULT_MAX:-3.0}"
 MULT_INIT="${MULT_INIT:-0.01}"
 GRID="${GRID:-7}"
-# 11 evals over 300M = 80 design iterations at 1.46 episodes/lane (see 3.);
-# for a resume of the 2026-08 run use NUM_EVALS=9 STEPS=240000000.
-NUM_EVALS="${NUM_EVALS:-11}"
+# 1 = one Lagrange multiplier per GMM component (default since 2026-09-28):
+# every component's bodies held to the budget themselves. 0 = one shared.
+LAMBDA_PER_COMPONENT="${LAMBDA_PER_COMPONENT:-1}"
+if [ "$LAMBDA_PER_COMPONENT" = "1" ]; then LPC_FLAG=--lagrange_per_component; else LPC_FLAG=--no-lagrange_per_component; fi
+# (For a resume of the 2026-08 Saute run: NUM_EVALS=9 STEPS=240000000
+# DESIGN_UPDATES=8 CHOP_FREQ=60000000 STEPS_BEFORE=0 STEPS_AFTER=30000000.)
+# SCHEDULE: SCHAFF'S ANT, EXTENDED FOR THE CONSTRAINT (2026-09-28). Upstream's
+# ant is 1.5B: design frozen for the first 200M (the policy learns to walk on
+# every sampled body first), a chop every 200M after that (8->4->2->1 at 400M,
+# 600M, 800M), the last 100M fine-tuning the policy on the mode. Kept: the
+# warm-up and the chops. Added (user's call, upstream is unconstrained): 500M
+# more, as a longer search (to 1.7B) and a 300M final fine-tune, because the
+# constrained single-ant runs needed 150M+ to settle into the budget. 2B total,
+# ~15 h on a 3090. 40 evals x 13 design iterations = 520 iterations of ~3.85M
+# steps = 1.50 episodes per lane each (the design updates are the ~390 between
+# 200M and 1.7B).
+NUM_EVALS="${NUM_EVALS:-41}"
+DESIGN_UPDATES="${DESIGN_UPDATES:-13}"
+CHOP_FREQ="${CHOP_FREQ:-200000000}"
+STEPS_BEFORE="${STEPS_BEFORE:-200000000}"
+STEPS_AFTER="${STEPS_AFTER:-300000000}"
 RESUME="${RESUME:-}"
 NAME="${NAME:-ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_r$(date -u +%m%d%H%M)}"
 CKPT="/root/MorphoSafety/checkpoints/$NAME"
@@ -173,13 +193,15 @@ assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost,
 kw = dict(T.robot_env_kwargs('ant'))
 kw['morphology_conditioning'] = True
 env = Minefield(**kw)
-assert env._ground_contact_eps == 0.05 and env._hazard_cost_shape == 'linear', (
-    'ABORT: cost is not linear at the 5 cm gate. Re-sync.')
+assert env._ground_contact_eps == 0.02 and env._hazard_cost_shape == 'linear', (
+    'ABORT: cost is not linear at the 2 cm gate (default since 2026-09-28). Re-sync.')
 w = env.observation_size
 assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions}, (
+    'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
 assert (o.iterations, o.ls_iterations) == (4, 8), f'ABORT: solver caps {o.iterations}/{o.ls_iterations}, expected 4/8'
-print(f'PASS: obs {w} (grid 7 + genes), 5 cm linear cost, design checkpointing present')
+print(f'PASS: obs {w} (grid 7 + genes), 2 cm linear cost, design checkpointing present')
 import jax, numpy as np, jax.numpy as jp
 a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
 ref = a.astype(np.float64) @ a.astype(np.float64)
@@ -237,8 +259,9 @@ echo " co-design $([ -n "$RESUME" ] && echo "RESUME from $RESUME" || echo FRESH)
 echo "   steps       $STEPS  (design_tmax $DESIGN_TMAX)"
 echo "   design_lr   $DESIGN_LR   objective $DESIGN_OBJECTIVE"
 echo "   safe RL     $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT"
-echo "   env         grid $GRID  flip $FLIP_COST  linear 5 cm  finish line  float32 matmuls"
-echo "   num_evals   $NUM_EVALS"
+echo "   env         grid $GRID  flip $FLIP_COST  linear 2 cm  finish line  float32 matmuls"
+echo "   num_evals   $NUM_EVALS x $DESIGN_UPDATES design updates"
+echo "   schedule    design frozen until $STEPS_BEFORE, chop every $CHOP_FREQ, fine-tune last $STEPS_AFTER"
 echo "   out         $CKPT"
 echo "=========================================================="
 echo
@@ -256,9 +279,9 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --robot ant --task minefield \
   --penalizer "$PENALIZER" --safety_budget "$BUDGET" --adaptive_budget_horizon \
   --lagrangian_multiplier_lr "$MULT_LR" --lagrangian_multiplier_max "$MULT_MAX" \
-  --initial_lagrange_multiplier "$MULT_INIT" \
+  --initial_lagrange_multiplier "$MULT_INIT" "$LPC_FLAG" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
-  --foot_hazard_grid "$GRID" --hazard_cost_shape linear --finish_line \
+  --foot_hazard_grid "$GRID" --hazard_cost_shape linear --ground_contact_eps 0.02 --finish_line \
   --matmul_precision highest --solver_iterations 4 --solver_ls_iterations 8 \
   --no-corridor_walls --terminate_out_of_bounds --exit_cost 50 --boundary_cost_weight 0 \
   --design_optimization \
@@ -266,9 +289,10 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --flip_cost "$FLIP_COST" \
   --num_morphologies 16 \
   --design_components 8 \
-  --design_updates_per_eval 8 \
-  --chop_freq 60000000 \
-  --steps_after_design_update 30000000 \
+  --design_updates_per_eval "$DESIGN_UPDATES" \
+  --chop_freq "$CHOP_FREQ" \
+  --steps_before_design_update "$STEPS_BEFORE" \
+  --steps_after_design_update "$STEPS_AFTER" \
   --num_envs 1024 --num_minibatches 32 \
   --design_lr "$DESIGN_LR" \
   --num_timesteps "$STEPS" \

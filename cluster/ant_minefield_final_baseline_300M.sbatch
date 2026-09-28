@@ -67,7 +67,8 @@ export SAFE_WIDTH=256
 export SAFE_PRECISION=highest
 export SAFE_SOLVER_IT="${SAFE_SOLVER_IT:-4}"
 export SAFE_SOLVER_LS="${SAFE_SOLVER_LS:-8}"
-unset SAFE_RESUME SAFE_EPS          # from scratch; eps = the 5 cm default
+unset SAFE_RESUME                   # from scratch
+export SAFE_EPS=0.05                # this run's 5 cm gate; the default became 2 cm on 2026-09-28
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
 exec bash cluster/ant_minefield_safe_b50.sbatch

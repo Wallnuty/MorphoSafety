@@ -30,6 +30,9 @@ def update_fn(
     env_step_per_training_step,
     safe,
     use_disagreement,
+    lagrange_components=1,
+    adaptive_budget_horizon=False,
+    budget_decision_steps=None,
 ):
     policy_gradient_update_fn = gradients.gradient_update_fn(
         policy_loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
@@ -85,9 +88,17 @@ def update_fn(
                 data,
                 optimizer_state=cost_value_optimizer_state,
             )
-            penalizer_aux, penalizer_params = penalizer.update(
-                aux["normalized_constraint_estimate"], penalizer_params
+            # Per-component (K,) constraint when there is one lambda per design
+            # component; popped so the metrics stay scalar.
+            constraint = aux.pop(
+                "constraint_per_component", aux["normalized_constraint_estimate"]
             )
+            if constraint.ndim:
+                # Negative = that component's bodies are over budget. 0 in a
+                # minibatch without that component, so the epoch mean is
+                # shrunk toward 0 for rarely-sampled components.
+                aux |= {f"constraint_c{k}": constraint[k] for k in range(constraint.shape[0])}
+            penalizer_aux, penalizer_params = penalizer.update(constraint, penalizer_params)
             aux |= penalizer_aux
             aux |= cost_value_aux
         else:
@@ -143,6 +154,8 @@ def update_fn(
             extra_fields += ("cost", "cumulative_cost")  # type: ignore
         if use_disagreement:
             extra_fields += ("disagreement",)  # type: ignore
+        if lagrange_components > 1:
+            extra_fields += ("design_component",)  # type: ignore
 
         def f(carry, unused_t):
             current_state, current_key = carry
@@ -170,6 +183,24 @@ def update_fn(
             lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
         )
         assert data.discount.shape[1:] == (unroll_length,)
+
+        if lagrange_components > 1 and adaptive_budget_horizon:
+            # Each design component's mean episode length, over the WHOLE batch
+            # (a minibatch has ~40 samples per component, too few to see an
+            # episode end reliably). Same estimator as the shared-lambda path in
+            # losses.py -- reciprocal of the per-decision end rate, clamped to
+            # [1, cap] -- attached per sample as the budget's horizon factor.
+            se = data.extras["state_extras"]
+            comp = se["design_component"]
+            trunc = se["truncation"]
+            ends = (1 - data.discount) * (1 - trunc) + trunc
+            onehot = jax.nn.one_hot(comp, lagrange_components)
+            n_k = onehot.sum(axis=(0, 1))
+            end_rate = (onehot * ends[..., None]).sum(axis=(0, 1)) / jnp.maximum(n_k, 1.0)
+            cap = float(budget_decision_steps)
+            mean_ep = jnp.clip(1.0 / jnp.maximum(end_rate, 1e-8), 1.0, cap)
+            state_extras = {**se, "budget_scale": (cap / mean_ep)[comp]}
+            data = data._replace(extras={**data.extras, "state_extras": state_extras})
 
         # Update normalization params and normalize observations.
         normalizer_params = running_statistics.update(

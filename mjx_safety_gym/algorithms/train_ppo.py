@@ -1112,8 +1112,10 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="How far a robot geom's lowest point may sit above the floor and "
         "still count as ON THE GROUND for the hazard cost (and the shaping "
-        "ramp). Default None = 0.05 m x arena_scale (user's call 2026-09-17; "
-        "CRAX charges below 0.10, Safety Gym has no gate). THE TOLERANCE IS "
+        "ramp), and the drawn hazard height. Default None = 0.02 m x "
+        "arena_scale (user's call 2026-09-28; 0.05 from 2026-09-17 -- pass "
+        "0.05 to match those runs, including the final-recipe baseline; CRAX "
+        "charges below 0.10, Safety Gym has no gate). THE TOLERANCE IS "
         "THE COST SCALE, because the trained gait skims: on the same "
         "trajectories 0.02 gave 84.0 cost/episode, 0.005 gave 40.8, 0.001 gave "
         "26.9 against 26.8 from MuJoCo's own floor contacts. Pass 0.02 with "
@@ -1439,6 +1441,19 @@ def build_argparser() -> argparse.ArgumentParser:
         "collapses by chopping instead -- see --chop_freq.",
     )
     parser.add_argument(
+        "--lagrange_per_component",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--design_optimization with --penalizer ppo_lagrangian] One "
+        "Lagrange multiplier per GMM component (default since 2026-09-28). "
+        "With a single shared multiplier the budget only holds on AVERAGE over "
+        "the population, so a reckless body can be carried by safe ones while "
+        "the speed objective rewards it; per component, every component's "
+        "bodies are held to the budget themselves, and a design is judged on "
+        "its speed AT the budget. Collapses to the shared case once one "
+        "component is left. --no-lagrange_per_component = one shared lambda.",
+    )
+    parser.add_argument(
         "--design_std_init", type=float, default=0.577,
         help="Initial per-dimension std of each component, in [-1,1] design "
         "space. Upstream's value.",
@@ -1519,6 +1534,18 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Resume from a specific checkpoint step directory.",
     )
     return parser
+
+
+def lagrange_components(args: argparse.Namespace) -> int:
+    """How many Lagrange multipliers the run keeps: one per GMM component under
+    co-design with --lagrange_per_component, else one."""
+    if (
+        args.design_optimization
+        and args.penalizer == "ppo_lagrangian"
+        and args.lagrange_per_component
+    ):
+        return int(args.design_components)
+    return 1
 
 
 def validate(args: argparse.Namespace) -> None:
@@ -1875,7 +1902,15 @@ def train(args: argparse.Namespace):
         penalty_kappa_init=args.penalty_kappa_init,
         penalty_kappa_max=args.penalty_kappa_max,
         penalty_ramp_updates=_ramp_updates,
+        num_components=lagrange_components(args),
     )
+    if lagrange_components(args) > 1:
+        print(
+            f"[co-design] one Lagrange multiplier per GMM component "
+            f"({lagrange_components(args)}), each holding its own bodies to "
+            f"the budget of {args.safety_budget:g}",
+            flush=True,
+        )
 
     def progress_fn(step, metrics):
         print(f"step={step} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
@@ -1917,6 +1952,7 @@ def train(args: argparse.Namespace):
         restore_checkpoint_path=args.restore_checkpoint_path,
         design_loop=design_loop,
         design_updates_per_eval=args.design_updates_per_eval,
+        lagrange_components=lagrange_components(args),
         # Gated on the co-design path only. It is the faithful behaviour for any
         # gene-conditioned run, but switching it on for the existing path would
         # silently change what every prior morphology checkpoint was trained

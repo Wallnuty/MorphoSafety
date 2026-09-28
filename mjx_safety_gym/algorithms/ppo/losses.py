@@ -111,6 +111,7 @@ def make_losses(
     use_disagreement,
     adaptive_budget_horizon=False,
     budget_decision_steps=None,
+    lagrange_components=1,
 ):
     def compute_policy_loss(
         policy_params,
@@ -254,12 +255,50 @@ def make_losses(
                     float(budget_decision_steps) / mean_ep_decisions
                 )
             constraint = budget - vsc.mean()
-            policy_loss, penalizer_aux, _ = penalizer(
-                policy_loss,
-                constraint,
-                jax.lax.stop_gradient(penalizer_params),
-                rest=-cost_advantages.mean(),
-            )
+            if lagrange_components > 1:
+                # ONE LAMBDA PER DESIGN COMPONENT (co-design, 2026-09-28).
+                # With a single multiplier the budget only has to hold on
+                # AVERAGE over the whole population of bodies, so a reckless
+                # body can be carried by safe ones -- and the design score
+                # (speed) does not see cost, so recklessness wins the search.
+                # Here each GMM component's samples are held to the budget by
+                # their own lambda: sample i's cost term is weighted by
+                # lambda[component_i], and each component gets its own
+                # constraint estimate. `design_component` is the per-lane
+                # component id the design loop installs; `budget_scale` is that
+                # component's adaptive-horizon factor (cap / mean episode
+                # length), estimated over the WHOLE training batch in
+                # training_step because a minibatch holds only ~40 samples per
+                # component. Lagrangian only (train_ppo.validate enforces it):
+                # this is Lagrangian.__call__ with a per-sample multiplier, and
+                # with one component it reduces to it exactly.
+                comp = data.extras["state_extras"]["design_component"]
+                onehot = jax.nn.one_hot(comp, lagrange_components)
+                counts = onehot.sum(axis=(0, 1))
+                if adaptive_budget_horizon:
+                    budget_s = safety_budget * data.extras["state_extras"]["budget_scale"]
+                else:
+                    budget_s = jnp.full_like(vsc, safety_budget)
+
+                def per_component(x):
+                    return (onehot * x[..., None]).sum(axis=(0, 1)) / jnp.maximum(counts, 1.0)
+
+                constraint_k = jnp.where(
+                    counts > 0, per_component(budget_s) - per_component(vsc), 0.0
+                )
+                lam = jax.lax.stop_gradient(penalizer_params.lagrange_multiplier)[comp]
+                policy_loss = policy_loss + jnp.mean(lam * cost_advantages)
+                penalizer_aux = {"lagrange_multiplier": lam.mean()}
+                aux["constraint_per_component"] = constraint_k
+                # Sample-weighted, for the log line; the update uses the vector.
+                constraint = (counts * constraint_k).sum() / jnp.maximum(counts.sum(), 1.0)
+            else:
+                policy_loss, penalizer_aux, _ = penalizer(
+                    policy_loss,
+                    constraint,
+                    jax.lax.stop_gradient(penalizer_params),
+                    rest=-cost_advantages.mean(),
+                )
             aux["normalized_constraint_estimate"] = constraint
             aux["budget_mean_episode_decisions"] = mean_ep_decisions
             aux["budget_effective_rate"] = budget * (1.0 - safety_discounting)

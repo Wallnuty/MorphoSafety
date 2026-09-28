@@ -427,11 +427,11 @@ if os.environ.get('PRECISION', 'highest') == 'highest':
     print(f'PASS: float32 matmuls (rel err {err:.1e})')
 kw0 = dict(T.robot_env_kwargs('ant')); kw0['foot_obstacle_obs'] = False
 e0 = Minefield(**kw0)
-assert abs(e0._ground_contact_eps - 0.05) < 1e-9 and e0._hazard_footprint == 'contact' \
+assert abs(e0._ground_contact_eps - 0.02) < 1e-9 and e0._hazard_footprint == 'contact' \
     and e0._hazard_cost_shape == 'linear', (
-    f'ABORT: cost semantics are eps={e0._ground_contact_eps}, footprint='
+    f'ABORT: default cost semantics are eps={e0._ground_contact_eps}, footprint='
     f'{e0._hazard_footprint}, shape={e0._hazard_cost_shape}; expected '
-    '0.05 / contact / linear (2026-09-17).')
+    '0.02 / contact / linear (2 cm gate since 2026-09-28). git pull.')
 
 kw = dict(T.robot_env_kwargs('ant')); kw['foot_obstacle_obs'] = os.environ['FOOT_OBS'] == '1'
 kw['foot_hazard_grid'] = int(os.environ['GRID']); kw['foot_hazard_rings'] = int(os.environ['RINGS'])
@@ -452,7 +452,7 @@ echo "   policy 256x4, lidar-only, $STEPS steps -> $CKPT"
 [ "$PENALIZER" = "scheduled" ] && echo "   kappa 0.01 -> $KAPPA_MAX over the first $RAMP_FRAC of the run, then held"
 [ "$PENALIZER" = "none" ] && echo "   UNCONSTRAINED -- budget flags ignored"
 [ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: reward -= $SHAPING_W * graded foot-in-hazard (ramp radius $SHAPING_R)"
-echo "   cost: $COST_SHAPE penetration, grounded within 5 cm, flip_cost=$FLIP_COST; hazard_steps logged alongside"
+echo "   cost: $COST_SHAPE penetration, grounded within ${EPS:-0.02 (default)} m, flip_cost=$FLIP_COST; hazard_steps logged alongside"
 echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION"
 echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
 echo "   CHECK FIRST: training/budget_mean_episode_decisions"
@@ -533,8 +533,9 @@ for line in p.read_text().splitlines():
     pct = lambda k: (f"{100 * float(g['eval/episode_' + k]):.0f}%" if 'eval/episode_' + k in g else "--")
     per_m = f"{c/displ:>6.1f}" if displ > 0.5 else f"{'--':>6}"
     speed = f"{float(g['eval/episode_speed']):>6.2f}" if "eval/episode_speed" in g else f"{displ/(0.02*l):>6.2f}"
+    vs_b = f"{c/B:>5.1f}x" if B > 0 else f"{'--':>6}"  # budget 0 has no ratio
     print(f"{int(float(g['step'])):>12,} {r:>7.2f} {speed}m/s {displ:>6.2f}m {c:>7.1f} "
-          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {pct('flipped'):>6} {pct('out_of_bounds'):>5} {l:>7.0f} "
+          f"{vs_b} {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {pct('flipped'):>6} {pct('out_of_bounds'):>5} {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY
 echo

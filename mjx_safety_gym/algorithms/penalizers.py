@@ -110,7 +110,18 @@ class Lagrangian:
         )
         if self.multiplier_max is not None:
             new_lagrange_multiplier = jnp.minimum(new_lagrange_multiplier, self.multiplier_max)
-        aux = {"lagrange_multiplier": new_lagrange_multiplier}
+        if new_lagrange_multiplier.ndim == 0:
+            aux = {"lagrange_multiplier": new_lagrange_multiplier}
+        else:
+            # ONE MULTIPLIER PER DESIGN COMPONENT (co-design, 2026-09-28): the
+            # constraint arrives as a (K,) vector, zero for a component with no
+            # samples in the minibatch, so that component's lambda is left as
+            # is. The loss logs the sample-weighted value as
+            # "lagrange_multiplier"; the per-component values are logged here.
+            aux = {
+                f"lagrange_multiplier_c{k}": new_lagrange_multiplier[k]
+                for k in range(new_lagrange_multiplier.shape[0])
+            }
         return aux, LagrangianParams(new_lagrange_multiplier, params.optimizer_state)
 
 
@@ -215,6 +226,7 @@ def get_penalizer(
     penalty_kappa_init: float = 0.01,
     penalty_kappa_max: float = 5.0,
     penalty_ramp_updates: int = 1,
+    num_components: int = 1,
 ) -> tuple[Optional[Penalizer], Optional[Params]]:
     """Build a penalizer and its initial state from simple keyword args.
 
@@ -234,10 +246,14 @@ def get_penalizer(
         penalizer_state = CRPOParams(burnin)
     elif name == "ppo_lagrangian":
         penalizer = Lagrangian(multiplier_lr, multiplier_max=multiplier_max)
-        penalizer_state = LagrangianParams(
-            jnp.asarray(initial_lagrange_multiplier),
-            penalizer.optimizer.init(jnp.asarray(initial_lagrange_multiplier)),
+        # num_components > 1: one multiplier per design-distribution component
+        # (co-design). 1 keeps the scalar every earlier run and checkpoint has.
+        init = (
+            jnp.full((num_components,), initial_lagrange_multiplier)
+            if num_components > 1
+            else jnp.asarray(initial_lagrange_multiplier)
         )
+        penalizer_state = LagrangianParams(init, penalizer.optimizer.init(init))
     elif name == "scheduled":
         penalizer = ScheduledPenalty(
             penalty_kappa_init, penalty_kappa_max, penalty_ramp_updates

@@ -47,6 +47,14 @@ DELIBERATE FIDELITY CHOICES, each mirroring the reference:
     gradient -- otherwise a proposal outside the box gets zero gradient and the
     distribution can never be pulled back inward.
 
+DEVIATION FROM THE PAPER, the one this project exists for: the inner loop is
+PPO-Lagrangian under a cost budget, not plain PPO, and each GMM component
+keeps its OWN Lagrange multiplier (2026-09-28; `--lagrange_per_component`).
+The lane -> component map comes from `sample()` and rides in
+info["design_component"]; see ppo/losses.py. With one shared multiplier the
+budget would only hold on average over the population, and the speed score
+(which does not read cost) would favour a reckless body carried by safe ones.
+
 DEVIATION FROM THE PAPER, recorded on purpose: designs live in [-1, 1] as they
 do upstream, but map onto this repo's existing `MorphologySpec` genes
 (`(p + 1) / 2`), whose scale range is SCALE_LO/HI = 0.6-1.4 rather than
@@ -203,6 +211,12 @@ class GmmDesignDistribution:
         eps = self.rng.normal(size=(n, self.n_params))
         return self.means[index] + np.exp(self.log_stds[index]) * eps
 
+    def mode_component(self) -> int:
+        """Index of the component whose mean is the mode (see `mode`)."""
+        live = np.flatnonzero(self.alive)
+        scores = [self.logp(self.means[i][None], np.array([i]))[0] for i in live]
+        return int(live[int(np.argmax(scores))])
+
     def mode(self) -> np.ndarray:
         """The highest-density design, matching `GmmPd.mode`.
 
@@ -211,9 +225,7 @@ class GmmDesignDistribution:
         smallest total log-std, i.e. the tightest one -- but it is written out
         so the behaviour still holds if weights ever become trainable.
         """
-        live = np.flatnonzero(self.alive)
-        scores = [self.logp(self.means[i][None], np.array([i]))[0] for i in live]
-        return self.means[live[int(np.argmax(scores))]].copy()
+        return self.means[self.mode_component()].copy()
 
     # -- densities ---------------------------------------------------------
 
@@ -576,15 +588,18 @@ class DesignLoop:
 
     # -- called from inside the jitted reset ------------------------------
 
-    def install(self, fields, genes) -> None:
+    def install(self, fields, genes, components) -> None:
         """Assign the design onto the wrapper. Runs DURING TRACING.
 
-        `fields`/`genes` are tracers at this point, which is the whole trick:
-        assigning them here makes them arguments of the compiled reset instead
-        of constants closed over by it, so a new population costs no recompile.
+        `fields`/`genes`/`components` are tracers at this point, which is the
+        whole trick: assigning them here makes them arguments of the compiled
+        reset instead of constants closed over by it, so a new population costs
+        no recompile. `components` is each lane's GMM component, for the
+        per-component Lagrange multipliers.
         """
         self._wrapper._fields = fields
         self._wrapper._genes = genes
+        self._wrapper._components = components
 
     # -- per-iteration ----------------------------------------------------
 
@@ -602,11 +617,17 @@ class DesignLoop:
         ) < self.steps_after_update
 
     def sample(self, n_devices: int, n_envs: int):
-        """Draw a population and compile it. Returns device-shaped (fields, genes)."""
+        """Draw a population and compile it.
+
+        Returns device-shaped (fields, genes, components), `components` being
+        each lane's GMM component index.
+        """
         step = self._last_step
         if self._frozen(step):
             params = np.tile(self.gmm.mode(), (self.num_morphologies, 1))
-            comps = np.zeros(self.num_morphologies, dtype=int)
+            # The component the mode belongs to, not 0: component 0 may have
+            # been chopped, and its Lagrange multiplier would be stale.
+            comps = np.full(self.num_morphologies, self.gmm.mode_component(), dtype=int)
         else:
             params, comps = self.gmm.sample(self.num_morphologies)
         self._pending = (params, comps)
@@ -620,7 +641,12 @@ class DesignLoop:
             k: jp.reshape(v, (n_devices, -1) + v.shape[1:]) for k, v in fields.items()
         }
         genes = jp.reshape(genes, (n_devices, -1) + genes.shape[1:])
-        return fields, genes
+        # Lanes are BLOCKED by design (build_design_batch repeats each spec
+        # `replicas` times contiguously), so the lane->component map is a repeat.
+        components = jp.reshape(
+            jp.asarray(np.repeat(comps, replicas), dtype=jp.int32), (n_devices, -1)
+        )
+        return fields, genes, components
 
     def scores_from(self, env_state) -> tuple[np.ndarray, np.ndarray]:
         """Mean score per design (HIGHER IS BETTER), and episodes counted.
@@ -729,6 +755,29 @@ class DesignLoop:
         })
         return -fitness.mean(axis=1), counts
 
+    def _chop_due(self, step: int) -> bool:
+        """Upstream's chop rule (`algorithm.py:_before_step`), 2026-09-28.
+
+        Chop at every multiple of `chop_freq` crossed AFTER the burn-in: the
+        first is the first multiple strictly past `steps_before_update`, the
+        next the multiple after the last chop. With Schaff's ant schedule
+        (burn-in 200M, chop_freq 200M) that is 400M, 600M, 800M.
+
+        The previous rule, `step - last_chop >= chop_freq` with last_chop
+        starting at 0, agrees when there is no burn-in, but with burn-in ==
+        chop_freq it chopped at the very first design update -- halving the
+        mixture before the distribution had moved at all. Keyed to the last
+        chop's multiple rather than to "a crossing this iteration", so a chop
+        whose boundary falls in a skipped iteration still happens at the next
+        active one.
+        """
+        if not self.chop_freq:
+            return False
+        f = int(self.chop_freq)
+        first = (self.steps_before_update // f + 1) * f
+        boundary = max(first, (self._last_chop // f + 1) * f)
+        return step >= boundary
+
     def finish_iteration(self, env_state, step: int) -> dict:
         """Score the population, take one REINFORCE step, chop on schedule.
 
@@ -781,7 +830,7 @@ class DesignLoop:
                 self.gmm.update(params[valid], comps[valid], scores[valid], lr_frac)
             )
             metrics["design/lr_frac"] = lr_frac
-            if self.chop_freq and step - self._last_chop >= self.chop_freq:
+            if self._chop_due(step):
                 killed = self.gmm.chop(dict(self._comp_scores))
                 if killed:
                     self._last_chop = step

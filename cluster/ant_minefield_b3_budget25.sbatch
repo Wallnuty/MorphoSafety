@@ -59,6 +59,7 @@ export SAFE_GRID=5
 export SAFE_PRECISION=default   # TF32, as the runs these continue (2026-09-26)
 export SAFE_WALLS=1              # walls, as the runs these continue (2026-09-26)
 export SAFE_SOLVER_IT=100 SAFE_SOLVER_LS=50   # solver, as the runs these continue
+export SAFE_EPS=0.05             # 5 cm gate, as the runs these continue (2026-09-28)
 export SAFE_STEPS=100000000
 export SAFE_NUM_EVALS=21           # every 5M, same cadence as the 50M runs
 

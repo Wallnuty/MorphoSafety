@@ -300,8 +300,10 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # as "on the ground", for --hazard_step_on. Scales with the robot.
         # Assigned AFTER _arena_scale, which it depends on.
         #
-        # 0.05 (5 cm) SINCE 2026-09-17, user's call. History: 0.02 until
-        # 2026-09-14, then 0.001 for three days. The 2026-09-14 audit (session
+        # 0.02 (2 cm) SINCE 2026-09-28, user's call. History: 0.02 until
+        # 2026-09-14, 0.001 for three days, 0.05 from 2026-09-17 to 09-27 (the
+        # final-recipe baseline ant_minefield_final_b25_300M ran at 0.05 --
+        # pass --ground_contact_eps 0.05 to match it). The 2026-09-14 audit (session
         # scratchpad cost_audit.py; 50M Saute500 walker, 32 episodes, every
         # variant on the SAME trajectory) is what all of these should be read
         # against:
@@ -324,7 +326,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # Pass ground_contact_eps explicitly (CLI --ground_contact_eps) to
         # reproduce any earlier scale.
         self._ground_contact_eps = (
-            0.05 * self._arena_scale
+            0.02 * self._arena_scale
             if ground_contact_eps is None
             else float(ground_contact_eps)
         )

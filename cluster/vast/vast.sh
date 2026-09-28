@@ -414,7 +414,8 @@ codesign)
   # intended one. A prefix nothing else uses removes the ambiguity.
   envs=""
   for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME DESIGN_OBJECTIVE DESIGN_COST_WEIGHT FLIP_COST \
-           PENALIZER BUDGET MULT_LR MULT_MAX MULT_INIT GRID; do
+           PENALIZER BUDGET MULT_LR MULT_MAX MULT_INIT GRID LAMBDA_PER_COMPONENT \
+           DESIGN_UPDATES CHOP_FREQ STEPS_BEFORE STEPS_AFTER; do
     eval "val=\${CODESIGN_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
   done
   rexec "cd $REMOTE_DIR && mkdir -p logs && \

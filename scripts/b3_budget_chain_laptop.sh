@@ -46,7 +46,7 @@ echo "=== code / observation preflight ==="
 JAX_PLATFORMS=cpu python -c "
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
-kw = dict(T.robot_env_kwargs('ant')); kw.update(foot_obstacle_obs=False, foot_hazard_grid=5, finish_line=False)
+kw = dict(T.robot_env_kwargs('ant')); kw.update(foot_obstacle_obs=False, foot_hazard_grid=5, finish_line=False, ground_contact_eps=0.05)
 e = Minefield(**kw)
 assert e.observation_size == 147, e.observation_size
 assert abs(e._ground_contact_eps - 0.05) < 1e-9 and e._hazard_cost_shape == 'linear' and not e._finish_line
@@ -74,7 +74,7 @@ run_arm () {  # run_arm <budget> [resume dir] [steps] [run name]
       --penalizer ppo_lagrangian --safety_budget "$B" --adaptive_budget_horizon \
       --lagrangian_multiplier_lr 1.5e-5 --lagrangian_multiplier_max 3.0 \
       --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs --foot_hazard_grid 5 \
-      --hazard_cost_shape linear --flip_cost 50 --no-finish_line \
+      --hazard_cost_shape linear --flip_cost 50 --no-finish_line --ground_contact_eps 0.05 \
       --matmul_precision default --solver_iterations 100 --solver_ls_iterations 50 \
       --corridor_walls --boundary_cost_weight 0 \
       --policy_hidden_layer_sizes 256 256 256 256 \

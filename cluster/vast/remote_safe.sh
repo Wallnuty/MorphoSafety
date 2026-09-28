@@ -151,8 +151,10 @@ if os.environ.get('PRECISION', 'highest') == 'highest':
 assert 'budget_decision_steps' in inspect.signature(ppo_losses.make_losses).parameters
 kw0 = dict(T.robot_env_kwargs('ant')); kw0['foot_obstacle_obs'] = False
 e0 = Minefield(**kw0)
-assert abs(e0._ground_contact_eps - 0.05) < 1e-9 and e0._hazard_footprint == 'contact' \
-    and e0._hazard_cost_shape == 'linear', 'ABORT: cost semantics are not the 2026-09-17 ones'
+assert abs(e0._ground_contact_eps - 0.02) < 1e-9 and e0._hazard_footprint == 'contact' \
+    and e0._hazard_cost_shape == 'linear', (
+    'ABORT: default cost semantics are not 0.02 / contact / linear (2 cm gate '
+    'since 2026-09-28). Sync the code.')
 kw = dict(T.robot_env_kwargs('ant')); kw['foot_obstacle_obs'] = os.environ['FOOT_OBS'] == '1'
 kw['foot_hazard_grid'] = int(os.environ['GRID']); kw['foot_hazard_rings'] = int(os.environ['RINGS'])
 if os.environ['LIDAR'] != '1': kw['lidar_groups'] = ()
@@ -168,7 +170,7 @@ echo "   -> $CKPT"
 echo "   log: $LOG"
 [ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR  cap=$MULT_MAX  init=$MULT_INIT"
 [ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: w=$SHAPING_W radius $SHAPING_R"
-echo "   cost: $COST_SHAPE penetration, grounded within 5 cm, flip_cost=$FLIP_COST"
+echo "   cost: $COST_SHAPE penetration, grounded within ${EPS:-0.02 (default)} m, flip_cost=$FLIP_COST"
 echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION"
 echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
 echo "=========================================================="
@@ -225,8 +227,9 @@ for line in p.read_text().splitlines():
     pct = lambda k: (f"{100 * float(g['eval/episode_' + k]):.0f}%" if 'eval/episode_' + k in g else "--")
     per_m = f"{c/displ:>6.1f}" if displ > 0.5 else f"{'--':>6}"
     speed = f"{float(g['eval/episode_speed']):>6.2f}" if "eval/episode_speed" in g else f"{displ/(0.02*l):>6.2f}"
+    vs_b = f"{c/B:>5.1f}x" if B > 0 else f"{'--':>6}"  # budget 0 has no ratio
     print(f"{int(float(g['step'])):>12,} {r:>7.2f} {speed}m/s {displ:>6.2f}m {c:>7.1f} "
-          f"{c/B:>5.1f}x {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {pct('flipped'):>6} {pct('out_of_bounds'):>5} {l:>7.0f} "
+          f"{vs_b} {per_m} {g.get('eval/episode_hazard_steps','--'):>8.8} {pct('flipped'):>6} {pct('out_of_bounds'):>5} {l:>7.0f} "
           f"{g.get('training/budget_mean_episode_decisions','--'):>9} {knob:>12}")
 PY
 echo "=== done $(date -u) ==="
