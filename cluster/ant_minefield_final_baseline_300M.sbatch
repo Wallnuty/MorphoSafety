@@ -42,7 +42,8 @@
 # exactly that file.
 #SBATCH --output=ant_safe_b50_%j.log
 #SBATCH --partition=bigbatch
-#SBATCH --exclude=mscluster45,mscluster83
+# mscluster75 added 2026-10-03 (user's call).
+#SBATCH --exclude=mscluster45,mscluster75,mscluster83
 #SBATCH --time=08:00:00
 
 export SAFE_NAME="${SAFE_NAME:-ant_minefield_final_b25_300M}"

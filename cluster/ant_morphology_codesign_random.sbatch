@@ -33,7 +33,8 @@
 #SBATCH --job-name=ant-codesign-random
 #SBATCH --output=ant_codesign_random_%j.log
 #SBATCH --partition=bigbatch
-#SBATCH --exclude=mscluster45,mscluster83
+# mscluster75 added 2026-10-03 (user's call).
+#SBATCH --exclude=mscluster45,mscluster75,mscluster83
 #SBATCH --time=36:00:00
 
 export HAZARD_PLACEMENT=random

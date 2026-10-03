@@ -44,7 +44,8 @@
 #SBATCH --job-name=ant-b3-b25
 #SBATCH --output=ant_safe_b50_%j.log
 #SBATCH --partition=bigbatch
-#SBATCH --exclude=mscluster45,mscluster83
+# mscluster75 added 2026-10-03 (user's call).
+#SBATCH --exclude=mscluster45,mscluster75,mscluster83
 #SBATCH --time=12:00:00
 # --output MUST stay ant_safe_b50_%j.log: the diagnostics printer at the end of
 # the main script reads the log back by that name.
