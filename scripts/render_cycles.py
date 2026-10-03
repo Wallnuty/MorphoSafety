@@ -149,6 +149,7 @@ def build(args, meta):
 
     torso_mat, _ = principled("robot_body", (0.10, 0.11, 0.13), rough=0.32, metal=0.85, coat=0.3)
     leg_mat, _ = principled("robot_legs", (0.82, 0.83, 0.85), rough=0.42, coat=0.2)
+    shin_mat, _ = principled("robot_shins", (0.72, 0.74, 0.77), rough=0.28, metal=0.9, coat=0.3)
     lane_mat, _ = principled("lane_paint", (0.95, 0.72, 0.06), rough=0.55)
     fin_mat = finish_material()
 
@@ -172,9 +173,12 @@ def build(args, meta):
             assign(o, lane_mat)
         elif geom.startswith("finish_line"):
             assign(o, fin_mat)
-        elif geom.startswith("torso") or "ankle" in geom:
-            # Lower legs (ankles) share the torso's finish.
+        elif geom.startswith("torso"):
             assign(o, torso_mat); smooth(o)
+        elif "ankle" in geom or geom.startswith("aux"):
+            # Limb segments alternate silver / white / silver from the torso
+            # out: hip (aux), thigh (white, below), lower leg (ankle).
+            assign(o, shin_mat); smooth(o)
         else:
             assign(o, leg_mat); smooth(o)
 
