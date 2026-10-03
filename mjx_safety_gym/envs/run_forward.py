@@ -230,6 +230,16 @@ class RunForward(GoToGoal):
         # differ by the lateral offset over 5-11 m of range, under ~10 deg.
         # Return for a full crossing halves (~10.5 instead of ~21).
         finish_line: bool = False,
+        # "lattice" (default, every run since 2026-08-22): the fixed staggered
+        # grid of _hazard_lattice, identical every episode. "random"
+        # (2026-10-03, user's call): rejection-sampled per reset like the
+        # vases, wholly inside the hazard zone -- same count and size, so the
+        # same disc area per crossing; only the arrangement varies. Under
+        # co-design every lane is reset each design iteration, so layouts are
+        # redrawn every ~1.5 episodes. A single-body run never re-resets its
+        # lanes (BraxAutoResetWrapper replays first_state), so there each lane
+        # keeps ONE layout for the whole run.
+        hazard_placement: str = "lattice",
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -277,6 +287,9 @@ class RunForward(GoToGoal):
             else float(goal_radius)
         )
         self._finish_line = bool(finish_line)
+        if hazard_placement not in ("lattice", "random"):
+            raise ValueError(f"hazard_placement must be 'lattice' or 'random', got {hazard_placement!r}")
+        self._hazard_placement = hazard_placement
         # Under a finish line the reward is dx only: the goal-distance term is
         # the Euclidean distance to a POINT and would pull the ant toward y=0.
         self._goal_reward_weight = 0.0 if self._finish_line else float(goal_reward_weight)
@@ -544,7 +557,7 @@ class RunForward(GoToGoal):
         placed = jp.full((n_obs, 2), 1e3)
         keepouts = jp.zeros((n_obs,))
 
-        def draw_one(key, keepout, placed, keepouts):
+        def draw_one(key, keepout, placed, keepouts, inset=0.0):
             def cond_fn(val):
                 i, conflicted, *_ = val
                 return jp.logical_and(i < 100, conflicted)
@@ -555,8 +568,10 @@ class RunForward(GoToGoal):
                 xy = jax.random.uniform(
                     k_,
                     (2,),
-                    minval=jp.array([self._obstacle_x_lo, -self._corridor_half_width]),
-                    maxval=jp.array([self._obstacle_x_hi, self._corridor_half_width]),
+                    minval=jp.array([self._obstacle_x_lo + inset,
+                                     -self._corridor_half_width + inset]),
+                    maxval=jp.array([self._obstacle_x_hi - inset,
+                                     self._corridor_half_width - inset]),
                 )
                 return i + 1, placement_not_valid(xy, keepout, placed, keepouts), xy, k
 
@@ -566,17 +581,30 @@ class RunForward(GoToGoal):
             return xy
 
         idx = 0
-        # HAZARDS ARE NOT SAMPLED. They sit on the fixed lattice built by
-        # _hazard_lattice(). They are still written into `placed`/`keepouts`,
-        # because vases ARE still rejection-sampled and must keep clear of them.
         haz_keepout = self.spec["hazards"].keepout
         entries = []
-        for xy_np in self._hazard_lattice_xy:
-            xy = jp.asarray(xy_np)
-            placed = placed.at[idx].set(xy)
-            keepouts = keepouts.at[idx].set(haz_keepout)
-            entries.append((idx, xy))
-            idx += 1
+        if self._hazard_placement == "random":
+            # Inset by the radius so every disc lies wholly inside the hazard
+            # zone, as the lattice's do. The extra split happens ONLY here, so
+            # the lattice key stream (vases, spawn) is unchanged.
+            r = self._hazard_size * self._arena_scale
+            rng, sub = jax.random.split(rng)
+            for key in jax.random.split(sub, n_haz):
+                xy = draw_one(key, haz_keepout, placed, keepouts, inset=r)
+                placed = placed.at[idx].set(xy)
+                keepouts = keepouts.at[idx].set(haz_keepout)
+                entries.append((idx, xy))
+                idx += 1
+        else:
+            # HAZARDS ARE NOT SAMPLED. They sit on the fixed lattice built by
+            # _hazard_lattice(). They are still written into `placed`/`keepouts`,
+            # because vases ARE still rejection-sampled and must keep clear of them.
+            for xy_np in self._hazard_lattice_xy:
+                xy = jp.asarray(xy_np)
+                placed = placed.at[idx].set(xy)
+                keepouts = keepouts.at[idx].set(haz_keepout)
+                entries.append((idx, xy))
+                idx += 1
         layout["hazards"] = entries
 
         vase_keepout = self.spec["vases"].keepout

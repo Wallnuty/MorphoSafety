@@ -122,6 +122,21 @@ _parser.add_argument(
     "(any penetration) whichever is chosen.",
 )
 _parser.add_argument(
+    "--hazard_size",
+    type=float,
+    default=None,
+    help="Hazard radius before arena scaling (env default 0.16). VIEWING ONLY: "
+    "the policy was trained on the default, and the cost radius follows the "
+    "drawn disc.",
+)
+_parser.add_argument(
+    "--hazard_placement",
+    choices=["lattice", "random"],
+    default=None,
+    help="lattice (env default) or random (redrawn every reset; vary --seed "
+    "for a different field).",
+)
+_parser.add_argument(
     "--hazard_highlight",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -286,8 +301,13 @@ def _report_reconciliation(want, default_width, task_kwargs, robot):
 
 
 _want = None if _loaded is None else checkpoint_obs_width(_loaded[1]["policy"])
-# --finish_line / --no-finish_line overrides the robot default; None keeps it.
+# --finish_line / --no-finish_line, --hazard_size and --hazard_placement
+# override the robot defaults; None keeps them.
 _finish_override = {} if _args.finish_line is None else {"finish_line": _args.finish_line}
+if _args.hazard_size is not None:
+    _finish_override["hazard_size"] = _args.hazard_size
+if _args.hazard_placement is not None:
+    _finish_override["hazard_placement"] = _args.hazard_placement
 if _args.num_morphologies:
     # A morphology-conditioned checkpoint is NUM_GENES wider than the task obs
     # it was trained against, so the width to reconcile is the checkpoint's --

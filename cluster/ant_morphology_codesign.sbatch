@@ -227,6 +227,20 @@ print('PASS:', gpus)
 " || { echo "=== GPU preflight FAILED, nothing spent ==="; exit 1; }
 echo
 
+# Hazard RADIUS before arena scaling (2026-10-03). 0.16 is what every earlier
+# co-design run used; any other value is tagged into the run name below, so it
+# can never resume into, or overwrite, a 0.16 run's checkpoints. The lattice
+# positions do not move (only the y inset does) and the obs width is unchanged.
+#   0.16: discs cover  8.0% of the hazard zone, closest discs 0.52 m apart
+#   0.23: discs cover 16.6% (2.07x the area),   closest discs 0.31 m apart
+HAZARD_SIZE="${HAZARD_SIZE:-0.16}"
+# Hazard PLACEMENT (2026-10-03). lattice = the fixed staggered grid every
+# earlier run used. random = redrawn at every reset; co-design resets every
+# lane each design iteration, so each layout lives ~1.5 episodes (~530k
+# distinct fields over the run). Same count/size; discs may overlap by up to
+# 3 cm (keepout 0.9 r, as Safety Gym). Tagged into the run name like the size.
+HAZARD_PLACEMENT="${HAZARD_PLACEMENT:-lattice}"
+
 # PREFLIGHT 2: the checkout is new enough, and the observation is the width
 # this run is FOR.
 #
@@ -237,7 +251,8 @@ echo
 # would train a policy that cannot see which body it is driving -- the whole
 # method, gone, with a log that looks completely normal.
 echo "=== code / observation preflight ==="
-python -c "
+HAZARD_SIZE="$HAZARD_SIZE" HAZARD_PLACEMENT="$HAZARD_PLACEMENT" python -c "
+import os
 from mjx_safety_gym import design, morphology
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
@@ -261,7 +276,21 @@ assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost,
     f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. git pull.')
 kw = dict(T.robot_env_kwargs('ant'))
 kw['morphology_conditioning'] = True
+hs = float(os.environ['HAZARD_SIZE'])
+kw['hazard_size'] = hs
+pl = os.environ['HAZARD_PLACEMENT']
+assert 'hazard_placement' in {a.dest for a in T.build_argparser()._actions}, (
+    'ABORT: no --hazard_placement in this checkout (2026-10-03). git pull.')
+kw['hazard_placement'] = pl
 env = Minefield(**kw)
+assert abs(env._hazard_radius - hs) < 1e-6, (
+    f'ABORT: hazard radius {env._hazard_radius} in the built model, expected {hs}')
+import jax as _jax, numpy as _np
+_s = [env.reset(_jax.random.PRNGKey(k)).data.mocap_pos for k in (0, 1)]
+_differ = not _np.allclose(_np.asarray(_s[0]), _np.asarray(_s[1]))
+assert _differ == (pl == 'random'), (
+    f'ABORT: hazard_placement={pl} but two resets gave '
+    f'{\"different\" if _differ else \"identical\"} hazard fields')
 assert env._ground_contact_eps == 0.02 and env._hazard_cost_shape == 'linear', (
     'ABORT: cost is not linear at the 2 cm gate (default since 2026-09-28). git pull.')
 w = env.observation_size
@@ -270,7 +299,7 @@ assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions
     'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
 assert (o.iterations, o.ls_iterations) == (4, 8), f'ABORT: solver caps {o.iterations}/{o.ls_iterations}, expected 4/8'
-print(f'PASS: obs {w} (grid 7 + genes), 2 cm linear cost, design checkpointing present')
+print(f'PASS: obs {w} (grid 7 + genes), 2 cm linear cost, hazard radius {hs} ({pl}), design checkpointing present')
 import jax, numpy as np, jax.numpy as jp
 a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
 ref = a.astype(np.float64) @ a.astype(np.float64)
@@ -339,8 +368,11 @@ RESUME="${RESUME:-}"
 # it would write 000000030146560 again and OVERWRITE the checkpoint that is the
 # only copy of the design state -- destroying the thing being resumed from,
 # halfway through the run that depends on it. Distinct name by default.
-NAME="${NAME:-ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_2000M}"
-if [ -n "$RESUME" ] && [ "$NAME" = "ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_2000M" ]; then
+if [ "$HAZARD_SIZE" = "0.16" ]; then HZ_TAG=""; else HZ_TAG="_hz${HAZARD_SIZE}"; fi
+if [ "$HAZARD_PLACEMENT" != "lattice" ]; then HZ_TAG="${HZ_TAG}_${HAZARD_PLACEMENT}"; fi
+BASE_NAME="ant_codesign_lagrangian_b${BUDGET}_grid${GRID}${HZ_TAG}_2000M"
+NAME="${NAME:-$BASE_NAME}"
+if [ -n "$RESUME" ] && [ "$NAME" = "$BASE_NAME" ]; then
   NAME="${NAME}_r$(date -u +%m%d%H%M)"
 fi
 CKPT="${SLURM_SUBMIT_DIR:-$PWD}/checkpoints/$NAME"
@@ -360,7 +392,7 @@ else
 fi
 echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
 echo "    schedule: design frozen until $STEPS_BEFORE, chop every $CHOP_FREQ, fine-tune last $STEPS_AFTER; $NUM_EVALS evals x $DESIGN_UPDATES updates"
-echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  finish line  float32"
+echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  hazard r=$HAZARD_SIZE $HAZARD_PLACEMENT  finish line  float32"
 
 # python -u is NOT optional: Python block-buffers stdout when redirected, and a
 # segfault never flushes it. A laptop run once reached 573k steps -- proven by
@@ -382,7 +414,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --penalizer "$PENALIZER" --safety_budget "$BUDGET" --adaptive_budget_horizon \
   --lagrangian_multiplier_lr "$MULT_LR" --lagrangian_multiplier_max "$MULT_MAX" \
   --initial_lagrange_multiplier "$MULT_INIT" "$LPC_FLAG" \
-  --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
+  --hazard_size "$HAZARD_SIZE" --hazard_placement "$HAZARD_PLACEMENT" \
+  --hazard_lidar --no-foot_obstacle_obs \
   --foot_hazard_grid "$GRID" --hazard_cost_shape linear --ground_contact_eps 0.02 --finish_line \
   --matmul_precision highest --solver_iterations 4 --solver_ls_iterations 8 \
   --no-corridor_walls --terminate_out_of_bounds --exit_cost 50 --boundary_cost_weight 0 \
@@ -419,6 +452,6 @@ if [ "$status" -eq 0 ]; then
   echo "reproduce the 29% unseen-body failure rate the decoupled pipeline had."
 else
   echo "FAILED (status $status). Resume from the newest checkpoint above and"
-  echo "pass --design_tmax 300000000 with the REMAINING budget as"
+  echo "pass --design_tmax $DESIGN_TMAX with the REMAINING budget as"
   echo "--num_timesteps -- see the RESUMING section in this file's header."
 fi

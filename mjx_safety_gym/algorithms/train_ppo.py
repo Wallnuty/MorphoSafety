@@ -974,6 +974,15 @@ def build_argparser() -> argparse.ArgumentParser:
         "this automatically and cannot drift from the disc that is drawn.",
     )
     parser.add_argument(
+        "--hazard_placement", choices=["lattice", "random"], default="lattice",
+        help="Corridor tasks only. lattice (default since 2026-08-22): the fixed "
+        "staggered grid, identical every episode. random (2026-10-03): "
+        "rejection-sampled per reset, same count and size. Under co-design "
+        "every lane is reset each design iteration, so layouts are redrawn "
+        "every ~1.5 episodes; a single-body run keeps one layout per lane "
+        "for the whole run (the autoreset replays first_state).",
+    )
+    parser.add_argument(
         "--hazard_lidar",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1703,6 +1712,7 @@ def train(args: argparse.Namespace):
                 goal_reward_weight=args.goal_reward_weight,
                 goal_observation=args.goal_observation,
                 finish_line=args.finish_line,
+                hazard_placement=args.hazard_placement,
                 **common,
             )
             if args.task == "minefield":
