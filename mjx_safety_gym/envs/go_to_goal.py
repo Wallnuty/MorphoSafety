@@ -3,6 +3,8 @@ import warnings
 
 import jax
 from mujoco import mjx
+
+from mjx_safety_gym import backend
 import mujoco as mj
 import jax.numpy as jp
 from importlib.resources import files
@@ -365,7 +367,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
 
         # print(mjSpec.to_xml())
 
-        self._mjx_model = mjx.put_model(self._mj_model)
+        self._mjx_model = backend.put_model(self._mj_model)
 
         # Set (not derived from _mjx_model -- see morphology.py's
         # randomization_fn docstring for why genes can't be recovered from a
@@ -1173,7 +1175,7 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         return data, rng
 
     def reset(self, rng) -> State:
-        data = mjx.make_data(self._mjx_model)
+        data = backend.make_data(self._mjx_model, self._mj_model)
 
         # Set initial object positions
         layout = _sample_layout(rng, self.spec)

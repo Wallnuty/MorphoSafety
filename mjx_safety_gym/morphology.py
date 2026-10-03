@@ -29,6 +29,8 @@ import mujoco as mj
 import numpy as np
 from mujoco import mjx
 
+from mjx_safety_gym import backend
+
 from mjx_safety_gym.world import ObjectSpec, apply_integrator, build_arena
 
 _XML_DIR = files("mjx_safety_gym.envs.xmls")
@@ -143,6 +145,22 @@ _BATCHED_FIELDS: tuple[str, ...] = (
     "actuator_gear",
 )
 _STATIC_PINNED_FIELDS: tuple[str, ...] = ("geom_aabb", "geom_rbound_hfield")
+
+
+def _pin(base, pinned):
+    """warp-probe: MJX >= 3.4 moved some pinned fields (geom_rbound_hfield)
+    into the backend-specific `_impl`; put each one where it now lives."""
+    top = {f.name for f in dataclasses.fields(type(base))}
+    outer = {k: v for k, v in pinned.items() if k in top}
+    if outer:
+        base = base.tree_replace(outer)
+    impl = getattr(base, "_impl", None)
+    if impl is not None and dataclasses.is_dataclass(impl):
+        names = {f.name for f in dataclasses.fields(type(impl))}
+        inner = {k: v for k, v in pinned.items() if k not in top and k in names}
+        if inner:
+            base = base.replace(_impl=impl.replace(**inner))
+    return base
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -345,7 +363,7 @@ def batch_models(mj_models: Sequence[mj.MjModel]) -> tuple[mjx.Model, mjx.Model]
     anything from `build_mj_model` in this module, since only capsule sizes
     and positions are ever scaled, never added or removed.
     """
-    mjx_models = [mjx.put_model(m) for m in mj_models]
+    mjx_models = [backend.put_model(m) for m in mj_models]
     base = mjx_models[0]
     # The 2 static fields live in the pytree treedef, not the leaves, so they
     # cannot be stacked -- pin them to a shared value first, or vmap raises a
@@ -355,8 +373,9 @@ def batch_models(mj_models: Sequence[mj.MjModel]) -> tuple[mjx.Model, mjx.Model]
     pinned = {
         f: np.maximum.reduce([np.asarray(getattr(m, f)) for m in mjx_models])
         for f in _STATIC_PINNED_FIELDS
+        if hasattr(base, f)  # warp-probe: MJX-Warp has no geom_rbound_hfield
     }
-    base = base.tree_replace(pinned)
+    base = _pin(base, pinned)
     in_axes = jax.tree_util.tree_map(lambda _: None, base)
     in_axes = in_axes.tree_replace({f: 0 for f in _BATCHED_FIELDS})
     stacked = {f: jp.stack([getattr(m, f) for m in mjx_models]) for f in _BATCHED_FIELDS}
@@ -432,13 +451,14 @@ def build_design_batch(
     else:
         mj_models = [model_builder(spec) for spec in specs]
 
-    mjx_models = [mjx.put_model(m) for m in mj_models]
+    mjx_models = [backend.put_model(m) for m in mj_models]
     base = mjx_models[0]
     pinned = {
         f: np.maximum.reduce([np.asarray(getattr(m, f)) for m in mjx_models])
         for f in _STATIC_PINNED_FIELDS
+        if hasattr(base, f)  # warp-probe: MJX-Warp has no geom_rbound_hfield
     }
-    base = base.tree_replace(pinned)
+    base = _pin(base, pinned)
 
     fields = {
         f: jp.repeat(

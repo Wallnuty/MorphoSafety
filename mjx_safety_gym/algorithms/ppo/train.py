@@ -271,7 +271,10 @@ def train(
     assert num_envs % device_count == 0
     env = environment
     env = TrackOnlineCosts(env)
-    reset_fn = jax.jit(jax.vmap(env.reset))
+    # warp-probe: pmap, not jit(vmap), over the device axis -- MJX-Warp keeps
+    # its contact buffers SHARED across worlds, and only pmap gives those a
+    # device axis for training_epoch's pmap to squeeze (brax 0.14 does the same).
+    reset_fn = jax.pmap(env.reset, axis_name=_PMAP_AXIS_NAME)
     # Design-aware reset. `install` assigns the incoming arrays onto the
     # MorphologyDesignWrapper DURING TRACING, so they are compiled in as real
     # arguments rather than baked-in constants -- the same trick the
@@ -287,7 +290,7 @@ def train(
             design_loop.install(fields, genes, components)
             return env.reset(rng)
 
-        design_reset_fn = jax.jit(jax.vmap(_reset_with_design))
+        design_reset_fn = jax.pmap(_reset_with_design, axis_name=_PMAP_AXIS_NAME)
     key_envs = jax.random.split(key_env, num_envs // process_count)
     key_envs = jnp.reshape(
         key_envs,
@@ -716,6 +719,7 @@ def train(
                     )
                 )
                 dummy_ckpt_config = config_dict.ConfigDict()
+                dummy_ckpt_config.network_factory_kwargs = {}  # brax >= 0.13 requires the key (warp-probe)
                 checkpoint.save(
                     checkpoint_logdir,
                     current_step,

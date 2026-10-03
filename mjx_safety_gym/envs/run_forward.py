@@ -132,6 +132,8 @@ import numpy as np
 import mujoco as mj
 from mujoco import mjx
 
+from mjx_safety_gym import backend
+
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_CONFIGS, GoToGoal
 from mjx_safety_gym.mjx_env import State, step
 from mjx_safety_gym.world import build_arena, placement_not_valid
@@ -827,7 +829,7 @@ class RunForward(GoToGoal):
     # -- episode -----------------------------------------------------------
 
     def reset(self, rng) -> State:
-        data = mjx.make_data(self._mjx_model)
+        data = backend.make_data(self._mjx_model, self._mj_model)
         layout, rng = self._sample_corridor_layout(rng)
         data, rng = self.update_positions(data, layout, rng)
         data = mjx.forward(self._mjx_model, data)
