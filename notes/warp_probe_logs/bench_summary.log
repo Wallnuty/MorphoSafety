@@ -1,0 +1,12 @@
+# FILTERED COPY of bench_summary.log: removed 0 lines of Warp noise (kernel-load messages + per-occurrence 'solver/linesearch iterations limit reached' overflow warnings, which only the 4/8-capped Warp runs emit)
+=== A_old_jax 23:01:00
+    exit 0 training/sps=13764.8741
+=== B_new_jax 23:12:59
+    exit 0 training/sps=14099.0606
+=== C_warp_4_8 23:25:26
+    exit 1 
+=== D_warp_100_50 23:26:02
+    exit 1 
+=== E_warp_codesign 23:26:33
+    exit 1 
+=== done 23:26:41

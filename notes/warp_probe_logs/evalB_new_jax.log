@@ -1,0 +1,28 @@
+# FILTERED COPY of evalB_new_jax.log: removed 0 lines of Warp noise (kernel-load messages + per-occurrence 'solver/linesearch iterations limit reached' overflow warnings, which only the 4/8-capped Warp runs emit)
+[ant] robot defaults applied: action_repeat=4, episode_length=2500, discounting=0.97, healthy_reward=0.0002, terminate_on_flip=True, goal_reward_weight=1.0, goal_observation=True, terminate_on_goal=True, foot_obstacle_obs=False, foot_hazard_grid=7, finish_line=True, solver_iterations=4, solver_ls_iterations=8
+JAX compilation cache: /home/samsn/.cache/jax
+matmul precision: highest
+Checkpoints: /tmp/claude-1000/-home-samsn-MorphologyResearch/960ef831-fa7b-4ff2-baf1-5d41b5288aaa/scratchpad/evalB_ckpt
+E1003 22:45:52.451909   59353 cuda_executor.cc:1182] [0] Failed to allocate device memory of 4.50GiB (4829741056 bytes): RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+E1003 22:45:52.456377   59353 cuda_executor.cc:1182] [0] Failed to allocate device memory of 4.05GiB (4346766848 bytes): RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+/home/samsn/miniconda3/envs/mjx-warp/lib/python3.11/site-packages/orbax/checkpoint/_src/serialization/jax_array_handlers.py:1005: UserWarning: Sharding info not provided when restoring. Populating sharding info from sharding file. Please note restoration time will be slightly increased due to reading from file. Note also that this option is unsafe when restoring on a different topology than the checkpoint was saved with.
+  warnings.warn(
+step=0 eval/walltime=168.6521 eval/episode_cost=1.5519 eval/episode_dx=10.9849 eval/episode_flipped=0.0078 eval/episode_hazard_steps=5.1465 eval/episode_out_of_bounds=0.0059 eval/episode_reward=11.0812 eval/episode_safe=0.0000 eval/episode_speed=1.1413 eval/episode_cost_std=2.0856 eval/episode_dx_std=0.6872 eval/episode_flipped_std=0.0880 eval/episode_hazard_steps_std=8.3425 eval/episode_out_of_bounds_std=0.0763 eval/episode_reward_std=0.6925 eval/episode_safe_std=0.0000 eval/episode_speed_std=0.0636 eval/avg_episode_length=481.5469 eval/epoch_eval_time=168.6521 eval/sps=7589.5866
+step=20480 eval/walltime=339.7929 training/sps=208.0777 training/walltime=98.4248 training/budget_effective_rate=0.0000 training/budget_mean_episode_decisions=625.0000 training/cost_v_loss=0.0004 training/cumulative_costs=0.0000 training/entropy_loss=0.0015 training/lagrange_multiplier=3.0000 training/normalized_constraint_estimate=-0.0265 training/policy_loss=0.0257 training/v_loss=0.0018 eval/episode_cost=2.0088 eval/episode_dx=10.9136 eval/episode_flipped=0.0098 eval/episode_hazard_steps=4.2598 eval/episode_out_of_bounds=0.0156 eval/episode_reward=11.0090 eval/episode_safe=0.0000 eval/episode_speed=1.1438 eval/episode_cost_std=2.7982 eval/episode_dx_std=0.9349 eval/episode_flipped_std=0.0983 eval/episode_hazard_steps_std=6.8847 eval/episode_out_of_bounds_std=0.1240 eval/episode_reward_std=0.9423 eval/episode_safe_std=0.0000 eval/episode_speed_std=0.0625 eval/avg_episode_length=477.3516 eval/epoch_eval_time=171.1408 eval/sps=7479.2221
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/samsn/MorphologyResearch/MorphoSafety-warp/mjx_safety_gym/algorithms/train_ppo.py", line 1988, in <module>
+    train(args)
+  File "/home/samsn/MorphologyResearch/MorphoSafety-warp/mjx_safety_gym/algorithms/train_ppo.py", line 1933, in train
+    make_policy, params, metrics = ppo_train.train(
+                                   ^^^^^^^^^^^^^^^^
+  File "/home/samsn/MorphologyResearch/MorphoSafety-warp/mjx_safety_gym/algorithms/ppo/train.py", line 719, in train
+    checkpoint.save(
+  File "/home/samsn/miniconda3/envs/mjx-warp/lib/python3.11/site-packages/brax/training/agents/ppo/checkpoint.py", line 35, in save
+    return checkpoint.save(path, step, params, config, _CONFIG_FNAME)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/samsn/miniconda3/envs/mjx-warp/lib/python3.11/site-packages/brax/training/checkpoint.py", line 152, in save
+    if 'activation' in config_cp_dict['network_factory_kwargs'] and callable(
+                       ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'network_factory_kwargs'

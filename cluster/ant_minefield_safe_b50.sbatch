@@ -249,8 +249,8 @@
 #     sinfo -p bigbatch -N -l          # look for drain/down states
 # and report a wedged GPU to support@wits-mss.supportsystem.com -- a node in
 # that state stays broken until someone resets it.
-# mscluster75 added 2026-10-03 (user's call).
-#SBATCH --exclude=mscluster45,mscluster75,mscluster83
+# mscluster75 added 2026-10-03 (user's call); mscluster44 2026-10-04 (GPU0 'Unable to determine the device handle', job 63510).
+#SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
 #SBATCH --time=06:00:00
 set -u
 

@@ -61,6 +61,8 @@ cover/
 
 # Django stuff:
 *.log
+# ...except the evidence cited by notes/warp_migration.md (filtered copies, small).
+!notes/warp_probe_logs/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

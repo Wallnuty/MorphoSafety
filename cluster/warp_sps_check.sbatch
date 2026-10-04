@@ -30,8 +30,8 @@
 #SBATCH --job-name=warp-sps
 #SBATCH --output=warp_sps_%j.log
 #SBATCH --partition=bigbatch
-# Same exclude list as every other job here (wedged GPUs; 75 = user's call).
-#SBATCH --exclude=mscluster45,mscluster75,mscluster83
+# Same exclude list as every other job here (wedged GPUs incl. 44 since 2026-10-04; 75 = user's call).
+#SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
 #SBATCH --time=01:30:00
 set -u
 

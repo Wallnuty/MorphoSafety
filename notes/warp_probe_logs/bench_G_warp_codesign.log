@@ -1,0 +1,31 @@
+# FILTERED COPY of bench_G_warp_codesign.log: removed 7748856 lines of Warp noise (kernel-load messages + per-occurrence 'solver/linesearch iterations limit reached' overflow warnings, which only the 4/8-capped Warp runs emit)
+[ant] robot defaults applied: action_repeat=4, episode_length=2500, discounting=0.97, healthy_reward=0.0002, terminate_on_flip=True, goal_reward_weight=1.0, goal_observation=True, terminate_on_goal=True, foot_obstacle_obs=False, foot_hazard_grid=7, finish_line=True, solver_iterations=4, solver_ls_iterations=8
+JAX compilation cache: /home/samsn/.cache/jax
+matmul precision: highest
+Checkpoints: /tmp/claude-1000/-home-samsn-MorphologyResearch/960ef831-fa7b-4ff2-baf1-5d41b5288aaa/scratchpad/bench_G_warp_codesign
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.3
+   Devices:
+     "cpu"      : "CPU"
+     "cuda:0"   : "NVIDIA GeForce RTX 4050 Laptop GPU" (6 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/samsn/.cache/warp/1.17.0
+[co-design] one Lagrange multiplier per GMM component (8), each holding its own bodies to the budget of 2
+step=0 eval/walltime=22.5486 eval/episode_cost=34.3755 eval/episode_dx=0.0382 eval/episode_flipped=0.2812 eval/episode_hazard_steps=30.9688 eval/episode_out_of_bounds=0.1562 eval/episode_reward=0.4105 eval/episode_safe=0.4688 eval/episode_speed=0.0046 eval/episode_cost_std=48.6502 eval/episode_dx_std=0.6672 eval/episode_flipped_std=0.4496 eval/episode_hazard_steps_std=108.3315 eval/episode_out_of_bounds_std=0.3631 eval/episode_reward_std=0.6830 eval/episode_safe_std=0.4990 eval/episode_speed_std=0.0238 eval/avg_episode_length=1867.8750 eval/epoch_eval_time=22.5486 eval/sps=3547.8917
+To disable the print warning: m.opt.warn_overflojw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the print warning: m.opt.warn_ove= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the print warning: m.opt.warn_w &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the print  priing: m.ing: m.opoverflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the arnnt warning: m.opt.warnow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the print warning: m.ong: m.opoverrn_overflow &= ~mjw.OverflowType.LS_ITERATIONS (or = 0 for all)
+To diu
+linesearterations limit reached - please increase iterations beyond 4
+To disable the print warning: m.opt.warn_overfl_overflow &= ~mjw.OverflowType.LS_ITERATIONS (or = 0 for all)
+Tnd 1986817907
+To disable the print  print warning: m.opoverflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+linesearterations limit reached - please increase iterations beyond 4
+design it=   1/2 step=   3,031,040 score=   +0.001 comp=8 ep/design=117.9 arrive=0.00 mode=[+0.22 -0.37 -0.73 -0.77 +0.50 +0.66 +0.17] lam=[c0:0.03 c1:0.04 c2:0.01 c3:0.02 c4:0.03 c5:0.05 c6:0.06 c7:0.02]
+To disable the print warning: m.opt.warn_overflojw.OverflowType.ITERATIONS (or = 0 for all)
+To disable the print warning: m.opt.warn_overf~mjw.OverflowType.ITERATIONS (or = 0 for all)
+design it=   2/2 step=   6,062,080 score=   +0.027 comp=8 ep/design=184.8 arrive=0.70 mode=[+0.22 -0.37 -0.73 -0.77 +0.50 +0.66 +0.17] lam=[c0:0.26 c1:0.10 c2:0.14 c3:0.19 c4:0.25 c5:0.29 c6:0.28 c7:0.16]
+step=6062080 eval/walltime=43.0828 training/sps=43069.7726 training/walltime=179.9068 training/budget_effective_rate=0.0088 training/budget_mean_episode_decisions=348.0481 training/constraint_c0=-4.9778 training/constraint_c1=0.0000 training/constraint_c2=-3.8220 training/constraint_c3=-4.4261 training/constraint_c4=-5.2228 training/constraint_c5=-5.4648 training/constraint_c6=-5.0717 training/constraint_c7=-4.0884 training/cost_v_loss=4.2954 training/cumulative_costs=61.6392 training/entropy_loss=0.0003 training/lagrange_multiplier=0.2478 training/lagrange_multiplier_c0=0.2636 training/lagrange_multiplier_c1=0.1006 training/lagrange_multiplier_c2=0.1406 training/lagrange_multiplier_c3=0.1908 training/lagrange_multiplier_c4=0.2455 training/lagrange_multiplier_c5=0.2913 training/lagrange_multiplier_c6=0.2753 training/lagrange_multiplier_c7=0.1616 training/normalized_constraint_estimate=-5.0977 training/policy_loss=0.0010 training/v_loss=0.0049 design/score_mean=0.0266 design/score_spread=0.0329 design/episodes_per_design=184.8125 design/components=8.0000 design/speed_mean=0.0266 design/arrival_rate=0.6953 design/arrival_decisions=350.2921 design/loss=0.0825 design/grad_norm=0.9157 design/mean_std=0.5769 design/dead=0.0000 design/lr_frac=0.0000 design/updating=1.0000 design/mode_0=0.2196 design/mode_1=-0.3678 design/mode_2=-0.7349 design/mode_3=-0.7731 design/mode_4=0.5007 design/mode_5=0.6609 design/mode_6=0.1701 eval/episode_cost=122.1312 eval/episode_dx=10.0419 eval/episode_flipped=0.0312 eval/episode_hazard_steps=280.2500 eval/episode_out_of_bounds=0.0625 eval/episode_reward=10.2592 eval/episode_safe=0.0000 eval/episode_speed=0.5186 eval/episode_cost_std=56.6196 eval/episode_dx_std=2.3341 eval/episode_flipped_std=0.1740 eval/episode_hazard_steps_std=126.2418 eval/episode_out_of_bounds_std=0.2421 eval/episode_reward_std=2.3387 eval/episode_safe_std=0.0000 eval/episode_speed_std=0.1480 eval/avg_episode_length=1087.0000 eval/epoch_eval_time=20.5342 eval/sps=3895.9312

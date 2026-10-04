@@ -1,0 +1,33 @@
+# Main log of cluster/warp_sps_check.sbatch, job 63512 (mscluster49), as pasted by the user 2026-10-04.
+# Per-run logs stayed on the cluster in ~/MorphoSafety-warp/warp_sps_63512/.
+=== node ===
+mscluster49.ms.wits.ac.za
+Sat Oct  3 11:49:50 PM UTC 2026
+NVIDIA GeForce RTX 3090, 24576 MiB, 595.71.05
+main checkout: /home-mscluster/ssnyman/MorphoSafety (6aa94f0)
+warp checkout: /home-mscluster/ssnyman/MorphoSafety-warp (7c0565b, branch warp-probe)
+
+=== preflight ===
+PASS old env: mujoco 3.3.2, [CudaDevice(id=0)]
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "CPU"
+     "cuda:0"   : "NVIDIA GeForce RTX 3090" (24 GiB, sm_86, mempool enabled)
+   Kernel cache:
+     /home-mscluster/ssnyman/.cache/warp/1.17.0
+PASS warp env: mujoco 3.14.0, warp 1.17.0, CUDA driver (13, 2), device cuda:0
+
+=== A_current_single 23:51:41
+    exit 0  training/sps=38203.7940
+=== D_warp_single 00:04:15
+    exit 0  training/sps=118311.0102
+=== F_current_codesign 00:09:04
+    exit 0  training/sps=40365.7604
+=== H_warp_codesign 00:22:06
+    exit 0  training/sps=133262.1850
+
+=== SUMMARY: training steps/s, 20000000 steps, 1024 envs, NVIDIA GeForce RTX 3090 ===
+workload      current (JAX 4/8)  Warp (full)  speedup  overflow warnings (warp)
+single ant               38,204      118,311    3.10x                         0
+co-design                40,366      133,262    3.30x                         0

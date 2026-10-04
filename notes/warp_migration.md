@@ -32,8 +32,15 @@ paper. Every number below comes from a run whose script and log are listed in
   backend, with cost, flips and exits unchanged. Results from the old and new
   setups must therefore not be mixed in one comparison; the reference runs need
   repeating on the new setup.
-* **Still owed:** the 300M quality run against the old final baseline (running),
-  the cluster (3090) speed check, and vases (need contact sensors, see below).
+* **Learning quality holds.** Repeating the old 300M final baseline on the new
+  setup (same flags, same seed) gives the same or slightly better result: at
+  241-261M, 1.52 vs 1.45 m/s, cost 26.3 vs 27.4 (budget 25), 0.3% vs 2.6%
+  flips. It trained in 46 min on the laptop; the old run needed 1.7 h on a 3090.
+* **Cluster.** On an RTX 3090 (mscluster): 38.2k -> 118.3k single ant (3.1x),
+  40.4k -> 133.3k co-design (3.3x), no overflow warnings. A 2B co-design run
+  would take ~4 h of training instead of ~14 h.
+* **Still owed:** vases (need contact sensors, see below), and repeating the
+  reference runs on the new setup before mixing old and new results.
 
 ## Why we looked
 
@@ -134,6 +141,26 @@ time, so these two numbers are probably understated and should not be used to
 argue about the cap on Warp. The headline comparison (A/F vs D/H) is
 unaffected: neither side printed any warnings.
 
+**Cluster RTX 3090** (`cluster/warp_sps_check.sbatch`, job 63512 on mscluster49,
+driver 595.71.05; all four runs in one job on one node, 20M steps each, 1024
+envs / 32 minibatches for both workloads; log
+`notes/warp_probe_logs/cluster_warp_sps_63512.log`):
+
+| workload | MJX-JAX 3.3.2, solver 4/8 | MJX-Warp 3.14, solver 100/50 | speed-up | Warp overflow warnings |
+|---|---|---|---|---|
+| single ant | 38.2k | 118.3k | 3.10x | 0 |
+| co-design (16 bodies, 8 Gaussians) | 40.4k | 133.3k | 3.30x | 0 |
+
+The ratio is smaller than on the laptop because the old stack gains much more
+from the bigger GPU (single ant 13.8k at 512 envs on the 4050 vs 38.2k here)
+while Warp barely does (~113k on the 4050 vs 118k here, both at 1024 envs). At
+1024 envs Warp is therefore not limited by GPU compute; per-step overhead
+(kernel launches, the PPO update) is the likely limit. Hypothesis, untested:
+more envs per GPU would widen the gap on a 3090. Wall clock per 20M-step run
+(including JAX compile, first-use Warp kernel compilation, two evaluations):
+single ant 12.6 min -> 4.8 min. For a 2B co-design run, 133k steps/s means
+~4.2 h of training instead of the ~13.9 h the last runs took.
+
 **Pure physics** (no learning; 1024 envs, random actions, 100-step jitted scan
 after warm-up; `scripts/warp_probe/step_throughput.py`), env steps/s:
 
@@ -173,18 +200,32 @@ Not used by minefield, but the `run` task has them.
   partly for speed (2026-08-15); since Warp only pays for active contacts they
   may be much cheaper there, but that needs measuring.
 
-### 5. Full-length quality run (in progress)
+### 5. Full-length quality run
 
 The old final baseline (`ant_minefield_final_b25_300M`, Vast 3090, MJX-JAX 3.3.2,
-solver 4/8; stopped at 261M: 1.45 m/s, cost 27.4 at budget 25, 2.6% flips, 1.9%
-exits) repeated with identical flags and seed but on Warp with the full solver,
-on the laptop: 5 cm gate, budget 25, multiplier lr 1.5e-5 / cap 3 / init 0.01,
-grid 7, torso lidar, linear cost, flip and exit cost 50, no walls, finish line,
-policy 256x4, 1024 envs / 32 minibatches, 300M steps, 31 evaluations.
-Log `logs/warp/warp_ant_minefield_final_b25_300M.log`, checkpoints
-`checkpoints/warp_ant_minefield_final_b25_300M`.
+solver 4/8, stopped at 261M) repeated with identical flags and seed but on Warp
+with the full solver, on the laptop: 5 cm gate, budget 25, multiplier lr
+1.5e-5 / cap 3 / init 0.01, grid 7, torso lidar, linear cost, flip and exit cost
+50, no walls, finish line, policy 256x4, 1024 envs / 32 minibatches, 300M steps,
+31 evaluations of 320 episodes. Log `notes/warp_probe_logs/warp_ant_minefield_final_b25_300M.log`
+(filtered copy), checkpoints `checkpoints/warp_ant_minefield_final_b25_300M`
+(laptop only). Both rows below average the three evaluations at 241, 251 and
+261M, the last three the old run reached:
 
-*Result: to be filled in when the run finishes.*
+| run | return | speed (m/s) | cost | hazard_steps | flipped | out of bounds | multiplier |
+|---|---|---|---|---|---|---|---|
+| old: MJX-JAX, solver 4/8, RTX 3090 | 10.89 | 1.447 | 27.4 | 70.8 | 2.6% | 1.9% | 0.47 |
+| new: MJX-Warp, solver 100/50, RTX 4050 | 11.06 | 1.520 | 26.3 | 76.6 | 0.3% | 2.4% | 0.30 |
+| new, final three evaluations (281-301M) | 11.08 | 1.532 | 26.2 | 77.8 | 0.5% | 0.6% | 0.33 |
+
+* **Learning is not degraded.** At equal steps the new run is ~5% faster, sits
+  at its budget of 25, and flips less. With one seed per arm these differences
+  are within what seeds alone can produce, so the claim is "matches", not
+  "improves".
+* **Wall time.** 300M steps took 2,747 s of training (46 min; median 112.7k
+  steps/s) on the laptop, against 6,102 s for 261M (1.7 h; median 43.2k) for the
+  old run on a 3090.
+* The run printed no solver or contact overflow warnings.
 
 ## Code changes (branch `warp-probe`)
 

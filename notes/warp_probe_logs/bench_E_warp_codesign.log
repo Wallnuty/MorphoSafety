@@ -1,0 +1,19 @@
+# FILTERED COPY of bench_E_warp_codesign.log: removed 891886 lines of Warp noise (kernel-load messages + per-occurrence 'solver/linesearch iterations limit reached' overflow warnings, which only the 4/8-capped Warp runs emit)
+[ant] robot defaults applied: action_repeat=4, discounting=0.97, healthy_reward=0.0002, terminate_on_flip=True, goal_reward_weight=1.0, goal_observation=True, terminate_on_goal=True, foot_obstacle_obs=False, foot_hazard_grid=7, finish_line=True, solver_iterations=4, solver_ls_iterations=8
+JAX compilation cache: /home/samsn/.cache/jax
+matmul precision: highest
+Checkpoints: /tmp/claude-1000/-home-samsn-MorphologyResearch/960ef831-fa7b-4ff2-baf1-5d41b5288aaa/scratchpad/bench_E_warp_codesign
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.3
+   Devices:
+     "cpu"      : "CPU"
+     "cuda:0"   : "NVIDIA GeForce RTX 4050 Laptop GPU" (6 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/samsn/.cache/warp/1.17.0
+[co-design] one Lagrange multiplier per GMM component (2), each holding its own bodies to the budget of 2
+step=0 eval/walltime=13.0618 eval/episode_cost=0.0000 eval/episode_dx=0.0299 eval/episode_flipped=0.0000 eval/episode_hazard_steps=0.0000 eval/episode_out_of_bounds=0.0000 eval/episode_reward=0.0499 eval/episode_safe=1.0000 eval/episode_speed=0.0149 eval/episode_cost_std=0.0000 eval/episode_dx_std=0.1076 eval/episode_flipped_std=0.0000 eval/episode_hazard_steps_std=0.0000 eval/episode_out_of_bounds_std=0.0000 eval/episode_reward_std=0.1076 eval/episode_safe_std=0.0000 eval/episode_speed_std=0.0538 eval/avg_episode_length=100.0000 eval/epoch_eval_time=13.0618 eval/sps=122.4943
+To disable the print warning: m.opt.erflow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+design it=   1/2 step=     204,800 score=   -0.001 comp=2 ep/design=512.0 arrive=0.00 mode=[+0.22 -0.37 -0.73 -0.77 +0.50 +0.66 +0.17] lam=[c0:0.01 c1:0.01]
+To disable the print warning: m.opt.warlow &= ~mjw.OverflowType.ITERATIONS (or = 0 for all)
+design it=   2/2 step=     409,600 score=   +0.002 comp=2 ep/design=512.0 arrive=0.00 mode=[+0.22 -0.37 -0.73 -0.77 +0.50 +0.66 +0.17] lam=[c0:0.01 c1:0.01]
+step=409600 eval/walltime=25.4316 training/sps=17630.1727 training/walltime=78.0275 training/budget_effective_rate=0.0850 training/budget_mean_episode_decisions=23.7633 training/constraint_c0=0.7858 training/constraint_c1=0.0000 training/cost_v_loss=0.0012 training/cumulative_costs=0.0000 training/entropy_loss=-0.0004 training/lagrange_multiplier=0.0088 training/lagrange_multiplier_c0=0.0088 training/lagrange_multiplier_c1=0.0094 training/normalized_constraint_estimate=0.7858 training/policy_loss=-0.0014 training/v_loss=0.0003 design/score_mean=0.0017 design/score_spread=0.0018 design/episodes_per_design=512.0000 design/components=2.0000 design/speed_mean=0.0017 design/arrival_rate=0.0000 design/arrival_decisions=nan design/loss=-0.6831 design/grad_norm=2.8778 design/mean_std=0.5770 design/dead=0.0000 design/lr_frac=0.0000 design/updating=1.0000 design/mode_0=0.2187 design/mode_1=-0.3688 design/mode_2=-0.7340 design/mode_3=-0.7740 design/mode_4=0.5017 design/mode_5=0.6599 design/mode_6=0.1711 eval/episode_cost=3.1250 eval/episode_dx=0.0698 eval/episode_flipped=0.0625 eval/episode_hazard_steps=0.0000 eval/episode_out_of_bounds=0.0000 eval/episode_reward=0.0889 eval/episode_safe=0.9375 eval/episode_speed=0.0339 eval/episode_cost_std=12.1031 eval/episode_dx_std=0.0833 eval/episode_flipped_std=0.2421 eval/episode_hazard_steps_std=0.0000 eval/episode_out_of_bounds_std=0.0000 eval/episode_reward_std=0.0843 eval/episode_safe_std=0.2421 eval/episode_speed_std=0.0429 eval/avg_episode_length=96.5000 eval/epoch_eval_time=12.3698 eval/sps=129.3476

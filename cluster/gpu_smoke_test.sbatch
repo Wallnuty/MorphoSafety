@@ -38,8 +38,8 @@
 # die in seconds is always idle, so it is always first in the queue -- exclude
 # or it catches every submission. Same list as ant_minefield_safe_b50.sbatch;
 # drop a node once support has reset it (sinfo -p bigbatch -N -l).
-# mscluster75 added 2026-10-03 (user's call).
-#SBATCH --exclude=mscluster45,mscluster75,mscluster83
+# mscluster75 added 2026-10-03 (user's call); mscluster44 2026-10-04 (GPU0 'Unable to determine the device handle', job 63510).
+#SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
 #SBATCH --time=00:10:00
 set -u
 echo "=== node ==="
