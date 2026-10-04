@@ -17,6 +17,9 @@
 #
 #   cd ~/MorphoSafety && sbatch cluster/warp_num_envs_sweep.sbatch
 #   ENVS="1024 4096" STEPS=20000000 sbatch cluster/warp_num_envs_sweep.sbatch   # smaller
+#   bash cluster/vast/vast.sh warp-sweep      # same thing on a rented 3090
+# Also runs as a plain bash script (the #SBATCH lines are then comments); PY
+# and OUT override the cluster's interpreter and output directory.
 #
 # Read the SUMMARY at the end of warp_envs_<jobid>.log; per-run logs and GPU
 # samples are in warp_envs_<jobid>/.
@@ -32,8 +35,8 @@ set -u
 ENVS="${ENVS:-1024 2048 4096 8192}"
 STEPS="${STEPS:-40000000}"
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
-OUT="${SLURM_SUBMIT_DIR:-$PWD}/warp_envs_${SLURM_JOB_ID:-local}"
-PY=$HOME/miniconda3/envs/mjx-warp/bin/python
+OUT="${OUT:-${SLURM_SUBMIT_DIR:-$PWD}/warp_envs_${SLURM_JOB_ID:-local}}"
+PY="${PY:-$HOME/miniconda3/envs/mjx-warp/bin/python}"
 mkdir -p "$OUT"
 
 echo "=== node ==="
@@ -118,3 +121,4 @@ for n in envs:
     print(f"{n:6d} | {cols[0]} | {cols[1]}")
 print(f"x = relative to {envs[0]} envs. GPU% = median utilisation over the second half of each run.")
 PY
+rm -rf "$OUT"/ckpt_*   # throwaway checkpoints; only the logs matter

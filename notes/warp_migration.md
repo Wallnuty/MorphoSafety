@@ -43,9 +43,11 @@ paper. Every number below comes from a run whose script and log are listed in
   [Adoption](#adoption-2026-10-04)); the vase cost now uses contact sensors and
   matches the old one step for step. The old stack stays reproducible from the
   `pre-warp` tag.
+* **More envs per GPU help on a 3090:** 4096 envs train 1.73-1.77x faster
+  than 1024 (233k steps/s co-design), 8192 ~1.95x; co-design then needs
+  longer design iterations (section 3b).
 * **Still owed:** repeating the reference runs on the new setup before mixing
-  old and new results, and the env-count sweep on a 3090
-  (`cluster/warp_num_envs_sweep.sbatch`).
+  old and new results, and checking that learning holds at a larger env count.
 
 ## Why we looked
 
@@ -187,6 +189,38 @@ both the accurate and the fast choice.
 (capacity 65,536) and 20 constraint rows per world (capacity 256), against the
 ~188 rows per env that MJX-JAX processes whatever is touching. That gap is the
 mechanism behind the speed-up.
+
+### 3b. Envs per GPU (RTX 3090, Vast)
+
+`cluster/warp_num_envs_sweep.sbatch` run on a rented 3090 (`vast.sh
+warp-sweep`; the cluster was full), Warp with the full solver, 40M steps per
+run, `num_minibatches = num_envs / 32` so every training step still uses one
+unroll per env; log `notes/warp_probe_logs/vast_warp_envs_sweep.log`:
+
+| envs | single ant (steps/s) | vs 1024 | co-design (steps/s) | vs 1024 |
+|---|---|---|---|---|
+| 1024 | 124.1k | 1.00 | 134.9k | 1.00 |
+| 2048 | 183.5k | 1.48 | 191.8k | 1.42 |
+| 4096 | 219.6k | 1.77 | 233.4k | 1.73 |
+| 8192 | 243.9k | 1.97 | 262.5k | 1.95 |
+
+* At 1024 envs this host matches mscluster (co-design 134.9k vs 133.3k).
+* Diminishing returns: 4096 -> 8192 adds only ~11%.
+* nvidia-smi reported 100% GPU utilisation at every size. That metric is the
+  share of time some kernel is running, not how much of the GPU it uses: the
+  GPU was never idle at 1024 envs, but its kernels were too small to fill it.
+  This corrects the earlier guess of host-side overhead. The memory column
+  (~14.9 GB) is JAX's preallocation (0.6 x 24 GB), not what the runs needed.
+* No overflow warnings at any size (contacts sized 64 per env).
+* **Co-design caveat.** A design is scored only from episodes that finish
+  within its iteration: episodes per lane = steps per iteration / num_envs /
+  2500. The 2B schedule's 3.85M-step iterations give 1.50 at 1024 envs but
+  0.75 at 2048 and 0.38 at 4096, so more envs require proportionally longer
+  design iterations (fewer design updates) or more total steps. The 8192 run
+  here already printed the trainer's < 1.0 warning and one unscored design.
+* Throughput only: a bigger env count changes how many envs each PPO update's
+  data comes from, so the learning outcome needs its own check before it
+  becomes a default.
 
 ### 4. Vases
 

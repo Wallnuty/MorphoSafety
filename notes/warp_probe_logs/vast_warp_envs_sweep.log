@@ -1,0 +1,27 @@
+# Summary of cluster/warp_num_envs_sweep.sbatch run on Vast via 'vast.sh warp-sweep' (instance 54154497, RTX 3090, driver 580.173.02), 2026-10-04.
+# Per-run logs and GPU samples: logs/vast/warp_envs_vast/ (laptop only).
+=== node ===
+=== preflight ===
+=== single_1024 (1024 envs, 32 minibatches) 13:44:19
+    exit 0  training/sps=124053.8410
+=== codesign_1024 (1024 envs, 32 minibatches) 13:51:46
+    exit 0  training/sps=134920.9459
+=== single_2048 (2048 envs, 64 minibatches) 13:58:56
+    exit 0  training/sps=183490.3981
+=== codesign_2048 (2048 envs, 64 minibatches) 14:03:37
+    exit 0  training/sps=191805.9768
+=== single_4096 (4096 envs, 128 minibatches) 14:09:02
+    exit 0  training/sps=219575.8963
+=== codesign_4096 (4096 envs, 128 minibatches) 14:13:09
+    exit 0  training/sps=233353.9967
+=== single_8192 (8192 envs, 256 minibatches) 14:18:00
+    exit 0  training/sps=243889.3946
+=== codesign_8192 (8192 envs, 256 minibatches) 14:21:49
+    exit 0  training/sps=262456.8220
+=== SUMMARY: MuJoCo Warp training steps/s vs envs per GPU, 40000000 steps each, NVIDIA GeForce RTX 3090 ===
+  envs |  single sps     x  GPU%    MiB | co-design sps     x  GPU%    MiB
+  1024 |     124,054  1.00   100  14888 |       134,921  1.00   100  14904
+  2048 |     183,490  1.48   100  14888 |       191,806  1.42   100  14908
+  4096 |     219,576  1.77   100  14920 |       233,354  1.73   100  14952
+  8192 |     243,889  1.97   100  14952 |       262,457  1.95   100  15020
+x = relative to 1024 envs. GPU% = median utilisation over the second half of each run.

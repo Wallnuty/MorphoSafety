@@ -9,6 +9,8 @@
 #   bash cluster/vast/vast.sh smoke           # measure this card: num_envs sweep
 #   bash cluster/vast/vast.sh throughput      # full hyperparameter sweep (~90 min)
 #   bash cluster/vast/vast.sh throughput-log  # follow the sweep
+#   bash cluster/vast/vast.sh warp-sweep      # MuJoCo Warp num_envs sweep (~1 h)
+#   bash cluster/vast/vast.sh warp-sweep-log  # follow it
 #   bash cluster/vast/vast.sh train <args>    # real run, detached in tmux
 #   bash cluster/vast/vast.sh push-ckpt <dir> # send a checkpoint to resume FROM
 #   bash cluster/vast/vast.sh codesign        # morphology co-design run (+preflights)
@@ -353,6 +355,27 @@ throughput)
 throughput-log)
   ssh_parts
   rexec "tail -n ${LINES:-40} -f $REMOTE_DIR/logs/throughput.log"
+  ;;
+
+warp-sweep)
+  ssh_parts
+  # cluster/warp_num_envs_sweep.sbatch run as a plain script (its #SBATCH lines
+  # are comments here), in tmux like `throughput`. ENVS / STEPS pass through.
+  # Output lands under logs/, so `pull` brings it home as logs/vast/.
+  sweep_envs="${ENVS:-1024 2048 4096 8192}"; sweep_steps="${STEPS:-40000000}"
+  rexec "cd $REMOTE_DIR && mkdir -p logs && \
+         tmux kill-session -t wsweep 2>/dev/null; \
+         tmux new-session -d -s wsweep \
+         'source /opt/conda_profile.sh && conda activate morpho && \
+          ENVS=\"$sweep_envs\" STEPS=$sweep_steps PY=\$(which python) OUT=$REMOTE_DIR/logs/warp_envs_vast \
+          bash cluster/warp_num_envs_sweep.sbatch 2>&1 | tee logs/warp_envs_vast.log' && \
+         echo 'launched in tmux session: wsweep'"
+  echo "Follow it with: $0 warp-sweep-log"
+  ;;
+
+warp-sweep-log)
+  ssh_parts
+  rexec "tail -n ${LINES:-40} -f $REMOTE_DIR/logs/warp_envs_vast.log"
   ;;
 
 train)
