@@ -184,10 +184,13 @@ assert 'design_tmax' in {a.dest for a in T.build_argparser()._actions}, (
 
 p = T.build_argparser().parse_args(['--robot', 'ant', '--task', 'minefield'])
 T.apply_robot_defaults(p)
+# Backend chosen the way train() chooses it, before any env exists.
+impl = T.configure_backend(p)
+assert impl == 'warp', f'ABORT: trainer default backend is {impl}, expected warp (2026-10-04). Re-sync.'
 assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost,
         p.corridor_walls, p.terminate_out_of_bounds, p.exit_cost,
         p.solver_iterations, p.solver_ls_iterations) == (
-    'ppo_lagrangian', 25.0, 7, 50.0, False, True, 50.0, 4, 8), (
+    'ppo_lagrangian', 25.0, 7, 50.0, False, True, 50.0, None, None), (
     f'ABORT: trainer defaults are not the 2026-09-25 recipe: {p.penalizer} '
     f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. Re-sync.')
 kw = dict(T.robot_env_kwargs('ant'))
@@ -200,7 +203,13 @@ assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}
 assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
-assert (o.iterations, o.ls_iterations) == (4, 8), f'ABORT: solver caps {o.iterations}/{o.ls_iterations}, expected 4/8'
+assert (o.iterations, o.ls_iterations) == (100, 50), (
+    f'ABORT: solver {o.iterations}/{o.ls_iterations}, expected the full 100/50 (no cap since the '
+    f'Warp migration, 2026-10-04). Re-sync.')
+import warp as wp
+wp.init()
+assert wp.get_cuda_device_count() > 0, f'ABORT: Warp sees no CUDA device (driver {wp.get_cuda_driver_version()}).'
+print(f'PASS: MuJoCo Warp on {wp.get_device(\"cuda:0\")}, solver 100/50')
 print(f'PASS: obs {w} (grid 7 + genes), 2 cm linear cost, design checkpointing present')
 import jax, numpy as np, jax.numpy as jp
 a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
@@ -250,9 +259,9 @@ else
 fi
 echo
 
-# 0.75 of 24 GB -- the same fraction the mscluster jobs use, left alone so a
-# VRAM problem here is directly comparable to one there.
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
+# 0.6 of 24 GB for JAX, as on mscluster: Warp allocates its own buffers in the
+# same process, so JAX must not take the 0.75 the pre-Warp jobs did.
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
 
 echo "=========================================================="
 echo " co-design $([ -n "$RESUME" ] && echo "RESUME from $RESUME" || echo FRESH)"
@@ -282,7 +291,7 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --initial_lagrange_multiplier "$MULT_INIT" "$LPC_FLAG" \
   --hazard_size 0.16 --hazard_lidar --no-foot_obstacle_obs \
   --foot_hazard_grid "$GRID" --hazard_cost_shape linear --ground_contact_eps 0.02 --finish_line \
-  --matmul_precision highest --solver_iterations 4 --solver_ls_iterations 8 \
+  --matmul_precision highest --impl warp \
   --no-corridor_walls --terminate_out_of_bounds --exit_cost 50 --boundary_cost_weight 0 \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \

@@ -33,6 +33,7 @@ from mujoco.usd.exporter import USDExporter
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from eval_checkpoint import build_policy  # noqa: E402
 
+from mjx_safety_gym import backend  # noqa: E402  (library default: jax)
 from mjx_safety_gym import design as design_lib  # noqa: E402
 from mjx_safety_gym import morphology as morph_lib  # noqa: E402
 from mjx_safety_gym.algorithms import train_ppo  # noqa: E402
@@ -86,7 +87,7 @@ def main() -> None:
         spec = evolved_spec(pathlib.Path(args.design_from).resolve())
         mj = raw.build_morphology_model(spec)
         raw._mj_model = mj
-        raw._mjx_model = mjx.put_model(mj)
+        raw._mjx_model = backend.put_model(mj)
         raw._morphology_genes = jax.numpy.asarray(spec.genes, dtype=jax.numpy.float32)
         print("scales:", {k: round(v, 2) for k, v in spec.scales.items()})
     policy = build_policy(ckpt, env, deterministic=args.deterministic, seed=args.seed)

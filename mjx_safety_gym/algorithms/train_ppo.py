@@ -23,6 +23,7 @@ import jax
 from brax.envs.wrappers import training as brax_training
 from mujoco_playground import wrapper as playground_wrapper
 
+from mjx_safety_gym import backend
 from mjx_safety_gym import jax_cache
 from mjx_safety_gym import numerics
 from mjx_safety_gym import design as design_lib
@@ -184,18 +185,19 @@ _ROBOT_DEFAULTS = {
         # 47 -> 243. Older checkpoints load through _env_kwarg_candidates.
         "foot_obstacle_obs": False, "foot_hazard_grid": 7, "finish_line": True,
         #
-        # SOLVER CAPS 4/8 (2026-09-27), was the XML's MuJoCo defaults 100/50.
-        # MJX runs every line-search step for every env, so ls_iterations was
-        # the dominant cost of training. Measured on the laptop, 512 envs, no
-        # walls: 3821 -> 13317 training sps (10/10: 10075). Physics check
-        # against 100/50: one-step velocity error median 4e-8 (the GPU's own
-        # run-to-run noise), p99 2e-3 over 1024 states; the b10 policy over
-        # 256 episodes unchanged (return 21.29 vs 21.00, speed 1.14 vs 1.12,
-        # cost 9.8 vs 12.4, flips 4.7% vs 6.6%, same foot penetration and
-        # torso height). 1/4 broke it (flips 20%, cost 3x). Pass
-        # --solver_iterations 100 --solver_ls_iterations 50 to reproduce
-        # earlier ant runs. See world.apply_solver.
-        "solver_iterations": 4, "solver_ls_iterations": 8,
+        # NO SOLVER CAP SINCE THE WARP MIGRATION (2026-10-04): the XML's MuJoCo
+        # defaults (100 iterations / 50 line-search steps) apply, i.e. the
+        # contact solve runs to convergence. On MuJoCo Warp that is also the
+        # FASTEST setting (it exits once every world has converged): laptop
+        # pure stepping 140k vs 47k env steps/s capped. See
+        # notes/warp_migration.md.
+        #
+        # 2026-09-27..10-03 the ant ran capped at 4/8 on MJX-JAX, which runs
+        # every allowed line-search step for every env: 3821 -> 13317 training
+        # sps on the laptop, physics within GPU noise of 100/50 for one step.
+        # On --impl jax the cap is still the fast option; pass
+        # --solver_iterations 4 --solver_ls_iterations 8 to get it back (and to
+        # match runs from that window, together with the pre-warp tag).
     },
     # ant_gym is 4x the ant's length scale but its measured best gait period is
     # similar (0.5 s vs 0.4 s), so the same control period applies. It travels
@@ -1283,20 +1285,44 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num_minibatches", type=int, default=16)
     parser.add_argument("--unroll_length", type=int, default=10)
     parser.add_argument(
+        "--impl",
+        choices=backend.IMPLS,
+        default=None,
+        help="MJX implementation. Unset = warp (MuJoCo Warp, the default since "
+        "2026-10-04: 3-5x faster training, needs a CUDA GPU). jax = MJX-JAX, "
+        "what every earlier run used; works on CPU. Same physics to ~1e-7 when "
+        "the solver converges. See mjx_safety_gym/backend.py.",
+    )
+    parser.add_argument(
+        "--warp_contacts_per_env",
+        type=int,
+        default=64,
+        help="Warp only: contact buffer per env; the shared buffer holds this "
+        "x max(num_envs, num_eval_envs). Measured peak on the ant: ~1.3 per "
+        "env. Overflowing it drops contacts, so err large.",
+    )
+    parser.add_argument(
+        "--warp_njmax",
+        type=int,
+        default=256,
+        help="Warp only: constraint rows per env (measured peak 20 on the ant).",
+    )
+    parser.add_argument(
         "--solver_iterations",
         type=int,
         default=None,
         help="Constraint-solver iteration cap. Unset = the robot default "
-        "(see _ROBOT_DEFAULTS; the XML's own value where there is none). "
-        "Pass 100 with --solver_ls_iterations 50 to reproduce ant runs from "
-        "before 2026-09-27. See world.apply_solver for the measurements.",
+        "(see _ROBOT_DEFAULTS; the XML's own value, MuJoCo's 100, where there "
+        "is none -- the ant since the Warp migration). 4 with "
+        "--solver_ls_iterations 8 is the old MJX-JAX speed cap.",
     )
     parser.add_argument(
         "--solver_ls_iterations",
         type=int,
         default=None,
-        help="Line-search steps per solver iteration -- the dominant cost: "
-        "MJX runs all of them for every env. See --solver_iterations.",
+        help="Line-search steps per solver iteration (MuJoCo default 50). "
+        "MJX-JAX runs all of them for every env; Warp stops at convergence. "
+        "See --solver_iterations.",
     )
     parser.add_argument(
         "--integrator",
@@ -1666,7 +1692,24 @@ def resolve_checkpoint_logdir(args: argparse.Namespace) -> Optional[Path]:
     )
 
 
+def configure_backend(args: argparse.Namespace) -> str:
+    """Pick the MJX implementation and size Warp's buffers. Must run before
+    any env is constructed: envs put their model on the device in __init__."""
+    impl = backend.configure(
+        impl=getattr(args, "impl", None) or "warp",
+        nworld=max(args.num_envs, getattr(args, "num_eval_envs", 1)),
+        contacts_per_world=getattr(args, "warp_contacts_per_env", None),
+        njmax=getattr(args, "warp_njmax", None),
+    )
+    if impl == "warp" and jax.default_backend() != "gpu":
+        raise SystemExit(
+            f"--impl warp needs a CUDA GPU, but JAX is on {jax.default_backend()}. "
+            "Pass --impl jax to run on CPU.")
+    return impl
+
+
 def train(args: argparse.Namespace):
+    print(f"MJX backend: {configure_backend(args)}")
     resolved_logdir = resolve_checkpoint_logdir(args)
     checkpoint_logdir = None if resolved_logdir is None else str(resolved_logdir)
     if checkpoint_logdir is not None:

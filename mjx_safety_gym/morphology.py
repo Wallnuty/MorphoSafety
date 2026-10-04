@@ -31,7 +31,7 @@ from mujoco import mjx
 
 from mjx_safety_gym import backend
 
-from mjx_safety_gym.world import ObjectSpec, apply_integrator, build_arena
+from mjx_safety_gym.world import ObjectSpec, add_vase_contact_sensors, apply_integrator, build_arena
 
 _XML_DIR = files("mjx_safety_gym.envs.xmls")
 _ANT_XML = _XML_DIR / "ant.xml"
@@ -148,7 +148,7 @@ _STATIC_PINNED_FIELDS: tuple[str, ...] = ("geom_aabb", "geom_rbound_hfield")
 
 
 def _pin(base, pinned):
-    """warp-probe: MJX >= 3.4 moved some pinned fields (geom_rbound_hfield)
+    """MJX 3.14 (Warp migration, 2026-10-04) moved some pinned fields (geom_rbound_hfield)
     into the backend-specific `_impl`; put each one where it now lives."""
     top = {f.name for f in dataclasses.fields(type(base))}
     outer = {k: v for k, v in pinned.items() if k in top}
@@ -260,6 +260,9 @@ def build_mj_model(
         obstacle_scale=cfg["arena_scale"],
         vase_mass=cfg["vase_mass"],
     )
+    from mjx_safety_gym.envs.go_to_goal import _ROBOT_CONFIGS  # lazy: go_to_goal imports this module
+
+    add_vase_contact_sensors(s, arena_spec["vases"].num_objects, _ROBOT_CONFIGS[robot]["collision_geoms"])
     model = s.compile()
     if scale_actuators:
         rescale_actuators(model, robot)
@@ -373,7 +376,7 @@ def batch_models(mj_models: Sequence[mj.MjModel]) -> tuple[mjx.Model, mjx.Model]
     pinned = {
         f: np.maximum.reduce([np.asarray(getattr(m, f)) for m in mjx_models])
         for f in _STATIC_PINNED_FIELDS
-        if hasattr(base, f)  # warp-probe: MJX-Warp has no geom_rbound_hfield
+        if hasattr(base, f)  # MJX-Warp models have no geom_rbound_hfield
     }
     base = _pin(base, pinned)
     in_axes = jax.tree_util.tree_map(lambda _: None, base)
@@ -456,7 +459,7 @@ def build_design_batch(
     pinned = {
         f: np.maximum.reduce([np.asarray(getattr(m, f)) for m in mjx_models])
         for f in _STATIC_PINNED_FIELDS
-        if hasattr(base, f)  # warp-probe: MJX-Warp has no geom_rbound_hfield
+        if hasattr(base, f)  # MJX-Warp models have no geom_rbound_hfield
     }
     base = _pin(base, pinned)
 

@@ -92,6 +92,39 @@ def apply_solver(
         spec.option.ls_iterations = int(ls_iterations)
 
 
+def add_vase_contact_sensors(spec: mj.MjSpec, num_vases: int, robot_geoms) -> None:
+    """Contact sensors for the vase collision cost: one per (vase, robot geom).
+
+    THIS IS THE VASE COLLISION COST'S INPUT SINCE THE WARP MIGRATION
+    (2026-10-04). It used to read `data.contact` directly (collision.py), which
+    MuJoCo Warp does not expose. Contact sensors work on both MJX backends and
+    on CPU MuJoCo -- but only GEOM-to-geom matching on MJX-JAX ("subtree
+    matching semantics not implemented for JAX backend"), hence one sensor per
+    pair rather than one per vase. Each reports [found, min distance]
+    (data="found dist", reduce="mindist", num=1); a pair is touching when found
+    > 0 AND the distance is < 0 -- exactly the old geoms_colliding rule (closest
+    contact of the pair penetrating). "found" alone also counts contacts at
+    distance >= 0 and over-counted vase hits by ~9% in that check. A vase is hit
+    when ANY robot geom touches it. Checked against the old rule step for step
+    (scripts/warp_probe/vase_cost_equivalence.py).
+
+    Must run on every compile path of a model with vases (env __init__,
+    build_morphology_model, morphology.build_mj_model), or sensor addresses
+    differ between bodies that are batched together. Sensor names:
+    vase_<i>_touch_<robot geom name>.
+    """
+    for i in range(num_vases):
+        for geom in robot_geoms:
+            sensor = spec.add_sensor()
+            sensor.name = f"vase_{i}_touch_{geom}"
+            sensor.type = mj.mjtSensor.mjSENS_CONTACT
+            sensor.objtype = mj.mjtObj.mjOBJ_GEOM    # geom1 = this robot geom
+            sensor.objname = geom
+            sensor.reftype = mj.mjtObj.mjOBJ_GEOM    # geom2 = this vase
+            sensor.refname = f"vase_{i}_geom"
+            sensor.intprm[0:3] = (9, 1, 1)           # data="found dist", reduce="mindist", num=1
+
+
 # sample_layout(vase: [10, 5], hazard: [20, 2], goal : []): [-2, -2, 2, 2]-> (vase: [x y theta])
 def build_arena(
     spec: mj.MjSpec,

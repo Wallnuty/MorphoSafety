@@ -89,7 +89,7 @@ cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate mjx-safety-gym
+conda activate mjx-warp
 
 # CRPO_-PREFIXED, and the prefix is not decoration. Reading a bare `NAME`
 # inherits THIS MACHINE's environment -- WSL exports NAME=SamLaptop -- so the

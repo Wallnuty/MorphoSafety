@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mjx-safety-gym"
-version = "0.1.6"
+version = "0.2.0"
 description = "MJX Safety Gym Environments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,27 +14,34 @@ authors = [
 ]
 dependencies = [
   "absl-py>=2.2.2,<3.0.0",
-  "etils==1.13.0",
-  "flax==0.10.6",
+  "etils==1.14.0",
+  "flax==0.12.8",
   "jax==0.10.2",
   "ml_collections==1.1.0",
-  "mujoco==3.3.2",
-  "mujoco_mjx==3.3.2",
-  "numpy==2.3.2",
-  "pynput==1.8.1",
+  # MuJoCo WARP MIGRATION (2026-10-04, notes/warp_migration.md): MuJoCo/MJX
+  # 3.3.2 -> 3.14.0 for MJX's Warp backend (`impl='warp'`, the trainer's
+  # default). The four mujoco/warp pins move together. Results from before
+  # the migration reproduce only on the `pre-warp` tag with its own env.
+  "mujoco==3.14.0",
+  "mujoco_mjx[warp]==3.14.0",
+  "mujoco-warp==3.14.0",
+  "warp-lang==1.17.0",
+  "numpy==2.4.6",
+  "orbax-checkpoint==0.12.6",
+  "pynput==1.8.2",
   "setuptools>=68.0.0",
   # NOTE: the CUDA plugin must stay in lockstep with the jax pin above --
   # a mismatched jax-cuda12-plugin fails hard at import with a PJRT version
   # error. Install it via the [cuda] extra rather than by hand; on a headless
   # cluster node a missing plugin does NOT fail, it silently falls back to CPU.
   # jax 0.6.0 was measured ~2.4x slower at MJX stepping, hence the exact pin.
-  "optax>=0.2.4",
-  # Pinned to commit, not branch: both of these track moving branches upstream
-  # (and `playground` had no ref at all, so it followed the default branch),
-  # which quietly breaks reproducibility the moment the fork advances. These
-  # SHAs are what the working environment was built from.
-  "brax @ git+https://github.com/Andrew-Luo1/brax.git@aeda2a4269fa05fe17d3e678f15f11e7d01323a7",
-  "playground @ git+https://github.com/Andrew-Luo1/mujoco_playground_new.git@179d98010a8320b42048be53bddac6b678e842b8",
+  "optax==0.2.8",
+  # Upstream PyPI releases since the Warp migration, replacing the
+  # Andrew-Luo1 forks (brax@aeda2a42, mujoco_playground_new@179d9801) that
+  # predate MJX's Warp backend. brax 0.14 stores the observation normaliser
+  # differently; old checkpoints still load (algorithms/rl/utils.py).
+  "brax==0.14.2",
+  "playground==0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +53,8 @@ cuda = ["jax[cuda12]==0.10.2"]
 # scripts/evolve.py + scripts/fitness_noise.py (NSGA-II morphology search).
 # Separate extra: irrelevant to anyone just training/replaying a fixed body.
 evolve = ["pymoo==0.6.2"]
+# scripts/export_usd.py (path-traced renders; Blender itself is a separate env).
+render = ["usd-core==24.11"]
 
 [project.urls]
 Homepage = "https://github.com/Wallnuty/MorphoSafety"

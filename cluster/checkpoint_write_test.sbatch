@@ -46,7 +46,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 echo
 echo "=== env ==="
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mjx-safety-gym
+conda activate mjx-warp
 python --version
 echo "home quota / free space:"
 df -h ~ | tail -1

@@ -1,10 +1,17 @@
 #!/bin/bash
 # Schaff et al. (ICRA 2019) co-design: train the DESIGN DISTRIBUTION jointly
-# with the policy. 300M env steps, ant on minefield, FINAL SAFE-RL RECIPE
-# (2026-09-25): PPO-Lagrangian at budget 25, per-foot 7x7 hazard grid, linear
-# cost at the 5 cm gate, flip cost 50, finish line. These are the trainer's
+# with the policy. 2B env steps, ant on minefield, FINAL SAFE-RL RECIPE
+# (2026-09-25) at budget 2 and the 2 cm gate: PPO-Lagrangian, per-foot 7x7
+# hazard grid, linear cost, flip cost 50, finish line. These are the trainer's
 # defaults now; they are also passed explicitly below so a later default
 # change cannot silently alter this run.
+#
+# SIMULATOR: MuJoCo WARP since 2026-10-04 (notes/warp_migration.md) -- env
+# `mjx-warp`, `--impl warp`, the contact solver run to convergence (MuJoCo's
+# 100/50, no cap). Measured on a 3090: 133k training sps against 40k for the
+# old MJX-JAX setup, so 2B is ~4 h of training instead of ~14 h. The three
+# co-design runs of 2026-09-28..10-03 used the old setup; reproduce them from
+# the `pre-warp` tag with env mjx-safety-gym.
 #
 #   Schaff, Yunis, Chakrabarti & Walter, "Jointly Learning to Construct and
 #   Control Agents using Deep Reinforcement Learning", arXiv 1801.01432.
@@ -29,10 +36,10 @@
 #    preflight below asserts on the actual API rather than trusting `git log`,
 #    so a stale checkout fails in seconds instead of at hour eight.
 #
-# 2. Environment, once: miniconda in $HOME, `conda create -n mjx-safety-gym
-#    python=3.11`, `pip install -e .[cuda]` from the repo. No `module load
-#    cuda-*` -- jax's plugin bundles its own CUDA 12 runtime and depends only
-#    on the host driver.
+# 2. Environment, once: miniconda in $HOME, then `bash cluster/warp/setup_env.sh`
+#    from the repo (builds `mjx-warp` from cluster/warp/requirements-warp.txt).
+#    No `module load cuda-*` -- jax's plugin and Warp bundle their own CUDA 12
+#    runtime and depend only on the host driver.
 #
 # 3. Run cluster/gpu_smoke_test.sbatch first if this node is new to you.
 #
@@ -196,7 +203,7 @@
 # drop a node once support has reset it (sinfo -p bigbatch -N -l).
 # mscluster75 added 2026-10-03 (user's call); mscluster44 2026-10-04 (GPU0 'Unable to determine the device handle', job 63510).
 #SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
-#SBATCH --time=36:00:00
+#SBATCH --time=12:00:00
 set -u
 
 echo "=== node ==="
@@ -205,7 +212,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 echo
 echo "=== env ==="
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mjx-safety-gym
+conda activate mjx-warp
 python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 df -h ~ | tail -1
@@ -269,10 +276,14 @@ assert 'design_tmax' in {a.dest for a in T.build_argparser()._actions}, (
 
 p = T.build_argparser().parse_args(['--robot', 'ant', '--task', 'minefield'])
 T.apply_robot_defaults(p)
+# The trainer's own backend choice, made the way train() makes it, BEFORE any
+# env exists (envs put their model on the device in __init__).
+impl = T.configure_backend(p)
+assert impl == 'warp', f'ABORT: trainer default backend is {impl}, expected warp (2026-10-04). git pull.'
 assert (p.penalizer, p.safety_budget, p.foot_hazard_grid, p.flip_cost,
         p.corridor_walls, p.terminate_out_of_bounds, p.exit_cost,
         p.solver_iterations, p.solver_ls_iterations) == (
-    'ppo_lagrangian', 25.0, 7, 50.0, False, True, 50.0, 4, 8), (
+    'ppo_lagrangian', 25.0, 7, 50.0, False, True, 50.0, None, None), (
     f'ABORT: trainer defaults are not the 2026-09-25 recipe: {p.penalizer} '
     f'b{p.safety_budget} grid{p.foot_hazard_grid} flip{p.flip_cost}. git pull.')
 kw = dict(T.robot_env_kwargs('ant'))
@@ -299,7 +310,14 @@ assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}
 assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
-assert (o.iterations, o.ls_iterations) == (4, 8), f'ABORT: solver caps {o.iterations}/{o.ls_iterations}, expected 4/8'
+assert (o.iterations, o.ls_iterations) == (100, 50), (
+    f'ABORT: solver {o.iterations}/{o.ls_iterations}, expected the full 100/50 (no cap since the '
+    f'Warp migration, 2026-10-04). git pull.')
+import warp as wp
+wp.init()
+assert wp.get_cuda_device_count() > 0, (
+    f'ABORT: Warp sees no CUDA device (driver {wp.get_cuda_driver_version()}).')
+print(f'PASS: MuJoCo Warp on {wp.get_device(\"cuda:0\")}, solver 100/50')
 print(f'PASS: obs {w} (grid 7 + genes), 2 cm linear cost, hazard radius {hs} ({pl}), design checkpointing present')
 import jax, numpy as np, jax.numpy as jp
 a = np.random.default_rng(0).standard_normal((256, 256)).astype(np.float32)
@@ -314,9 +332,9 @@ print(f'PASS: float32 matmuls on {jax.default_backend()} (rel err {err:.1e})')
 " || { echo "=== code preflight FAILED, nothing spent ==="; exit 1; }
 echo
 
-# 0.75 of 24 GB. The card has room; this is the same fraction the other
-# cluster jobs use, left alone so a VRAM problem here is comparable to theirs.
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
+# 0.6 of 24 GB for JAX: Warp allocates its own buffers in the same process
+# (contacts, constraints), so JAX must not take the 0.75 the pre-Warp jobs did.
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
 
 # ---- overridable at submit time, e.g.
 #        DESIGN_LR=0.03 RESUME=<ckpt-step-dir> STEPS=240000000 sbatch <this>
@@ -393,7 +411,7 @@ else
 fi
 echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
 echo "    schedule: design frozen until $STEPS_BEFORE, chop every $CHOP_FREQ, fine-tune last $STEPS_AFTER; $NUM_EVALS evals x $DESIGN_UPDATES updates"
-echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  hazard r=$HAZARD_SIZE $HAZARD_PLACEMENT  finish line  float32"
+echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  hazard r=$HAZARD_SIZE $HAZARD_PLACEMENT  finish line  float32  MuJoCo Warp, full solver"
 
 # python -u is NOT optional: Python block-buffers stdout when redirected, and a
 # segfault never flushes it. A laptop run once reached 573k steps -- proven by
@@ -418,7 +436,7 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_size "$HAZARD_SIZE" --hazard_placement "$HAZARD_PLACEMENT" \
   --hazard_lidar --no-foot_obstacle_obs \
   --foot_hazard_grid "$GRID" --hazard_cost_shape linear --ground_contact_eps 0.02 --finish_line \
-  --matmul_precision highest --solver_iterations 4 --solver_ls_iterations 8 \
+  --matmul_precision highest --impl warp \
   --no-corridor_walls --terminate_out_of_bounds --exit_cost 50 --boundary_cost_weight 0 \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \

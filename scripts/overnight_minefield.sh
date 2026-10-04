@@ -36,7 +36,7 @@ ROOT="$PWD"
 # with ModuleNotFoundError: No module named 'jax' -- which has bitten this
 # project before. Source conda explicitly rather than relying on the caller.
 source "$HOME/miniconda3/etc/profile.d/conda.sh" || exit 1
-conda activate mjx-safety-gym || exit 1
+conda activate mjx-warp || exit 1
 
 TASK=minefield
 STEPS_PER_GEN="${STEPS_PER_GEN:-5000000}"

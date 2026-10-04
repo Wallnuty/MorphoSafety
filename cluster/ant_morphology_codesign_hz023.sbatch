@@ -22,15 +22,20 @@
 #
 #   git pull && sbatch cluster/ant_morphology_codesign_hz023.sbatch
 #
+# SIMULATOR: the 2026-10-03 run of this wrapper used MJX-JAX (pre-warp tag);
+# resubmitted now it runs on MuJoCo Warp with the full solver, via the main
+# script. Results of the two are not directly comparable.
+#
 # SIZING: hazards have no collision geometry, so throughput matches the 0.16
-# run (42.9k sps, 13.9 h on mscluster); --time 36h as there.
+# run: on MuJoCo Warp ~133k sps on a 3090, 2B in ~4-5 h; --time 12h. (Old
+# MJX-JAX stack: 42.9k sps, 13.9 h on mscluster.)
 #
 #SBATCH --job-name=ant-codesign-hz023
 #SBATCH --output=ant_codesign_hz023_%j.log
 #SBATCH --partition=bigbatch
 # mscluster75 added 2026-10-03 (user's call); mscluster44 2026-10-04 (GPU0 'Unable to determine the device handle', job 63510).
 #SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
-#SBATCH --time=36:00:00
+#SBATCH --time=12:00:00
 
 export HAZARD_SIZE=0.23
 

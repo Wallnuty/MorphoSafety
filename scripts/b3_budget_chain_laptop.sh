@@ -23,7 +23,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate mjx-safety-gym
+conda activate mjx-warp
 mkdir -p "$ROOT/logs"
 
 SRC="$ROOT/checkpoints/vast/ant_minefield_ppo_lagrangian_b25_grid5_flip50_warm_100M/000050380800"

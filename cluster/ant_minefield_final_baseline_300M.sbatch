@@ -12,6 +12,12 @@
 # Every value is pinned below even though each is also the current default, so
 # a later default change cannot silently alter this run.
 #
+# PRE-WARP RUN. It ran on MJX-JAX / MuJoCo 3.3.2 before the Warp migration
+# (2026-10-04, notes/warp_migration.md). Exact reproduction: `git checkout
+# pre-warp` with env mjx-safety-gym. On the current stack this wrapper pins
+# SAFE_IMPL=jax with the same 4/8 cap, the closest match -- but the capped solve
+# differs slightly between MuJoCo versions (an old policy loses ~4.5% speed).
+#
 # A thin wrapper: exports SAFE_* and hands over to ant_minefield_safe_b50.sbatch,
 # which carries the GPU/code preflights (they abort in seconds on a stale
 # checkout), the training command and the summary printer. Only THIS file's
@@ -66,6 +72,7 @@ export SAFE_FINISH_LINE=1
 export SAFE_SHAPING_W=0
 export SAFE_WIDTH=256
 export SAFE_PRECISION=highest
+export SAFE_IMPL="${SAFE_IMPL:-jax}"   # the backend this run used (see PRE-WARP RUN above)
 export SAFE_SOLVER_IT="${SAFE_SOLVER_IT:-4}"
 export SAFE_SOLVER_LS="${SAFE_SOLVER_LS:-8}"
 unset SAFE_RESUME                   # from scratch

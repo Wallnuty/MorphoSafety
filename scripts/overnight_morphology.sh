@@ -44,7 +44,7 @@ cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh" || exit 1
-conda activate mjx-safety-gym || exit 1
+conda activate mjx-warp || exit 1
 
 ROBOT=ant
 TASK=minefield

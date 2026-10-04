@@ -13,13 +13,13 @@ import numpy as np
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env as playground_mjx_env
 
-from mjx_safety_gym.collision import geoms_colliding
 from mjx_safety_gym.mjx_env import State, step
 import mjx_safety_gym.lidar as lidar
 from mjx_safety_gym.morphology import NUM_GENES
 from mjx_safety_gym.world import (
     ObjectSpec,
     _sample_layout,
+    add_vase_contact_sensors,
     apply_integrator,
     apply_solver,
     build_arena,
@@ -363,6 +363,8 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         apply_integrator(mjSpec, integrator)
         apply_solver(mjSpec, *self._solver_caps)
         self._build_arena(mjSpec)
+        add_vase_contact_sensors(
+            mjSpec, self.spec["vases"].num_objects, _ROBOT_CONFIGS[self._robot]["collision_geoms"])
         self._mj_model = mjSpec.compile()
 
         # print(mjSpec.to_xml())
@@ -448,6 +450,8 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         apply_solver(mjSpec, *self._solver_caps)
         morphology_lib.apply_morphology(mjSpec, spec)
         self._build_arena(mjSpec)
+        add_vase_contact_sensors(
+            mjSpec, self.spec["vases"].num_objects, _ROBOT_CONFIGS[self._robot]["collision_geoms"])
         model = mjSpec.compile()
         morphology_lib.rescale_actuators(model, self._robot)
         return model
@@ -489,6 +493,15 @@ class GoToGoal(playground_mjx_env.MjxEnv):
             for i in range(self.spec["vases"].num_objects)
             # + self._mj_model.geom(f'pillar{i}').id for i in range(self._num_pillars)
         ]
+        # sensordata address of each (vase, robot geom) contact sensor, shape
+        # (vases, robot geoms); [adr] = found, [adr + 1] = min distance. See
+        # world.add_vase_contact_sensors.
+        self._vase_touch_adr = np.array(
+            [[self._mj_model.sensor_adr[self._mj_model.sensor(f"vase_{i}_touch_{g}").id]
+              for g in robot_config["collision_geoms"]]
+             for i in range(self.spec["vases"].num_objects)],
+            dtype=int,
+        ).reshape(self.spec["vases"].num_objects, len(robot_config["collision_geoms"]))
         self._hazard_body_ids = [
             self._mj_model.body(f"hazard_{i}").id
             for i in range(self.spec["hazards"].num_objects)
@@ -679,17 +692,13 @@ class GoToGoal(playground_mjx_env.MjxEnv):
         # float32 being the default empty dtype. A python-level branch on a
         # count fixed at __init__ is trace-time, so this costs nothing.
         if self._collision_obstacle_geoms_ids:
-            collision_cost = jp.sum(
-                jp.array([
-                    jp.any(
-                        jp.array([
-                            geoms_colliding(data, geom, robot_geom)
-                            for robot_geom in self._robot_collision_geom_ids
-                        ])
-                    )
-                    for geom in self._collision_obstacle_geoms_ids
-                ])
-            )
+            # Contact sensors per (vase, robot geom) pair (world.
+            # add_vase_contact_sensors), not data.contact, which MuJoCo Warp
+            # does not have (2026-10-04). Same rule as before: a vase is hit
+            # when any robot geom's closest contact with it penetrates.
+            found = data.sensordata[self._vase_touch_adr]       # (vases, robot geoms)
+            dist = data.sensordata[self._vase_touch_adr + 1]    # closest contact's distance
+            collision_cost = jp.sum(jp.any((found > 0) & (dist < 0), axis=-1))
         else:
             collision_cost = jp.zeros(())
 

@@ -13,8 +13,9 @@
 #      /home-mscluster/<you>/miniconda3 (per the guide's own recommendation --
 #      don't use the shared Anaconda), matching what's already done locally.
 #   3. Clone the repo, then:
-#        conda create -n mjx-safety-gym python=3.11 -y
-#        conda activate mjx-safety-gym
+#        bash cluster/warp/setup_env.sh   # builds `mjx-warp` (since the Warp migration,
+#                                         # 2026-10-04; `mjx-safety-gym` is the pre-warp stack)
+#        conda activate mjx-warp
 #        pip install -e ".[cuda]"
 #      (add ".[cuda,evolve]" instead if you also want pymoo for evolve.py)
 #
@@ -51,7 +52,7 @@ nvidia-smi
 echo
 echo "=== conda env ==="
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mjx-safety-gym
+conda activate mjx-warp
 python --version
 pip show jax jaxlib jax-cuda12-plugin 2>&1 | grep -E "^Name|^Version"
 echo

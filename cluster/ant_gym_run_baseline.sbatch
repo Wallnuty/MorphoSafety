@@ -103,7 +103,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 echo
 echo "=== env ==="
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mjx-safety-gym
+conda activate mjx-warp
 python --version
 pip show jax mujoco 2>&1 | grep -E "^Name|^Version"
 df -h ~ | tail -1

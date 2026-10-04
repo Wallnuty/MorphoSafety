@@ -26,7 +26,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
 # correctly treats as an unexpected exit and stops on, so the whole A/B finished
 # in under a second having trained nothing.
 source "$HOME/miniconda3/etc/profile.d/conda.sh" || exit 1
-conda activate mjx-safety-gym || exit 1
+conda activate mjx-warp || exit 1
 python -c "import jax; assert jax.devices()[0].platform == 'gpu', jax.devices()" \
   || { echo "FATAL: jax is not on the GPU; refusing to start"; exit 1; }
 

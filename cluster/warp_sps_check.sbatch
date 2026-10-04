@@ -4,8 +4,8 @@
 # Repeats the laptop probe's speed matrix (notes/warp_migration.md) on a 3090,
 # same configs, same seed, in ONE job on ONE node, so the ratios are clean:
 #
-#   A  current stack, single ant   MuJoCo 3.3.2  MJX-JAX   solver 4/8     ~/MorphoSafety, env mjx-safety-gym
-#   D  Warp,          single ant   MuJoCo 3.14   MJX-Warp  solver 100/50  this checkout,  env mjx-warp
+#   A  old stack,  single ant   MuJoCo 3.3.2  MJX-JAX   solver 4/8     ~/MorphoSafety-prewarp, env mjx-safety-gym
+#   D  Warp,       single ant   MuJoCo 3.14   MJX-Warp  solver 100/50  ~/MorphoSafety,         env mjx-warp
 #   F  current stack, co-design    (16 bodies, 8 Gaussians, as the 2B runs)
 #   H  Warp,          co-design
 #
@@ -15,14 +15,15 @@
 # ~95-109k. Here EVERY run uses 1024 envs / 32 minibatches, as the real runs do.
 # The 3090 ratio is NOT assumed to be the same -- this job is what measures it.
 #
-# BEFORE SUBMITTING (once):
-#   1. On the laptop, push the branch:  git push -u origin warp-probe
-#   2. On the cluster, check it out NEXT TO the main checkout and build the env:
-#        cd ~/MorphoSafety && git fetch origin
-#        git worktree add -b warp-probe ~/MorphoSafety-warp origin/warp-probe
-#        bash ~/MorphoSafety-warp/cluster/warp/setup_env.sh
-#   3. Submit from the warp checkout:
-#        cd ~/MorphoSafety-warp && sbatch cluster/warp_sps_check.sbatch
+# SINCE THE MERGE INTO main (2026-10-04) the old stack lives in a checkout of
+# the `pre-warp` tag next to the main one (see notes/warp_migration.md,
+# "Adoption"). Once:
+#        cd ~/MorphoSafety && git worktree add ~/MorphoSafety-prewarp pre-warp
+#        conda activate mjx-safety-gym && pip install --no-deps -e ~/MorphoSafety-prewarp
+#   Submit from the main checkout:
+#        cd ~/MorphoSafety && sbatch cluster/warp_sps_check.sbatch
+#   (First run, job 63512 on 2026-10-04, was made from the warp-probe branch
+#   against the then-main checkout; same stacks, same configs.)
 #
 # Read the SUMMARY block at the end of warp_sps_<jobid>.log. Per-run logs and
 # throwaway checkpoints go to warp_sps_<jobid>/ next to it.
@@ -35,8 +36,8 @@
 #SBATCH --time=01:30:00
 set -u
 
-MAIN_DIR="${MAIN_DIR:-$HOME/MorphoSafety}"
-WARP_DIR="${WARP_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+OLD_DIR="${OLD_DIR:-$HOME/MorphoSafety-prewarp}"   # pre-warp tag, env mjx-safety-gym
+WARP_DIR="${WARP_DIR:-$HOME/MorphoSafety}"          # main, env mjx-warp
 STEPS="${STEPS:-20000000}"
 OUT="${SLURM_SUBMIT_DIR:-$PWD}/warp_sps_${SLURM_JOB_ID:-local}"
 PY_OLD=$HOME/miniconda3/envs/mjx-safety-gym/bin/python
@@ -46,7 +47,7 @@ mkdir -p "$OUT"
 echo "=== node ==="
 hostname; date
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-echo "main checkout: $MAIN_DIR ($(git -C "$MAIN_DIR" log -1 --format=%h 2>/dev/null))"
+echo "old checkout:  $OLD_DIR ($(git -C "$OLD_DIR" describe --tags --always 2>/dev/null))"
 echo "warp checkout: $WARP_DIR ($(git -C "$WARP_DIR" log -1 --format=%h 2>/dev/null), branch $(git -C "$WARP_DIR" branch --show-current 2>/dev/null))"
 echo
 
@@ -65,7 +66,7 @@ wp.init()
 assert wp.get_cuda_device_count() > 0, (
     f"ABORT: Warp sees no CUDA device (driver {wp.get_cuda_driver_version()}); "
     "warp-lang 1.17 may need a newer driver than this node has")
-import mjx_safety_gym.backend  # only on the warp-probe branch
+import mjx_safety_gym.backend  # the Warp migration's backend switch
 print(f"PASS warp env: mujoco {mujoco.__version__}, warp {wp.__version__}, "
       f"CUDA driver {wp.get_cuda_driver_version()}, device {wp.get_device('cuda:0')}")
 PY
@@ -88,10 +89,10 @@ run() {  # name python checkout [extra trainer args...]
   echo "    exit $?  $(grep -o 'training/sps=[0-9.]*' "$OUT/$name.log" | tail -1)"
 }
 
-run A_current_single "$PY_OLD" "$MAIN_DIR"
-MJX_IMPL=warp MJX_NWORLD=1024 run D_warp_single "$PY_WARP" "$WARP_DIR" "${FULL_SOLVER[@]}"
-run F_current_codesign "$PY_OLD" "$MAIN_DIR" "${CODESIGN[@]}"
-MJX_IMPL=warp MJX_NWORLD=1024 run H_warp_codesign "$PY_WARP" "$WARP_DIR" "${CODESIGN[@]}" "${FULL_SOLVER[@]}"
+run A_current_single "$PY_OLD" "$OLD_DIR"
+run D_warp_single "$PY_WARP" "$WARP_DIR" --impl warp "${FULL_SOLVER[@]}"
+run F_current_codesign "$PY_OLD" "$OLD_DIR" "${CODESIGN[@]}"
+run H_warp_codesign "$PY_WARP" "$WARP_DIR" "${CODESIGN[@]}" --impl warp "${FULL_SOLVER[@]}"
 
 echo
 echo "=== SUMMARY: training steps/s, $STEPS steps, 1024 envs, $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) ==="

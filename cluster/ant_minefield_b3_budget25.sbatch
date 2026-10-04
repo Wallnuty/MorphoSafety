@@ -39,6 +39,11 @@
 # and the placement is not "learned" in any lasting sense -- worth knowing
 # before co-design leans on it.
 #
+# PRE-WARP ARM (MJX-JAX / MuJoCo 3.3.2; notes/warp_migration.md). Exact
+# reproduction: `git checkout pre-warp` with env mjx-safety-gym. On the current
+# stack it runs on MuJoCo Warp with the pinned settings below; its solver is the
+# full 100/50, which the two backends compute identically (to ~1e-7).
+#
 # Sizing: 100M at ~6000 sps = 4.6 h, plus 21 evals at ~95 s = 0.6 h; 12 h is
 # 2x margin.
 #SBATCH --job-name=ant-b3-b25

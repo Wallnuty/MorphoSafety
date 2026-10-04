@@ -5,7 +5,7 @@ import jax
 
 
 def restore_state(tree, target_example):
-    # brax >= 0.13 (warp-probe env): the normaliser's count became a UInt64
+    # brax >= 0.13 (since the Warp migration, 2026-10-04): the normaliser's count became a UInt64
     # (hi/lo uint32) and std_eps was added, so a checkpoint written by brax
     # 0.12 (a dict of count/mean/std/summed_variance) no longer lines up leaf
     # for leaf. Map it by field name instead; std_eps keeps its default 0.0.

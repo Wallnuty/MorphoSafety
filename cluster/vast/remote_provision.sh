@@ -103,6 +103,13 @@ if not devs or devs[0].platform != "gpu":
 import jax.numpy as jp
 x = jp.ones((2048, 2048))
 print("matmul ok, trace =", float((x @ x).trace()))
+# Training runs on MuJoCo Warp since 2026-10-04 (notes/warp_migration.md), and
+# Warp brings its own CUDA runtime: check it can drive this GPU too.
+import warp as wp
+wp.init()
+if wp.get_cuda_device_count() < 1:
+    sys.exit(f"FATAL: Warp sees no CUDA device (driver {wp.get_cuda_driver_version()}).")
+print("warp", wp.__version__, "on", wp.get_device("cuda:0"))
 print("PREFLIGHT PASSED")
 PY
 

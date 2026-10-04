@@ -12,7 +12,7 @@ import mujoco.viewer
 import orbax.checkpoint as ocp
 from brax.training.acme import running_statistics
 
-from mjx_safety_gym import jax_cache, numerics
+from mjx_safety_gym import backend, jax_cache, numerics
 from mjx_safety_gym.algorithms.ppo import networks as ppo_networks
 from mjx_safety_gym.algorithms.train_ppo import (
     _ROBOT_DEFAULTS,
@@ -215,6 +215,15 @@ _parser.add_argument(
     "checkpoints trained with. Only changes the GPU path -- the CPU is float32 "
     "either way. See mjx_safety_gym/numerics.py.",
 )
+_parser.add_argument(
+    "--impl",
+    choices=backend.IMPLS,
+    default="jax",
+    help="MJX implementation for the replay. jax (default) runs on CPU or GPU; "
+    "training uses warp since 2026-10-04, but with the solver converged the two "
+    "are the same physics to ~1e-7 (notes/warp_migration.md), and one env needs "
+    "no Warp throughput.",
+)
 _args = _parser.parse_args()
 
 # --design_from is meaningless outside the morphology branch, and that branch is
@@ -232,7 +241,7 @@ DETERMINISTIC = _args.deterministic
 # Compile once, and every later run loads the cached kernel from disk
 jax_cache.configure()
 print(f"matmul precision: {numerics.configure_matmul_precision(_args.matmul_precision)} "
-      f"({jax.default_backend()})")
+      f"({jax.default_backend()}), MJX backend: {backend.configure(impl=_args.impl)}")
 
 def resolve_checkpoint(robot: str) -> Optional[Path]:
     """The checkpoint directory to replay, or None if nothing is trained."""
@@ -419,7 +428,7 @@ if _args.num_morphologies:
     _inner = getattr(env, "unwrapped", env)
     _mj = _inner.build_morphology_model(_spec)
     _inner._mj_model = _mj
-    _inner._mjx_model = mjx.put_model(_mj)
+    _inner._mjx_model = backend.put_model(_mj)
     _inner._morphology_genes = jax.numpy.asarray(_spec.genes, dtype=jax.numpy.float32)
 
     _mass = float(_mj.body_subtreemass[_mj.body("robot").id])

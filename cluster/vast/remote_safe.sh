@@ -75,8 +75,12 @@ PRECISION="${SAFE_PRECISION:-highest}"
 WALLS="${SAFE_WALLS:-0}"
 EXIT_COST="${SAFE_EXIT_COST:-50}"
 if [ "$WALLS" = "1" ]; then WALLS_FLAG=--corridor_walls; else WALLS_FLAG=--no-corridor_walls; fi
-# Solver caps: empty = the robot default (ant 4/8 since 2026-09-27); 100/50
-# reproduces earlier arms.
+# MJX implementation: warp (default since 2026-10-04, notes/warp_migration.md)
+# or jax (the pre-migration backend; see also the pre-warp tag).
+IMPL="${SAFE_IMPL:-warp}"
+# Solver caps: empty = the robot default -- the full MuJoCo 100/50 since the
+# Warp migration (on Warp the uncapped solve is also the fastest); 4/8 was the
+# ant's MJX-JAX speed cap 2026-09-27..10-03.
 SOLVER_IT="${SAFE_SOLVER_IT:-}"; SOLVER_LS="${SAFE_SOLVER_LS:-}"
 SOLVER_FLAGS=(); [ -n "$SOLVER_IT" ] && SOLVER_FLAGS+=(--solver_iterations "$SOLVER_IT")
 [ -n "$SOLVER_LS" ] && SOLVER_FLAGS+=(--solver_ls_iterations "$SOLVER_LS")
@@ -124,7 +128,7 @@ print('PASS:', gpus)
 " || { echo "=== GPU preflight FAILED, nothing spent ==="; exit 1; }
 
 echo "=== code / observation preflight ==="
-FOOT_OBS="$FOOT_OBS" GRID="$GRID" RINGS="$RINGS" LIDAR="$LIDAR" PRECISION="$PRECISION" python -c "
+IMPL="$IMPL" FOOT_OBS="$FOOT_OBS" GRID="$GRID" RINGS="$RINGS" LIDAR="$LIDAR" PRECISION="$PRECISION" python -c "
 import inspect, os
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.algorithms import train_ppo as T
@@ -136,6 +140,12 @@ for f in ('adaptive_budget_horizon', 'start_y_jitter', 'hazard_shaping_weight',
 for f in ('matmul_precision', 'corridor_walls', 'terminate_out_of_bounds', 'exit_cost',
           'solver_iterations', 'solver_ls_iterations'):
     assert f in dests, f'ABORT: no --{f} in this checkout (added 2026-09-26/27). Sync the code.'
+assert 'impl' in dests, 'ABORT: no --impl in this checkout (Warp migration, 2026-10-04). Sync the code.'
+if os.environ.get('IMPL', 'warp') == 'warp':
+    import warp as wp
+    wp.init()
+    assert wp.get_cuda_device_count() > 0, f'ABORT: Warp sees no CUDA device (driver {wp.get_cuda_driver_version()}).'
+    print(f'PASS: MuJoCo Warp on {wp.get_device(\"cuda:0\")}')
 from mjx_safety_gym.algorithms.wrappers import CostEpisodeWrapper
 assert {'flipped', 'out_of_bounds'} <= set(CostEpisodeWrapper._SUMMED_INFO_KEYS), (
     'ABORT: no flipped / out-of-bounds eval metrics in this checkout (2026-09-27). Sync the code.')
@@ -163,7 +173,8 @@ print(f'PASS: obs {w}; 2026-09-17 cost semantics present end to end')
 " || { echo "=== code preflight FAILED, nothing spent ==="; exit 1; }
 [ -d "$CKPT" ] && { echo "ABORT: $CKPT exists; refusing to mix two runs"; exit 1; }
 
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.75
+# 0.6, not the pre-Warp 0.75: Warp allocates its own buffers in the same process.
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
 echo "=========================================================="
 echo " $PENALIZER  budget=$BUDGET (EPISODE TOTAL, adaptive horizon)  $STEPS steps"
 echo "   -> $CKPT"
@@ -171,7 +182,7 @@ echo "   log: $LOG"
 [ "$PENALIZER" = "ppo_lagrangian" ] && echo "   multiplier_lr=$MULT_LR  cap=$MULT_MAX  init=$MULT_INIT"
 [ "$SHAPING_W" != "0" ] && echo "   REWARD SHAPING: w=$SHAPING_W radius $SHAPING_R"
 echo "   cost: $COST_SHAPE penetration, grounded within ${EPS:-0.02 (default)} m, flip_cost=$FLIP_COST"
-echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION"
+echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION  backend=$IMPL"
 echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
 echo "=========================================================="
 echo
@@ -186,7 +197,7 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_size 0.16 "$LIDAR_FLAG" "$FOOT_FLAG" --foot_hazard_grid "$GRID" --foot_hazard_rings "$RINGS" \
   "$FINISH_FLAG" "${EPS_FLAG[@]}" \
   --hazard_cost_shape "$COST_SHAPE" --flip_cost "$FLIP_COST" \
-  --matmul_precision "$PRECISION" "${SOLVER_FLAGS[@]}" \
+  --matmul_precision "$PRECISION" --impl "$IMPL" "${SOLVER_FLAGS[@]}" \
   --hazard_shaping_weight "$SHAPING_W" --hazard_shaping_radius "$SHAPING_R" \
   "$WALLS_FLAG" --terminate_out_of_bounds --exit_cost "$EXIT_COST" --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes "$WIDTH" "$WIDTH" "$WIDTH" "$WIDTH" \

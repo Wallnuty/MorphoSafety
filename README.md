@@ -18,9 +18,18 @@ You can install it in two ways:
 python -m venv .venv
 source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
 
-# Install mjx-safety-gym in editable mode
-pip install -e .
+# Install mjx-safety-gym in editable mode (add [cuda] on a GPU machine)
+pip install -e ".[cuda]"
 ```
+
+**Simulator backend (since 2026-10-04).** Training runs on **MuJoCo Warp**
+through MJX (`train_ppo --impl warp`, the default; needs an NVIDIA GPU), with
+the contact solver run to convergence -- 3-5x faster than the MJX-JAX backend
+and the same physics to ~1e-7. `--impl jax` (and every other script by
+default) uses MJX-JAX and runs on CPU too. On the cluster, build the exact env
+with `bash cluster/warp/setup_env.sh` (env `mjx-warp`). Results from before
+the switch reproduce from the `pre-warp` tag with its own env; see
+`notes/warp_migration.md` for the measurements and what changed.
 
 ### Option 2 - Direct Install from Pypi 
 ```bash 

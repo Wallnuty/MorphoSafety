@@ -271,7 +271,7 @@ def train(
     assert num_envs % device_count == 0
     env = environment
     env = TrackOnlineCosts(env)
-    # warp-probe: pmap, not jit(vmap), over the device axis -- MJX-Warp keeps
+    # pmap, not jit(vmap), over the device axis (Warp migration, 2026-10-04): MJX-Warp keeps
     # its contact buffers SHARED across worlds, and only pmap gives those a
     # device axis for training_epoch's pmap to squeeze (brax 0.14 does the same).
     reset_fn = jax.pmap(env.reset, axis_name=_PMAP_AXIS_NAME)
@@ -719,7 +719,7 @@ def train(
                     )
                 )
                 dummy_ckpt_config = config_dict.ConfigDict()
-                dummy_ckpt_config.network_factory_kwargs = {}  # brax >= 0.13 requires the key (warp-probe)
+                dummy_ckpt_config.network_factory_kwargs = {}  # brax >= 0.13 requires the key
                 checkpoint.save(
                     checkpoint_logdir,
                     current_step,

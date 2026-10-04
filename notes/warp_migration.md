@@ -39,8 +39,13 @@ paper. Every number below comes from a run whose script and log are listed in
 * **Cluster.** On an RTX 3090 (mscluster): 38.2k -> 118.3k single ant (3.1x),
   40.4k -> 133.3k co-design (3.3x), no overflow warnings. A 2B co-design run
   would take ~4 h of training instead of ~14 h.
-* **Still owed:** vases (need contact sensors, see below), and repeating the
-  reference runs on the new setup before mixing old and new results.
+* **Adopted 2026-10-04.** Merged into `main` as the default (see
+  [Adoption](#adoption-2026-10-04)); the vase cost now uses contact sensors and
+  matches the old one step for step. The old stack stays reproducible from the
+  `pre-warp` tag.
+* **Still owed:** repeating the reference runs on the new setup before mixing
+  old and new results, and the env-count sweep on a 3090
+  (`cluster/warp_num_envs_sweep.sbatch`).
 
 ## Why we looked
 
@@ -227,7 +232,7 @@ with the full solver, on the laptop: 5 cm gate, budget 25, multiplier lr
   old run on a 3090.
 * The run printed no solver or contact overflow warnings.
 
-## Code changes (branch `warp-probe`)
+## Code changes during the probe (branch `warp-probe`)
 
 | file | change | why |
 |---|---|---|
@@ -242,6 +247,88 @@ Not changed: the environments, rewards, costs, observation, PPO and the
 Lagrangian. `data.contact` is not available on Warp; minefield does not use it.
 JAX and Warp both reserve GPU memory in one process, so runs set
 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5`.
+
+## Adoption (2026-10-04)
+
+What changed on `main` when the probe was merged, beyond the probe's own
+changes above.
+
+**Defaults.**
+* `train_ppo` trains on MuJoCo Warp unless told otherwise: `--impl warp`
+  (default) or `--impl jax`. Warp's buffers are sized from the run:
+  `--warp_contacts_per_env` (64; the shared buffer holds this x
+  max(num_envs, num_eval_envs)) and `--warp_njmax` (256 rows per env).
+  `--impl warp` without a GPU stops with an error instead of falling back.
+* Everything else (main.py, replay, render and eval scripts) uses MJX-JAX by
+  default, so it runs on CPU too; `main.py --impl` overrides. With the solver
+  converged the two backends are the same physics (sections 1-2).
+* The ant has **no solver cap**: MuJoCo's own 100 / 50 applies. The 4 / 8 cap
+  of 2026-09-27..10-03 was an MJX-JAX speed fix; on `--impl jax` it is still
+  the fast option and can be passed explicitly.
+* `mjx_safety_gym/backend.py` is the single place models and data are made
+  (`configure()`, `put_model()`, `make_data()`); the trainer configures it
+  before any env exists.
+
+**Vase cost on contact sensors** (`world.add_vase_contact_sensors`). Warp has
+no `data.contact`, so the vase collision cost now reads one contact sensor per
+(vase, robot geom) pair, data `found` and `dist` with `reduce="mindist"`; a
+vase is hit when any of its pairs is found with distance < 0, the old rule.
+Two things learned on the way:
+* MJX-JAX does not implement subtree matching for contact sensors, hence one
+  sensor per robot geom rather than one per vase.
+* `found` alone counts contacts at distance >= 0 as well and over-counted vase
+  hits by ~9%; requiring distance < 0 makes it exact.
+
+Check (`scripts/warp_probe/vase_cost_equivalence.py`, run task, 64 envs, vases
+moved into a ring around each ant, 300 random-action steps, JAX backend where
+both costs exist): **0 differing env-steps** in 19,200, with 3,440-3,491
+contact steps per run (GPU runs are not bit-reproducible, so totals vary
+between runs; old and new agree within each run). Warp vs JAX from the
+identical start state: the same 320 of 8,320 pairs touching, 0 disagreements.
+Caveat: on deep box-capsule overlaps the two backends' contact distances differ
+by up to 3.7 mm, so vase-heavy dynamics are not bit-identical across backends.
+
+**Packages and envs.**
+* `pyproject.toml` pins the new stack (MuJoCo / MJX 3.14.0 + `[warp]`,
+  mujoco-warp 3.14.0, warp-lang 1.17.0, brax 0.14.2, playground 0.2.0, flax
+  0.12.8, orbax-checkpoint 0.12.6), replacing the Andrew-Luo1 brax / playground
+  forks; version 0.2.0; `[render]` extra for `scripts/export_usd.py`.
+* Env `mjx-warp` (exact freeze: `cluster/warp/requirements-warp.txt`, built by
+  `cluster/warp/setup_env.sh`) runs `main`. Env `mjx-safety-gym` stays the old
+  stack and runs a checkout of the **`pre-warp` tag** (the last commit before
+  the merge). Vast builds its `morpho` env from `pyproject.toml`, so it follows
+  automatically; its provisioning now also checks Warp can drive the GPU.
+
+**Launchers.** All sbatch/laptop scripts activate `mjx-warp`. The co-design
+launchers (cluster and Vast) pass `--impl warp`, assert the full 100 / 50 solver
+and that Warp sees the GPU, give JAX 0.6 of the GPU memory (Warp allocates its
+own buffers in the same process; with JAX at 0.9 on the 6 GB laptop it is
+tight), and allow 12 h instead of 36 h. The single-ant launcher has
+`SAFE_IMPL` (default warp). Wrappers for pre-warp runs say so in their header;
+the final-baseline wrapper pins `SAFE_IMPL=jax` with its old 4 / 8 cap, the
+closest match on the new stack. `cluster/warp_sps_check.sbatch` now compares a
+`pre-warp` checkout against `main`; `cluster/warp_num_envs_sweep.sbatch` is new.
+
+**End-to-end checks of the merged code** (laptop RTX 4050, default flags
+unless stated, short runs): single ant 3M steps -> backend warp, 66k steps/s;
+co-design 6M (1024 envs, 16 bodies) -> warp, 102k, design iterations run;
+single ant at 2048 envs / 64 minibatches (the sweep's scaling) -> 95k; all
+with zero solver-limit warnings. The co-design launcher's preflight passes;
+`scripts/export_usd.py` (CPU, JAX backend) replays the 300M Warp checkpoint.
+An OLD checkpoint (budget-0 2 cm single ant, trained on MJX-JAX 3.3.2 with the
+4 / 8 cap) restores and runs on Warp with the full solver; 512 episodes:
+
+| setup | return | speed (m/s) | cost | hazard_steps | flipped | out of bounds |
+|---|---|---|---|---|---|---|
+| its own stack (3.3.2, JAX, 4/8), section 1 | 11.05 | 1.195 | 1.49 | 3.56 | 0.8% | 1.0% |
+| new default (3.14, Warp, 100/50) | 11.04 | 1.135 | 1.96 | 5.48 | 0.4% | 1.6% |
+
+As in section 1, a policy tuned to the capped solve loses ~5% speed on the
+converged one; new results should come from policies trained on the new setup.
+
+**Reproducing a pre-Warp result.** `git worktree add ../MorphoSafety-prewarp
+pre-warp`, install it into `mjx-safety-gym` (`pip install --no-deps -e`), and
+run from there: same code, same MuJoCo 3.3.2, same solver cap as at the time.
 
 ## Threats to validity
 
@@ -260,7 +347,7 @@ JAX and Warp both reserve GPU memory in one process, so runs set
   compared within the old setup. Mixing old and new numbers in one table is not
   valid without re-running the old references.
 
-## Suggested methods text (if adopted)
+## Suggested methods text
 
 > Simulation uses MuJoCo 3.14 through MJX with the MuJoCo Warp backend on
 > NVIDIA GPUs, timestep 0.01 s with the RK4 integrator. Contact is solved with
@@ -286,6 +373,7 @@ the `mjx-safety-gym` env.
 | pure stepping throughput | `step_throughput.py <iterations> <ls_iterations>` | (printed) |
 | buffer use | `buffer_usage.py` | (printed) |
 | vases / contact sensors | `vases_and_contact_sensor.py` | (printed) |
+| vase cost, sensors vs old contact read | `vase_cost_equivalence.py` | (printed) |
 | state leaves without a device axis | `state_leaves.py` | (printed) |
 | policy-level physics check | trainer, `--restore_checkpoint_path ... --num_timesteps 1 --num_evals 2 --num_eval_envs 64 --num_eval_episodes 8` | `notes/warp_probe_logs/evalA_old.log`, `evalB_new_jax.log` |
 | training throughput A-H | trainer, flags in the logs' first lines | `notes/warp_probe_logs/bench_*.log` |
