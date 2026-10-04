@@ -1,43 +1,37 @@
-1. MPC — no; a foothold planner + tracking policy — this is what I'd actually do. The plan's objection to MPC over the physics still stands (tens of millions of physics steps per morphology evaluated, and it doesn't discover gaits). But the hierarchical version is a different thing: a geometric planner picks safe footholds — we already have that code, the kinematic check is exactly a foothold planner and it found the zero-cost path — and the policy gets the next target foothold per foot in its observation with a dense tracking reward. That turns "discover placement from a cost" into "hit a target", which RL does well. Safety becomes a property of the planner; morphology enters as reachability and tracking accuracy, which is a clean co-design question. It's also what works in the literature: the hierarchical Doggo result was 79% success where PPO-Lagrangian was 0. Moderate build (jittable planner in the env, target obs, tracking term).
+You're right to be cautious here. What you saw is promising, but on its own it doesn't prove the "one network, several strategies" claim.
 
-2. What the perceptive-locomotion literature does for stepping-stone-type tasks is give the policy an egocentric terrain scan: a grid of terrain samples around the robot in its yaw frame (Miki et al. 2022, the ANYmal stepping-stone work, most "learning to walk on discrete footholds" papers). Our analogue is trivial to compute: a grid of cells in the torso's yaw frame, 1 where the cell centre is inside a hazard disc. Continuous, no nearest-neighbour switching, and it shows the free space directly; the network already knows where its feet are in that frame from the joint angles. Three versions, by cost:
+**Does it prove the shared network stores different strategies?** Not yet. The policy you watched spent its last 300M steps trained on that one body only. From about 800M onward it only saw one region of the design space. It could simply have specialised, and the random-body eval (cost 219) shows it no longer handles other bodies well. Two cheap checks on the existing run's checkpoints would settle it:
+- **Same weights, different bodies.** Take a checkpoint from before the first pruning (around 350M, when all 8 Gaussians were alive). Run it on a long-legged body and on a short-legged one, and measure route choice, e.g. how much of each episode the torso spends over a hazard. If long legs step over and short legs weave under identical weights, that's your evidence.
+- **When the strategy appeared.** Run the evolved body under the 400M, 800M, 1.2B, 1.7B and 2B checkpoints with the same metric. The long-legged Gaussian must already have been faster by 400–800M to win the prunings, but that could have come from longer strides between hazards rather than stepping over them. This sweep answers whether the final fine-tune is what switched the strategy.
 
-representation	dims	what it gives
-hazard grid around the torso, 8×8 at 0.15 m	64	the field-standard scan; free space, not just obstacles
-per-foot grid, 5×5 at 0.08 m around each foot's ground projection	100	the same map, centred where the decision is made
-touchdown clearance per foot: clearance at the ballistic landing point (foot xy + v·(z/vz) while descending)	+4	patches weakness 2 into the existing obs, cheap
-My recommendation: the torso hazard grid, plus touchdown clearance on top of the existing 16 — the grid is general (any layout, any body), the touchdown feature is the one number placement actually turns on. ~60 lines in foot_obstacle_observations' neighbourhood, a new --hazard_grid flag, and C/B become "grid" arms instead of "nearest-mine" arms — worth doing before C goes out, since B inherits C's obs width. Say the word and I'll build it.
+You'd need to copy those checkpoints over (about 10 MB each); then I can run both.
 
-3. Gait-parameterised actions (PMTG/CPG-style: the policy outputs stride length, phase, clearance over a trajectory generator instead of raw torques). Foot placement becomes a low-dimensional, semantic decision rather than something emergent from 8 torques at 12 Hz. Standard in legged robotics; the biggest build on this list.
+**Has it been shown before?** One network producing different gaits for different bodies is established in the universal-controller work (MetaMorph, Amorpheus). As far as I remember, Schaff et al. mostly report designs and returns rather than analysing strategies. What looks new is the safety angle: a constraint changing both the body and the route. A quick search found co-design with resource limits on the design, and constrained RL for legged locomotion, but not safe RL inside the co-design loop. That's promising but not a full literature review, so do a proper one before claiming novelty.
 
-4. Imitation from the planner. The kinematic check produces a zero-cost foothold sequence; use it as a reference for a tracking reward or DAgger, DeepMimic-style. Sits between the hierarchy I described and pure RL: the planner is used at training time only, the deployed policy is flat.
+**On "bigger = better":** the result is really "longer legs, smaller and lighter torso". The actual weakness is that 4 of 7 parameters are pinned at the edge of the allowed range, so the range limit, not a trade-off, decided the answer. A reviewer would spot that immediately, and there are two causes:
+- **Size is free.** Motor strength is rescaled with leg length (gear 191 vs 150), so longer legs come with extra torque at no cost.
+- **Both pressures point the same way.** In this environment, long legs are both faster and better at stepping over mines, so safety and speed never compete.
 
-5. Read all three against the actual code. The pasted advice is mostly right, one claim is off, and the sources disagree with two of my choices.
+**What I'd suggest, in order:**
 
-What the sources actually do
+1. **An environment where safety pulls the body the other way.** Your lasers idea is the strongest option: beams at random heights and positions, combined with the mines. Long legs step over mines but hit beams; low bodies duck beams but must weave between mines. The best body then depends on the mix and on the budget, which is exactly the tension you want. The Lasers task already exists, so the main work is randomising the beam heights.
+2. **A budget sweep as the headline figure.** Co-design at several budgets (no constraint, 25, 5, 2, 0) and plot the evolved design parameters against the budget, showing that safety requirements reshape the body. Each run is about 15 h.
+3. **The controls any paper needs:**
+   - unconstrained co-design (`PENALIZER=none`) on the same task: does it pick the same body?
+   - evolve without safety first, then train a safe policy on that body
+   - the nominal body with safe RL
+   - shared vs per-Gaussian λ (your method contribution)
+   - 3 seeds for the main conditions
+4. **Make size cost something.** Either keep motor strength fixed, add an energy term, or give the design a fixed mass budget. Otherwise every environment tends to push toward the range edge.
+5. **Payload (your backpack idea)** as a second tension: a heavy or fragile load with a cost on tipping or jerk. That pushes toward a wide, low, stable stance, against long legs.
+6. **Real-world framing without a new robot.** The lattice minefield already looks like a crop field. Legged robots that mustn't trample plants (mines) or hit low branches (lasers) is a real safety problem, and a nuclear or rescue site works too. A real quadruped (e.g. Menagerie's Go1) would be more convincing, but reshaping mesh-based robot models is a lot of engineering. I'd keep the ant for the main results and add a second robot later if a reviewer asks.
 
-hazard cost	where	grounding gate	what the policy sees
-Safety Gym / Gymnasium (hazards.py:85-89)	cost × (size − dist) — linear in penetration depth, torso centre	cost	none (2D)	torso lidar
-CRAX Pathway (safe_pathway.py:412-473)	(1 − d/r)² per foot, quadratic, max over feet, sum over hazards, ×1.5; plus 5.0 cost on unhealthy termination	cost	foot z < 0.10 m	torso lidar only (planar robots — it's a timing task, not 2D placement)
-Hwang et al. 2026	none — stepping stones, falling is the failure	—	—	17×11 heightmap at 0.1 m + per-foot Gaussian blobs (w=10, σ=0.1) on the same grid, CNN + attention; the foot map alone was +10% success, the biggest component
-So "the field has converged on penetration depth" is right — even the original Safety Gym hazard cost we ported is graded, and ours went binary somewhere in the port. "Quadratic" is CRAX; Safety Gym is linear. The CaT "13×11 at 8 cm" detail I can't verify locally — treat as unconfirmed.
+Boxes would also stop "big" from being free, but they only add a physical limit, not a safety trade-off, so I'd prioritise lasers.
 
-Where we differ, and what I'd change
+If you agree, I'd start with the two cheap checks on this run plus an unconstrained co-design baseline, and build the randomised lasers + mines environment in parallel.
 
-The graded term belongs in the cost. Both references make penetration the cost; I put it in the reward. Your instinct was right and the sources back it. Fix: cost = Σ_hazards max_feet(depth) (linear like Safety Gym, quadratic as an option), with the binary count still logged as episode_hazard_steps so the new numbers stay readable. Reward shaping stays available for the unconstrained arms only.
-No ring outside the disc. Neither reference ramps beyond the hazard edge; my 0.25 margin is nonstandard. Default the ramp to the disc radius.
-Charge the flip. CRAX's 5.0 termination cost is the answer to the exit both CRPO and Lagrangian took: if ending the episode costs about a careless crossing's worth, "walk 3 m and fall over" no longer satisfies the budget. A --flip_cost flag, off by default.
-Foot-resolution obs. Hwang's point is feet and terrain in one representation so the network can relate them; CRAX doesn't do it at all. The MLP-scale version is the per-foot local hazard grid I suggested — the grid is the source's idea, the per-foot centring is our substitute for their attention encoder.
-One thing the sources are looser on: grounding. CRAX charges a foot hovering up to 10 cm; Safety Gym charges the torso passing over. Our 1 mm is the physically honest choice you asked for, but it's the strictest in the literature and the signal is correspondingly sparser — worth remembering if the graded cost still doesn't bite.
-
-The velocity-tracking warning doesn't apply: our reward is global +x with walls and a lattice spanning the corridor, so the field can't be dodged — the analogous exploit here is stopping/flipping, which is what item 3 closes.
-
-Items 1–3 are ~80 lines and change the budget's units (penetration units, ~0.8× hazard-steps on the walker), so the constrained arm's budget would be re-derived. Want me to build them before the cluster arms go out?
-
-6. Switch to CaT (constraints as terminations). This is the closest published method to what you're doing and it's about five lines on top of PPO. Instead of a hard budget, you compute a termination probability δ proportional to the magnitude of the constraint violation, normalized by an exponential moving average of the max violation in the recent batch, then multiply rewards by (1−δ) and write δ into the dones. Allowing δ strictly between 0 and 1 is what lets the agent learn to recover from violations and explore a little inside the violating region. They anneal soft constraints from p_max 0.05 up to 0.25 over training while keeping genuine no-go constraints at 1.0. They ran 60+ constraint terms this way on real hardware.
-
-If you want to stay closer to safe-RL-proper: PPO-Lagrangian with the PID multiplier update (Stooke et al.) is the standard strong baseline. Skip CPO — Ray et al. found it performs surprisingly poorly on Safety Gym relative to Lagrangian methods. In the legged world, Kim et al. use IPO with adaptive constraint thresholding and note that CPO's optimization cost grows linearly in the number of constraints. 
-OpenAI
-arxiv
-
-7. . The per-foot encoder is the cheap upgrade if we ever want one — 100 inputs is small enough that it hasn't been needed.
+Sources:
+- [Co-design is powerful and not free](https://arxiv.org/html/2510.08368)
+- [Co-design of Embodied Neural Intelligence via Constrained Evolution](https://arxiv.org/pdf/2205.10688)
+- [Not Only Rewards But Also Constraints: Applications on Legged Robot Locomotion](https://arxiv.org/html/2308.12517v2)
+- [N-LIMB: Neural Limb Optimization for Efficient Morphological Design](https://arxiv.org/pdf/2207.11773)
