@@ -43,7 +43,14 @@ TASK="${SLURM_ARRAY_TASK_ID:-0}"
 export JAX_CACHE_DIR="$HOME/.cache/jax_rest_task$TASK"
 SRC="${RESUME_ROOT:-$PWD/checkpoints/resume_src}"
 LOGS="$PWD/logs/cluster_rest/task$TASK"
-mkdir -p "$LOGS" logs/eval
+# Both tasks start in the same second and create the same parent dirs. The
+# cluster's Rust coreutils `mkdir -p` fails ("Already exists") if the other task
+# creates a parent mid-call (GNU mkdir does not), which killed task 1 of job
+# 72805 before it ran anything. Retry until the dirs exist.
+for d in "$LOGS" logs/eval; do
+  for _ in 1 2 3 4 5; do mkdir -p "$d" 2>/dev/null; [ -d "$d" ] && break; sleep 1; done
+  [ -d "$d" ] || { echo "ABORT: could not create $d"; exit 1; }
+done
 STATUS="$LOGS/status.txt"
 echo "=== task $TASK on $(hostname), $(date) ==="
 
