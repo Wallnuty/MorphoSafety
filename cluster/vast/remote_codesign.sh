@@ -91,6 +91,10 @@
 # is repeatedly put onto bodies it has not settled on and may never reach the
 # clean-gait regime that earns the trained rate in the first place.
 set -uo pipefail
+# Extra train_ppo flags given to this script (e.g. --seed 1 --hazard_placement random).
+# Saved HERE: the RESUME block below rebuilds "$@" with `set --`, which until
+# 2026-10-19 silently dropped them.
+EXTRA_ARGS=("$@")
 cd /root/MorphoSafety || exit 1
 
 source /opt/conda_profile.sh 2>/dev/null || source /opt/conda/etc/profile.d/conda.sh
@@ -105,7 +109,7 @@ echo
 # ---- overridable at launch, e.g. DESIGN_LR=0.05 bash cluster/vast/vast.sh codesign
 STEPS="${STEPS:-2000000000}"
 DESIGN_TMAX="${DESIGN_TMAX:-2000000000}"
-DESIGN_LR="${DESIGN_LR:-0.03}"
+DESIGN_LR="${DESIGN_LR:-0.08}"   # 0.03 before 2026-10-19 (4x the design updates)
 # 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
 # DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
 # nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
@@ -117,7 +121,7 @@ PENALIZER="${PENALIZER:-ppo_lagrangian}"   # none = the Schaff baseline
 # Budget 2 (2026-09-28, user's call): at the 2 cm gate the single-ant runs
 # reached cost 2.7 at budget 5 and 1.9 at budget 0, so 25 would barely bind.
 BUDGET="${BUDGET:-2}"
-MULT_LR="${MULT_LR:-1.5e-5}"
+MULT_LR="${MULT_LR:-6e-5}"   # 1.5e-5 before 2026-10-19 (see BATCH below)
 MULT_MAX="${MULT_MAX:-3.0}"
 MULT_INIT="${MULT_INIT:-0.01}"
 GRID="${GRID:-7}"
@@ -138,10 +142,34 @@ if [ "$LAMBDA_PER_COMPONENT" = "1" ]; then LPC_FLAG=--lagrange_per_component; el
 # steps = 1.50 episodes per lane each (the design updates are the ~390 between
 # 200M and 1.7B).
 NUM_EVALS="${NUM_EVALS:-41}"
-DESIGN_UPDATES="${DESIGN_UPDATES:-13}"
+DESIGN_UPDATES="${DESIGN_UPDATES:-3}"   # 13 at 1024 envs; 3 keeps >= 1.6 worst-case episodes per lane at 4096
 CHOP_FREQ="${CHOP_FREQ:-200000000}"
 STEPS_BEFORE="${STEPS_BEFORE:-200000000}"
 STEPS_AFTER="${STEPS_AFTER:-300000000}"
+# BATCH SIZE (2026-10-18). 4096 envs train ~1.75x faster than 1024 on a 3090
+# (Warp sweep, 2026-10-04), but a design is only scored from episodes that
+# finish inside one design iteration, so scale the population WITH the envs:
+# keep 64 lanes per design (NUM_MORPHOLOGIES = NUM_ENVS/64) and lengthen the
+# iterations (fewer DESIGN_UPDATES per eval) so each lane still fits >= 1
+# worst-case (2500-step) episode.
+NUM_ENVS="${NUM_ENVS:-4096}"
+NUM_MORPHOLOGIES="${NUM_MORPHOLOGIES:-64}"
+# 32, NOT NUM_ENVS/32: until 2026-10-19 this defaulted to NUM_ENVS/32 = 128,
+# the scaling the A/B below rejected; the 10-18 Vast run only had 32 because
+# it was passed explicitly.
+NUM_MINIBATCHES="${NUM_MINIBATCHES:-32}"
+# Large-batch PPO (laptop A/B 2026-10-18): at 4096 envs, scaling minibatches
+# 4x (128 x 32) learned ~2x worse per step -- 512 SGD steps on each stale
+# batch. 32 minibatches x BATCH_SIZE 128 with LEARNING_RATE 2e-4 learned the
+# gait as well per step and ran 1.39x faster on the laptop; the multiplier
+# then needs MULT_LR x4 (it updates once per minibatch). brax requires
+# BATCH_SIZE * NUM_MINIBATCHES to be a multiple of NUM_ENVS.
+BATCH_SIZE="${BATCH_SIZE:-128}"
+# Evaluation vmaps num_eval_envs bodies, which must be a multiple of
+# NUM_MORPHOLOGIES: at 64 designs use 64 envs x 5 episodes (the same 320).
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-64}"
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-5}"
+LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 RESUME="${RESUME:-}"
 NAME="${NAME:-ant_codesign_lagrangian_b${BUDGET}_grid${GRID}_r$(date -u +%m%d%H%M)}"
 CKPT="/root/MorphoSafety/checkpoints/$NAME"
@@ -162,7 +190,8 @@ echo
 # PREFLIGHT 2: the synced code is new enough, and the observation is the width
 # this run is FOR.
 #
-# 250 = 47 (proprio + goal + lidar) + 196 (4 feet x 7x7 grid) + 7 genes; no
+# 251 = 47 (proprio + goal + lidar) + 1 (lateral offset, default since
+# 2026-10-15; runs before that were 250) + 196 (4 feet x 7x7 grid) + 7 genes; no
 # budget scalar (that was Saute's). A silent 54 would mean the foot grid is
 # off; a silent 243 would mean morphology conditioning never reaches the
 # observation, training a policy that cannot see which body it is driving --
@@ -199,7 +228,7 @@ env = Minefield(**kw)
 assert env._ground_contact_eps == 0.02 and env._hazard_cost_shape == 'linear', (
     'ABORT: cost is not linear at the 2 cm gate (default since 2026-09-28). Re-sync.')
 w = env.observation_size
-assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+assert w == 244 + morphology.NUM_GENES, f'expected 251 (grid 7 + lateral offset + genes), got {w}'
 assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
@@ -252,11 +281,12 @@ sig = np.exp(z['gmm_log_stds'][lm > -1e5]).mean()
 print(f'      mean sigma of live components: {sig:.4f}  (init 0.577)')
 " || exit 1
 [ "$CKPT" = "$RESUME" ] && { echo "ABORT: output dir == resume dir"; exit 1; }
-  set -- --restore_checkpoint_path "$RESUME"
+  set -- --restore_checkpoint_path "$RESUME" "${EXTRA_ARGS[@]}"
 else
   echo "=== fresh run (no RESUME) ==="
-  set --
+  set -- "${EXTRA_ARGS[@]}"
 fi
+[ ${#EXTRA_ARGS[@]} -gt 0 ] && echo "   extra flags: ${EXTRA_ARGS[*]}"
 echo
 
 # 0.6 of 24 GB for JAX, as on mscluster: Warp allocates its own buffers in the
@@ -270,6 +300,8 @@ echo "   design_lr   $DESIGN_LR   objective $DESIGN_OBJECTIVE"
 echo "   safe RL     $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT"
 echo "   env         grid $GRID  flip $FLIP_COST  linear 2 cm  finish line  float32 matmuls"
 echo "   num_evals   $NUM_EVALS x $DESIGN_UPDATES design updates"
+echo "   batch       $NUM_ENVS envs, $NUM_MORPHOLOGIES designs ($((NUM_ENVS / NUM_MORPHOLOGIES)) lanes each), $NUM_MINIBATCHES minibatches x $BATCH_SIZE, lr $LEARNING_RATE"
+python -c "print('   episodes per lane per design iteration (worst case): %.2f' % ($STEPS / ($NUM_EVALS - 1) / $DESIGN_UPDATES / $NUM_ENVS / 2500))"
 echo "   schedule    design frozen until $STEPS_BEFORE, chop every $CHOP_FREQ, fine-tune last $STEPS_AFTER"
 echo "   out         $CKPT"
 echo "=========================================================="
@@ -296,13 +328,15 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
   --flip_cost "$FLIP_COST" \
-  --num_morphologies 16 \
+  --num_morphologies "$NUM_MORPHOLOGIES" \
   --design_components 8 \
   --design_updates_per_eval "$DESIGN_UPDATES" \
   --chop_freq "$CHOP_FREQ" \
   --steps_before_design_update "$STEPS_BEFORE" \
   --steps_after_design_update "$STEPS_AFTER" \
-  --num_envs 1024 --num_minibatches 32 \
+  --num_envs "$NUM_ENVS" --num_minibatches "$NUM_MINIBATCHES" --batch_size "$BATCH_SIZE" \
+  --learning_rate "$LEARNING_RATE" \
+  --num_eval_envs "$NUM_EVAL_ENVS" --num_eval_episodes "$NUM_EVAL_EPISODES" \
   --design_lr "$DESIGN_LR" \
   --num_timesteps "$STEPS" \
   --design_tmax "$DESIGN_TMAX" \

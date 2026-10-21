@@ -39,7 +39,13 @@ echo
 STEPS="${SAFE_STEPS:-50000000}"
 BUDGET="${SAFE_BUDGET:-25}"
 PENALIZER="${SAFE_PENALIZER:-ppo_lagrangian}"
-MULT_LR="${SAFE_MULT_LR:-1.5e-5}"
+MULT_LR="${SAFE_MULT_LR:-6e-5}"   # x4 with the large-batch defaults (2026-10-19)
+# BATCH (2026-10-19): large-batch defaults, as the trainer's. Old arms pin
+# SAFE_NUM_ENVS=1024 SAFE_NUM_MINIBATCHES=32 SAFE_BATCH_SIZE=32 SAFE_LEARNING_RATE=1e-4.
+NUM_ENVS="${SAFE_NUM_ENVS:-4096}"
+NUM_MINIBATCHES="${SAFE_NUM_MINIBATCHES:-32}"
+BATCH_SIZE="${SAFE_BATCH_SIZE:-128}"
+LEARNING_RATE="${SAFE_LEARNING_RATE:-2e-4}"
 # 2026-09-21: anti-windup cap and a warm-start initial value for the multiplier.
 # MULT_MAX 3.0 = above where every settled arm sat (1.3-1.9), below the 4-5 that
 # crushed gaits. MULT_INIT 0.01 is the from-scratch value; for an arm resumed
@@ -117,6 +123,10 @@ if [ -n "$RESUME" ]; then
 else
   set --
 fi
+# SAFE_EXTRA: further train_ppo flags, word-split (2026-10-19), e.g.
+#   SAFE_EXTRA="--hazard_placement random --seed 1 --body_from checkpoints/X"
+# shellcheck disable=SC2206
+[ -n "${SAFE_EXTRA:-}" ] && set -- "$@" ${SAFE_EXTRA}
 
 echo "=== GPU preflight ==="
 python -c "
@@ -184,6 +194,7 @@ echo "   log: $LOG"
 echo "   cost: $COST_SHAPE penetration, grounded within ${EPS:-0.02 (default)} m, flip_cost=$FLIP_COST"
 echo "   physics: walls=$WALLS (exit ends episode, exit_cost=$EXIT_COST)  solver=${SOLVER_IT:-robot default}/${SOLVER_LS:-robot default}  matmul=$PRECISION  backend=$IMPL"
 echo "   observation: $FOOT_FLAG grid $GRID rings $RINGS lidar $LIDAR | policy ${WIDTH}x4 | $FINISH_FLAG${EPS:+ | eps $EPS}"
+[ -n "${SAFE_EXTRA:-}" ] && echo "   extra flags: $SAFE_EXTRA"
 echo "=========================================================="
 echo
 
@@ -201,7 +212,8 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --hazard_shaping_weight "$SHAPING_W" --hazard_shaping_radius "$SHAPING_R" \
   "$WALLS_FLAG" --terminate_out_of_bounds --exit_cost "$EXIT_COST" --boundary_cost_weight 0 \
   --policy_hidden_layer_sizes "$WIDTH" "$WIDTH" "$WIDTH" "$WIDTH" \
-  --num_envs 1024 --num_minibatches 32 \
+  --num_envs "$NUM_ENVS" --num_minibatches "$NUM_MINIBATCHES" --batch_size "$BATCH_SIZE" \
+  --learning_rate "$LEARNING_RATE" \
   --num_timesteps "$STEPS" --num_evals "$NUM_EVALS" \
   --checkpoint_logdir "$CKPT" "$@" 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}

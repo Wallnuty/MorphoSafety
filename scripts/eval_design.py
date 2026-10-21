@@ -14,7 +14,9 @@ under, which no policy can meet at budget 0).
 
 A run with no design_state.npz is a single-body run: the nominal ant is
 evaluated the same way (no genes in the observation), so the two are scored by
-one protocol and can share a table.
+one protocol and can share a table. A single-body run trained on a fixed
+non-nominal body (`train_ppo --body_from`) carries fixed_body.npz in its run
+dir, and that body is installed instead.
 
 `hazard_free` is the share of episodes with NO hazard contact at all (zero
 hazard steps) -- what a viewer notices, and what the mean cost hides. When it
@@ -24,8 +26,10 @@ is 100%, the line also gives the 95% upper bound on the per-episode touch rate
 SEEDS. `--seeds 0 1 2` evaluates each seed in turn without recompiling; a
 seed reproduces exactly what `--seeds <that seed>` alone prints. On the fixed
 lattice the layout and the spawn never change, so seeds only change the
-policy's action noise: under `--deterministic` every episode starts from the
-same state and the seeds have nothing to vary. On random fields they also
+policy's action noise. Under `--deterministic` every episode starts from the
+same state, yet episodes still differ (measured 2026-10-14: 16 deterministic
+nominal crossings, 12 hazard-free): contact dynamics amplify float differences
+between lanes, so use several episodes there too. On random fields seeds also
 redraw the hazards.
 
 Runs on either stack. For runs trained before the Warp migration use env
@@ -58,6 +62,12 @@ from mjx_safety_gym import morphology as morph_lib  # noqa: E402
 from mjx_safety_gym.algorithms import train_ppo  # noqa: E402
 from mjx_safety_gym.algorithms.rl.evaluation import ConstraintsEvaluator  # noqa: E402
 from mjx_safety_gym.envs.minefield import Minefield  # noqa: E402
+
+try:  # 2026-10-15; absent from the pre-warp checkout
+    from mjx_safety_gym.envs.laser_field import LaserField  # noqa: E402
+    from mjx_safety_gym.envs.laser_web import LaserWeb  # noqa: E402
+except ImportError:
+    LaserField = LaserWeb = None
 
 try:  # after the Warp migration models go through the backend module
     from mjx_safety_gym import backend as _backend  # noqa: E402
@@ -93,6 +103,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=pathlib.Path, required=True, help="co-design or single-body checkpoint run dir")
     ap.add_argument("--budget", type=float, required=True, help="the run's --safety_budget")
+    ap.add_argument("--task", default="minefield", choices=["minefield", "laserfield", "laserweb"])
+    ap.add_argument("--beam_obs", default="segments", choices=["segments", "profile"], help="laserfield only")
+    ap.add_argument("--web_style", default="tall", choices=["tall", "ant"], help="laserweb only")
+    ap.add_argument("--web_obs", default="ceiling", choices=["ceiling", "voxels", "both", "wide", "objects", "wide_objects"], help="laserweb only")
     ap.add_argument("--hazard_size", type=float, default=0.16)
     ap.add_argument("--hazard_placement", default="lattice", choices=["lattice", "random"])
     ap.add_argument("--flip_cost", type=float, default=50.0)
@@ -101,17 +115,30 @@ def main() -> None:
     ap.add_argument("--episodes", type=int, default=4, help="per env: total = envs x episodes")
     ap.add_argument("--deterministic", action="store_true", help="mean action (trainer default: sampled)")
     ap.add_argument("--seeds", "--seed", dest="seeds", type=int, nargs="+", default=[0])
+    ap.add_argument("--json", type=pathlib.Path, default=None,
+                    help="also write the per-seed and pooled summaries here")
     args = ap.parse_args()
 
     step = step_dir(args.run.resolve())
     codesign = (step / design_lib.DesignLoop.SIDECAR).exists()
     want = train_ppo.checkpoint_obs_width(ocp.PyTreeCheckpointer().restore(str(step))[1]["policy"])
-    env = Minefield(
-        robot="ant", morphology_conditioning=codesign, hazard_size=args.hazard_size,
-        hazard_placement=args.hazard_placement, flip_cost=args.flip_cost,
-        exit_cost=args.exit_cost, **train_ppo.robot_env_kwargs("ant"))
+    task = {"minefield": Minefield, "laserfield": LaserField, "laserweb": LaserWeb}[args.task]
+
+    def build(**over):
+        return task(
+            robot="ant", morphology_conditioning=codesign, hazard_size=args.hazard_size,
+            hazard_placement=args.hazard_placement, flip_cost=args.flip_cost,
+            exit_cost=args.exit_cost,
+            **({"beam_obs": args.beam_obs} if args.task == "laserfield" else {}),
+            **({"web_obs": args.web_obs, "web_style": args.web_style} if args.task == "laserweb" else {}),
+            **{**train_ppo.robot_env_kwargs("ant"), **over})
+
+    env = build()
+    if env.observation_size == want + 1 and train_ppo.robot_env_kwargs("ant").get("lateral_observation"):
+        env = build(lateral_observation=False)  # trained before the lateral offset (2026-10-15)
     assert env.observation_size == want, (
         f"env obs {env.observation_size} != checkpoint {want}: wrong settings for this run")
+    fixed = args.run.resolve() / "fixed_body.npz"  # train_ppo --body_from
     if codesign:
         spec, mode = evolved_spec(step)
         mj = env.build_morphology_model(spec)
@@ -119,15 +146,18 @@ def main() -> None:
         env._mjx_model = put_model(mj)
         env._morphology_genes = jp.asarray(spec.genes, dtype=jp.float32)
         body = f"evolved body, mode {np.round(mode, 2)}"
+    elif fixed.exists():
+        genes = np.load(fixed)["genes"]
+        mj = env.build_morphology_model(morph_lib.MorphologySpec(genes))
+        env._mj_model = mj
+        env._mjx_model = put_model(mj)
+        body = f"fixed body (single-body run), genes {np.round(genes, 2)}"
     else:
         mj = env._mj_model
         body = "nominal body (single-body run)"
     print(f"{args.run.name} @ {step.name}: {body}, "
           f"mass {mj.body_subtreemass[mj.body('robot').id]:.1f} kg, solver "
           f"{mj.opt.iterations}/{mj.opt.ls_iterations}, mujoco {__import__('mujoco').__version__}")
-    if args.deterministic and args.hazard_placement == "lattice" and (len(args.seeds) > 1 or args.episodes > 1):
-        print("note: deterministic policy on the fixed lattice -- every episode starts from the same "
-              "state, so the episodes (and seeds) are copies of one another")
 
     policy = build_policy(args.run.resolve(), env, args.deterministic, args.seeds[0])
     defaults = train_ppo._ROBOT_DEFAULTS["ant"]
@@ -142,6 +172,7 @@ def main() -> None:
     env_keys = ("cost", "safe")
     pooled_ep: dict[str, list] = {k: [] for k in (*ep_keys, "hazard_free")}
     pooled_env: dict[str, list] = {k: [] for k in env_keys}
+    per_seed: list[dict] = []
     n = args.envs * args.episodes
     print(f"{n} episodes per seed, budget {args.budget:g}, "
           f"{'deterministic' if args.deterministic else 'stochastic'} policy")
@@ -162,6 +193,7 @@ def main() -> None:
         for k, v in per_env.items():
             pooled_env[k].append(v)
         s = summarise(per_ep, per_env)
+        per_seed.append({"seed": seed, **{k: float(v[0]) for k, v in s.items()}})
         print(f"  seed {seed}: return {s['reward'][0]:.2f} | speed {s['speed'][0]:.2f} m/s | "
               f"cost {s['cost'][0]:.2f} +- {s['cost'][2]:.2f} | hazard steps {s['hazard_steps'][0]:.1f} | "
               f"hazard-free {100 * s['hazard_free'][0]:.1f}% | flipped {100 * s['flipped'][0]:.1f}% | "
@@ -173,6 +205,20 @@ def main() -> None:
     for k in ("reward", "speed", "cost", "hazard_steps", "hazard_free", "flipped", "out_of_bounds", "safe"):
         mean, sd, se, nk = s[k]
         print(f"  {k:14s} {mean:9.4f}  (sd {sd:.4f}, se {se:.4f}, n {nk})")
+    if args.json is not None:
+        import json
+
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps({
+            "run": str(args.run), "step": step.name, "body": body, "budget": args.budget,
+            "task": args.task, "hazard_placement": args.hazard_placement,
+            "mass_kg": float(mj.body_subtreemass[mj.body("robot").id]),
+            "deterministic": args.deterministic, "episodes_per_seed": n,
+            "pooled": {k: {"mean": float(v[0]), "sd": float(v[1]), "se": float(v[2]), "n": int(v[3])}
+                       for k, v in s.items()},
+            "per_seed": per_seed,
+        }, indent=1))
+        print(f"wrote {args.json}")
     free = np.concatenate(pooled_ep["hazard_free"])
     if free.all():
         print(f"  no hazard contact in {free.size} episodes: per-episode touch rate < "

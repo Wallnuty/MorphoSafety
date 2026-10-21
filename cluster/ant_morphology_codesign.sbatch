@@ -205,6 +205,7 @@
 #SBATCH --exclude=mscluster44,mscluster45,mscluster75,mscluster83
 #SBATCH --time=12:00:00
 set -u
+EXTRA_ARGS=("$@")  # kept across the RESUME block's `set --` (dropped before 2026-10-19)
 
 echo "=== node ==="
 hostname; date
@@ -252,7 +253,8 @@ HAZARD_PLACEMENT="${HAZARD_PLACEMENT:-lattice}"
 # PREFLIGHT 2: the checkout is new enough, and the observation is the width
 # this run is FOR.
 #
-# 250 = 47 (proprio + goal + lidar) + 196 (4 feet x 7x7 grid) + 7 genes; no
+# 251 = 47 (proprio + goal + lidar) + 1 (lateral offset, default since
+# 2026-10-15; runs before that were 250) + 196 (4 feet x 7x7 grid) + 7 genes; no
 # budget scalar (that was Saute's). A silent 54 would mean the foot grid is
 # off -- the thing that makes the constraint act on placement; a silent 243
 # would mean morphology conditioning is not reaching the observation, which
@@ -306,7 +308,7 @@ assert _differ == (pl == 'random'), (
 assert env._ground_contact_eps == 0.02 and env._hazard_cost_shape == 'linear', (
     'ABORT: cost is not linear at the 2 cm gate (default since 2026-09-28). git pull.')
 w = env.observation_size
-assert w == 243 + morphology.NUM_GENES, f'expected 250 (grid 7 + genes), got {w}'
+assert w == 244 + morphology.NUM_GENES, f'expected 251 (grid 7 + lateral offset + genes), got {w}'
 assert 'lagrange_per_component' in {a.dest for a in T.build_argparser()._actions}, (
     'ABORT: no per-component Lagrange multipliers in this checkout (2026-09-28). git pull.')
 o = env.mj_model.opt
@@ -353,14 +355,14 @@ DESIGN_TMAX="${DESIGN_TMAX:-2000000000}"
 # steps = 1.50 episodes per lane each (the design updates are the ~390 between
 # 200M and 1.7B).
 NUM_EVALS="${NUM_EVALS:-41}"
-DESIGN_UPDATES="${DESIGN_UPDATES:-13}"
+DESIGN_UPDATES="${DESIGN_UPDATES:-3}"   # 13 at 1024 envs; 3 keeps >= 1.6 worst-case episodes per lane at 4096
 CHOP_FREQ="${CHOP_FREQ:-200000000}"
 STEPS_BEFORE="${STEPS_BEFORE:-200000000}"
 STEPS_AFTER="${STEPS_AFTER:-300000000}"
 # 0.03, not 1e-3: at 1e-3 the 2026-08 run's distribution moved 2% of the gene
 # space in 60M steps (sigma 0.5763 vs 0.577 init) -- inert. See
 # cluster/vast/remote_codesign.sh's DESIGN_LR section for the arithmetic.
-DESIGN_LR="${DESIGN_LR:-0.03}"
+DESIGN_LR="${DESIGN_LR:-0.08}"   # 0.03 before 2026-10-19 (it had 4x the design updates)
 # 2026-09-17: score designs on time AND cost. DESIGN_OBJECTIVE=safe_time with
 # DESIGN_COST_WEIGHT (decisions per unit of episode cost; 1.0 makes a careless
 # nominal-ant crossing's ~58 linear cost units worth ~half its arrival time)
@@ -372,7 +374,7 @@ PENALIZER="${PENALIZER:-ppo_lagrangian}"   # none = the Schaff baseline
 # Budget 2 (2026-09-28, user's call): at the 2 cm gate the single-ant runs
 # reached cost 2.7 at budget 5 and 1.9 at budget 0, so 25 would barely bind.
 BUDGET="${BUDGET:-2}"
-MULT_LR="${MULT_LR:-1.5e-5}"
+MULT_LR="${MULT_LR:-6e-5}"   # 1.5e-5 before 2026-10-19 (see BATCH below)
 MULT_MAX="${MULT_MAX:-3.0}"
 MULT_INIT="${MULT_INIT:-0.01}"
 GRID="${GRID:-7}"
@@ -380,6 +382,18 @@ GRID="${GRID:-7}"
 # every component's bodies held to the budget themselves. 0 = one shared.
 LAMBDA_PER_COMPONENT="${LAMBDA_PER_COMPONENT:-1}"
 if [ "$LAMBDA_PER_COMPONENT" = "1" ]; then LPC_FLAG=--lagrange_per_component; else LPC_FLAG=--no-lagrange_per_component; fi
+# BATCH (2026-10-19, large-batch defaults; Vast test ant_codesign_4096env_b2_2000M:
+# 312k sps, 2B in 2.6 h, evolved body 2.64 m/s at cost 1.79 vs budget 2). Keep 64
+# lanes per design (NUM_MORPHOLOGIES = NUM_ENVS/64). Before 2026-10-19:
+# NUM_ENVS=1024 NUM_MORPHOLOGIES=16 BATCH_SIZE=32 LEARNING_RATE=1e-4 MULT_LR=1.5e-5
+# DESIGN_UPDATES=13 DESIGN_LR=0.03 NUM_EVAL_ENVS=32 NUM_EVAL_EPISODES=10.
+NUM_ENVS="${NUM_ENVS:-4096}"
+NUM_MORPHOLOGIES="${NUM_MORPHOLOGIES:-64}"
+NUM_MINIBATCHES="${NUM_MINIBATCHES:-32}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
+LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+NUM_EVAL_ENVS="${NUM_EVAL_ENVS:-64}"        # must be a multiple of NUM_MORPHOLOGIES
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-5}"
 RESUME="${RESUME:-}"
 
 # A RESUMED RUN MUST NOT WRITE INTO THE DIRECTORY IT IS RESUMING FROM. The
@@ -405,11 +419,12 @@ if [ -n "$RESUME" ]; then
     echo "design search from its init while the policy continued. Refusing."; exit 1; }
   echo "=== RESUMING from $RESUME ==="
   echo "    design_lr=$DESIGN_LR  steps=$STEPS  design_tmax=$DESIGN_TMAX"
-  set -- --restore_checkpoint_path "$RESUME"
+  set -- --restore_checkpoint_path "$RESUME" "${EXTRA_ARGS[@]}"
 else
-  set --
+  set -- "${EXTRA_ARGS[@]}"
 fi
-echo "=== co-design: $STEPS steps, 1024 envs, design_lr=$DESIGN_LR -> $CKPT ==="
+echo "=== co-design: $STEPS steps, $NUM_ENVS envs ($NUM_MORPHOLOGIES designs), $NUM_MINIBATCHES x $BATCH_SIZE, lr $LEARNING_RATE, design_lr=$DESIGN_LR -> $CKPT ==="
+python -c "print('episodes per lane per design iteration (worst case): %.2f' % ($STEPS / ($NUM_EVALS - 1) / $DESIGN_UPDATES / $NUM_ENVS / 2500))"
 echo "    schedule: design frozen until $STEPS_BEFORE, chop every $CHOP_FREQ, fine-tune last $STEPS_AFTER; $NUM_EVALS evals x $DESIGN_UPDATES updates"
 echo "    $PENALIZER b$BUDGET  lr=$MULT_LR cap=$MULT_MAX init=$MULT_INIT  grid $GRID  flip $FLIP_COST  hazard r=$HAZARD_SIZE $HAZARD_PLACEMENT  finish line  float32  MuJoCo Warp, full solver"
 
@@ -441,13 +456,15 @@ time python -u -m mjx_safety_gym.algorithms.train_ppo \
   --design_optimization \
   --design_objective "$DESIGN_OBJECTIVE" --design_cost_weight "$DESIGN_COST_WEIGHT" \
   --flip_cost "$FLIP_COST" \
-  --num_morphologies 16 \
+  --num_morphologies "$NUM_MORPHOLOGIES" \
   --design_components 8 \
   --design_updates_per_eval "$DESIGN_UPDATES" \
   --chop_freq "$CHOP_FREQ" \
   --steps_before_design_update "$STEPS_BEFORE" \
   --steps_after_design_update "$STEPS_AFTER" \
-  --num_envs 1024 --num_minibatches 32 \
+  --num_envs "$NUM_ENVS" --num_minibatches "$NUM_MINIBATCHES" --batch_size "$BATCH_SIZE" \
+  --learning_rate "$LEARNING_RATE" \
+  --num_eval_envs "$NUM_EVAL_ENVS" --num_eval_episodes "$NUM_EVAL_EPISODES" \
   --design_lr "$DESIGN_LR" \
   --num_timesteps "$STEPS" \
   --design_tmax "$DESIGN_TMAX" \

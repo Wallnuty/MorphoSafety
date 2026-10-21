@@ -22,6 +22,8 @@ from mjx_safety_gym.algorithms.train_ppo import (
     latest_checkpoint,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.laser_field import LaserField
+from mjx_safety_gym.envs.laser_web import LaserWeb
 from mjx_safety_gym.envs.lasers import Lasers
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
@@ -34,7 +36,7 @@ _parser = argparse.ArgumentParser(
 _parser.add_argument("--robot", choices=sorted(_ROBOT_XMLS), default="point")
 _parser.add_argument(
     "--task",
-    choices=["goal", "run", "minefield", "lasers"],
+    choices=["goal", "run", "minefield", "lasers", "laserfield", "laserweb"],
     default="goal",
     help="Must match the task the checkpoint was trained on. All three tasks "
     "give the same observation width, so a mismatch loads cleanly and replays a "
@@ -224,6 +226,14 @@ _parser.add_argument(
     "are the same physics to ~1e-7 (notes/warp_migration.md), and one env needs "
     "no Warp throughput.",
 )
+_parser.add_argument("--beam_obs", default="segments", choices=["segments", "profile"],
+                     help="[laserfield] beam observation the checkpoint was trained with")
+_parser.add_argument("--web_style", default="tall", choices=["tall", "ant"],
+                     help="[laserweb] 'ant' = the ant-scale web (antweb_* runs)")
+_parser.add_argument("--web_obs", default="ceiling",
+                     choices=["ceiling", "voxels", "both", "wide", "objects", "wide_objects"],
+                     help="[laserweb] beam observation the checkpoint was trained with")
+_parser.add_argument("--num_beams", type=int, default=None, help="[laserfield/laserweb] beam count")
 _args = _parser.parse_args()
 
 # --design_from is meaningless outside the morphology branch, and that branch is
@@ -276,6 +286,8 @@ _TASKS = {
     "run": RunForward,
     "minefield": Minefield,
     "lasers": Lasers,
+    "laserfield": LaserField,
+    "laserweb": LaserWeb,
     "goal": GoToGoal,
 }
 def _report_reconciliation(want, default_width, task_kwargs, robot):
@@ -317,6 +329,14 @@ if _args.hazard_size is not None:
     _finish_override["hazard_size"] = _args.hazard_size
 if _args.hazard_placement is not None:
     _finish_override["hazard_placement"] = _args.hazard_placement
+# The laser tasks' observation variants change the width, so they must match
+# the checkpoint (2026-10-19; before, the viewer always built the defaults).
+if _args.task == "laserfield":
+    _finish_override["beam_obs"] = _args.beam_obs
+if _args.task == "laserweb":
+    _finish_override.update(web_obs=_args.web_obs, web_style=_args.web_style)
+if _args.num_beams is not None and _args.task in ("laserfield", "laserweb"):
+    _finish_override["num_beams"] = _args.num_beams
 if _args.num_morphologies:
     # A morphology-conditioned checkpoint is NUM_GENES wider than the task obs
     # it was trained against, so the width to reconcile is the checkpoint's --

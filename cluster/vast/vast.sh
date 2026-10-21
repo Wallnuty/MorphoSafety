@@ -19,6 +19,8 @@
 #   bash cluster/vast/vast.sh crpo            # CRPO safety run (+preflights)
 #   bash cluster/vast/vast.sh lagrangian      # Lagrangian arm; queues behind crpo
 #   bash cluster/vast/vast.sh logs            # follow the remote log
+#   bash cluster/vast/vast.sh queue <file>    # run a job queue (remote_queue.sh) in tmux
+#   bash cluster/vast/vast.sh queue-status    # its status lines + GPU use
 #   bash cluster/vast/vast.sh pull            # bring checkpoints/logs home
 #   bash cluster/vast/vast.sh down            # DESTROY (billing stops here)
 #
@@ -299,6 +301,7 @@ sync)
     --exclude '.git' --exclude 'checkpoints' --exclude 'logs' \
     --exclude '__pycache__' --exclude '*.pyc' --exclude '.pytest_cache' \
     --exclude 'cluster/vast/.instance' \
+    --exclude 'renders' \
     -e "$(rsh)" "$ROOT/" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/" \
     || die "rsync failed -- the remote does NOT have your code. Do not train."
   echo "code synced to $SSH_HOST:$REMOTE_DIR"
@@ -438,7 +441,7 @@ codesign)
   envs=""
   for v in STEPS DESIGN_TMAX DESIGN_LR NUM_EVALS RESUME NAME DESIGN_OBJECTIVE DESIGN_COST_WEIGHT FLIP_COST \
            PENALIZER BUDGET MULT_LR MULT_MAX MULT_INIT GRID LAMBDA_PER_COMPONENT \
-           DESIGN_UPDATES CHOP_FREQ STEPS_BEFORE STEPS_AFTER; do
+           DESIGN_UPDATES CHOP_FREQ STEPS_BEFORE STEPS_AFTER NUM_ENVS NUM_MORPHOLOGIES NUM_MINIBATCHES BATCH_SIZE LEARNING_RATE NUM_EVAL_ENVS NUM_EVAL_EPISODES; do
     eval "val=\${CODESIGN_$v:-}"; [ -n "$val" ] && envs="$envs $v=$val"
   done
   rexec "cd $REMOTE_DIR && mkdir -p logs && \
@@ -528,6 +531,24 @@ lagrangian-log)
 logs)
   ssh_parts
   rexec "tail -f $REMOTE_DIR/logs/vast_train.log"
+  ;;
+
+queue)
+  # Run a queue file of jobs in tmux (cluster/vast/remote_queue.sh). Syncs the
+  # code first, so the queue runs exactly what is on this disk.
+  q="${2:-}"; [ -f "$q" ] || die "usage: $0 queue <queue file under cluster/vast/queues/>"
+  "$0" sync || exit 1
+  ssh_parts
+  rexec "cd $REMOTE_DIR && tmux kill-session -t queue 2>/dev/null; \
+         tmux new-session -d -s queue 'bash cluster/vast/remote_queue.sh $q' && \
+         echo 'launched queue $q in tmux session: queue'"
+  ;;
+
+queue-status)
+  ssh_parts
+  rexec "cat $REMOTE_DIR/logs/queue/status.txt 2>/dev/null; \
+         tmux has-session -t queue 2>/dev/null && echo '(tmux queue: running)' || echo '(tmux queue: not running)'; \
+         nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader"
   ;;
 
 pull)

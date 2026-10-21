@@ -362,9 +362,37 @@ class EpisodeStatsWrapper(Wrapper):
     `CostEpisodeWrapper` documents for its own info keys).
     """
 
+    def __init__(
+        self,
+        env: Env,
+        episode_length: int | None = None,
+        action_repeat: int = 1,
+        return_ceiling: float | None = None,
+    ):
+        # Inner-step horizon a NON-arrival is charged for the per-episode speed
+        # (design.py's "speed" objective); None leaves ep_speed_sum at zero.
+        # `return_ceiling` (with the horizon) enables ep_fitness_sum, the
+        # "time"/"safe_time" fitness per episode; without it that sum is NaN,
+        # which design.py refuses rather than reading as a score.
+        super().__init__(env)
+        self._episode_length = episode_length
+        self._action_repeat = int(action_repeat)
+        self._return_ceiling = return_ceiling
+
     def reset(self, rng: jax.Array) -> State:
         state = self.env.reset(rng)
         zero = jp.zeros_like(state.reward)
+        # SUMS over every episode the lane finishes (2026-10-19). Upstream
+        # (nlimb envs.py, NLimbRecorderEnv.update_buffer) scores a robot by the
+        # MEAN return of ALL episodes it completed; the *_last latches kept
+        # only one per lane -- ~15% of finished episodes at 400M. Lanes are
+        # re-reset every design iteration, so these are per-iteration sums.
+        state.info["ep_return_sum"] = zero
+        state.info["ep_speed_sum"] = zero
+        state.info["ep_arrived_sum"] = zero
+        state.info["ep_arrived_len_sum"] = zero
+        state.info["ep_fitness_sum"] = zero
+        state.info["ep_cost_sum"] = zero
         state.info["ep_return"] = zero
         state.info["ep_return_last"] = zero
         # Episode COST, latched like the return (2026-09-17), so a design can
@@ -426,6 +454,33 @@ class EpisodeStatsWrapper(Wrapper):
         running_dx = state.info["ep_dx"] + state.info.get("dx", jp.zeros_like(running))
         state.info["ep_dx_last"] = jp.where(finished, running_dx, state.info["ep_dx_last"])
         state.info["ep_dx"] = jp.where(finished, jp.zeros_like(running), running_dx)
+
+        # Per-episode stats into the iteration sums. Speed is in inner steps
+        # (dx / charged), with a non-arrival charged the full horizon, exactly
+        # as design.py's speed objective; the host multiplies by action_repeat.
+        f = finished.astype(running.dtype)
+        arrived_ep = state.info["ep_arrived_last"] * f
+        state.info["ep_return_sum"] = state.info["ep_return_sum"] + f * running
+        if self._episode_length:
+            charged = jp.where(arrived_ep > 0, length, float(self._episode_length))
+            speed = running_dx / jp.maximum(charged, 1.0)
+        else:
+            speed = jp.zeros_like(running)
+        state.info["ep_speed_sum"] = state.info["ep_speed_sum"] + f * speed
+        state.info["ep_arrived_sum"] = state.info["ep_arrived_sum"] + arrived_ep
+        state.info["ep_arrived_len_sum"] = state.info["ep_arrived_len_sum"] + arrived_ep * length
+        # design.py's time fitness, per episode, in DECISIONS: the arrival
+        # decision, else max_decisions x (1 + shortfall of the return).
+        if self._episode_length and self._return_ceiling:
+            max_decisions = float(self._episode_length // self._action_repeat)
+            shortfall = jp.clip(1.0 - running / self._return_ceiling, 0.0, 1.0)
+            fitness = jp.where(
+                arrived_ep > 0, length / self._action_repeat, max_decisions * (1.0 + shortfall)
+            )
+        else:
+            fitness = jp.full_like(running, jp.nan)
+        state.info["ep_fitness_sum"] = state.info["ep_fitness_sum"] + f * fitness
+        state.info["ep_cost_sum"] = state.info["ep_cost_sum"] + f * running_cost
 
         state.info["ep_count"] = state.info["ep_count"] + done
         state.info["ep_return"] = jp.where(finished, jp.zeros_like(running), running)

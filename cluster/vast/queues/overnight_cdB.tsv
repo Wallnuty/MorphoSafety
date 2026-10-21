@@ -1,0 +1,9 @@
+# 2026-10-19 overnight: random minefield, budget 2
+cd_ff_s1	NAME=cd_ff_s1 PENALIZER=ppo_lagrangian bash cluster/vast/remote_codesign.sh --hazard_placement random --seed 1 --design_ranking feasibility_first
+eval_cd_ff_s1	python scripts/eval_design.py --run checkpoints/cd_ff_s1 --budget 2 --hazard_placement random --seeds 0 1 2 --json logs/eval/cd_ff_s1.json
+fx_cd_ff_s1	SAFE_NAME=fx_cd_ff_s1 SAFE_BUDGET=2 SAFE_STEPS=300000000 SAFE_NUM_EVALS=11 SAFE_EXTRA="--hazard_placement random --seed 1 --body_from /root/MorphoSafety/checkpoints/cd_ff_s1" bash cluster/vast/remote_safe.sh
+eval_fx_cd_ff_s1	python scripts/eval_design.py --run checkpoints/fx_cd_ff_s1 --budget 2 --hazard_placement random --seeds 0 1 2 --json logs/eval/fx_cd_ff_s1.json
+cd_speed_s1	NAME=cd_speed_s1 PENALIZER=ppo_lagrangian bash cluster/vast/remote_codesign.sh --hazard_placement random --seed 1 --design_ranking objective
+eval_cd_speed_s1	python scripts/eval_design.py --run checkpoints/cd_speed_s1 --budget 2 --hazard_placement random --seeds 0 1 2 --json logs/eval/cd_speed_s1.json
+fx_cd_speed_s1	SAFE_NAME=fx_cd_speed_s1 SAFE_BUDGET=2 SAFE_STEPS=300000000 SAFE_NUM_EVALS=11 SAFE_EXTRA="--hazard_placement random --seed 1 --body_from /root/MorphoSafety/checkpoints/cd_speed_s1" bash cluster/vast/remote_safe.sh
+eval_fx_cd_speed_s1	python scripts/eval_design.py --run checkpoints/fx_cd_speed_s1 --budget 2 --hazard_placement random --seeds 0 1 2 --json logs/eval/fx_cd_speed_s1.json

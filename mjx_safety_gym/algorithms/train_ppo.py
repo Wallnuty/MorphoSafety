@@ -16,10 +16,13 @@ Usage:
 
 import argparse
 import functools
+import pathlib
 from pathlib import Path
 from typing import Optional
 
 import jax
+import jax.numpy as jp
+import numpy as np
 from brax.envs.wrappers import training as brax_training
 from mujoco_playground import wrapper as playground_wrapper
 
@@ -39,6 +42,8 @@ from mjx_safety_gym.algorithms.wrappers import (
     Saute,
 )
 from mjx_safety_gym.envs.go_to_goal import _ROBOT_XMLS, GoToGoal
+from mjx_safety_gym.envs.laser_field import LaserField
+from mjx_safety_gym.envs.laser_web import LaserWeb
 from mjx_safety_gym.envs.lasers import Lasers
 from mjx_safety_gym.envs.minefield import Minefield
 from mjx_safety_gym.envs.run_forward import RunForward
@@ -101,6 +106,10 @@ _ROBOT_DEFAULTS = {
         "healthy_reward": 0.0, "terminate_on_flip": False,
         "goal_reward_weight": 0.0, "goal_observation": False,
         "terminate_on_goal": True, "foot_obstacle_obs": False, "foot_hazard_grid": 0, "finish_line": True,
+        # LATERAL OFFSET ON (2026-10-15, user's call): y / corridor_half_width,
+        # +1 obs dim. The finish-line goal sensing carries x and heading but no
+        # y, so the corridor edge (exit = cost 50 + termination) was invisible.
+        "lateral_observation": True,
     },
     "ant": {
         "action_repeat": 4, "episode_length": 2500, "discounting": 0.97,
@@ -184,6 +193,10 @@ _ROBOT_DEFAULTS = {
         # the 2026-09-21 A/B (cost 43.3 vs 53.8, speed 1.08 vs 0.99). Obs
         # 47 -> 243. Older checkpoints load through _env_kwarg_candidates.
         "foot_obstacle_obs": False, "foot_hazard_grid": 7, "finish_line": True,
+        # LATERAL OFFSET ON (2026-10-15, user's call): y / corridor_half_width,
+        # +1 obs dim. The finish-line goal sensing carries x and heading but no
+        # y, so the corridor edge (exit = cost 50 + termination) was invisible.
+        "lateral_observation": True,
         #
         # NO SOLVER CAP SINCE THE WARP MIGRATION (2026-10-04): the XML's MuJoCo
         # defaults (100 iterations / 50 line-search steps) apply, i.e. the
@@ -302,6 +315,10 @@ _ROBOT_DEFAULTS = {
         # that it does not lower hazard cost on the objective as it stands.
         # Pass --foot_obstacle_obs to get it back.
         "foot_obstacle_obs": False, "foot_hazard_grid": 0, "finish_line": True,
+        # LATERAL OFFSET ON (2026-10-15, user's call): y / corridor_half_width,
+        # +1 obs dim. The finish-line goal sensing carries x and heading but no
+        # y, so the corridor edge (exit = cost 50 + termination) was invisible.
+        "lateral_observation": True,
     },
 }
 
@@ -328,7 +345,7 @@ def apply_robot_defaults(args: argparse.Namespace) -> None:
 _ENV_DEFAULT_KEYS = (
     "healthy_reward", "terminate_on_flip", "goal_reward_weight",
     "goal_observation", "terminate_on_goal", "foot_obstacle_obs", "foot_hazard_grid",
-    "finish_line", "solver_iterations", "solver_ls_iterations",
+    "finish_line", "solver_iterations", "solver_ls_iterations", "lateral_observation",
 )
 
 
@@ -399,6 +416,15 @@ _HAZARD_LIDAR_GROUPS = ("obstacle",)
 
 
 def _env_kwarg_candidates(robot: str) -> list[dict]:
+    """Every base candidate as-is, then again WITHOUT the lateral offset
+    (default since 2026-10-15, +1 obs dim), which every earlier checkpoint
+    lacks."""
+    base = _env_kwarg_candidates_base(robot)
+    return [*base, *({**c, "lateral_observation": False} for c in base
+                     if c.get("lateral_observation"))]
+
+
+def _env_kwarg_candidates_base(robot: str) -> list[dict]:
     """Env configurations to try against a checkpoint, current first.
 
     TWO separate changes have moved the corridor observation width, and a
@@ -617,12 +643,41 @@ def latest_checkpoint(robot: str) -> Optional[Path]:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
+def fixed_body_genes(path) -> np.ndarray:
+    """Genes ([0,1]^7) of the mode of a co-design run's design distribution.
+    `path` is a run dir (latest step) or a step dir holding design_state.npz."""
+    p = pathlib.Path(path)
+    if not (p / design_lib.DesignLoop.SIDECAR).exists():
+        steps = sorted(q for q in p.iterdir() if q.is_dir() and q.name.isdigit()
+                       and (q / design_lib.DesignLoop.SIDECAR).exists())
+        if not steps:
+            raise SystemExit(f"--body_from {path}: no design_state.npz there")
+        p = steps[-1]
+    z = np.load(p / design_lib.DesignLoop.SIDECAR, allow_pickle=True)
+    gmm = design_lib.GmmDesignDistribution(
+        n_params=morphology_lib.NUM_GENES, n_components=int(np.asarray(z["gmm_log_mixprobs"]).size))
+    gmm.load_state_dict({k[len("gmm_"):]: z[k] for k in z.files if k.startswith("gmm_")})
+    return np.asarray(gmm.to_genes(gmm.mode()), dtype=float)
+
+
+def install_body(env, genes) -> None:
+    """Swap a built env's robot for the body `genes` describes (no genes in the
+    observation), as scripts/eval_design.py does for an evolved body."""
+    from mjx_safety_gym import backend as _backend
+
+    mj = env.build_morphology_model(morphology_lib.MorphologySpec(np.asarray(genes, dtype=float)))
+    env._mj_model = mj
+    env._mjx_model = _backend.put_model(mj)
+    env._morphology_genes = jp.asarray(genes, dtype=jp.float32)
+
+
 def wrap_for_brax_training(
     env,
     episode_length: int,
     action_repeat: int = 1,
     already_batched: bool = False,
     track_episode_stats: bool = False,
+    return_ceiling: float | None = None,
 ):
     """Vmap + cost-aware episode wrapper + mujoco_playground's auto-reset.
 
@@ -652,7 +707,7 @@ def wrap_for_brax_training(
         # `data`/`obs` -- the latches live in `info` and survive. Only attached
         # for design optimization, so no existing run's info pytree changes
         # shape.
-        env = EpisodeStatsWrapper(env)
+        env = EpisodeStatsWrapper(env, episode_length, action_repeat, return_ceiling)
     return env
 
 
@@ -739,8 +794,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lagrangian_multiplier_lr",
         type=float,
-        default=1.5e-5,
-        help="1.5e-5 since 2026-09-25 = what every arm since 2026-09-17 ran "
+        default=6e-5,
+        help="6e-5 since 2026-10-19: the multiplier updates once per MINIBATCH, and the "
+        "large-batch defaults run 4x fewer minibatches per env step, so its lr is 4x "
+        "(1.5e-5 left it rising 4x slower, cost 3.9 vs 1.1 at 100M). Before that: "
+        "1.5e-5 since 2026-09-25 = what every arm since 2026-09-17 ran "
         "(the linear 5 cm cost's |constraint| is ~0.7x the old 2 cm scale's). "
         "Before that: 7e-7, ss2r's own default (agent/penalizer/ppo_lagrangian.yaml). The "
         "previous default of 1e-2 traces to ss2r's go1_sim_to_real "
@@ -833,7 +891,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--task",
-        choices=["goal", "run", "minefield", "lasers"],
+        choices=["goal", "run", "minefield", "lasers", "laserfield", "laserweb"],
         default="goal",
         help="'goal' is the original navigate-to-a-respawning-goal task. 'run' "
         "is RunForward: start at one end of a corridor and get as far in +x as "
@@ -1232,6 +1290,51 @@ def build_argparser() -> argparse.ArgumentParser:
         "--healthy_reward.",
     )
     parser.add_argument(
+        "--lateral_observation",
+        type=lambda v: v.lower() not in ("0", "false", "no"),
+        default=None,
+        help="[corridor tasks] Append the robot's lateral offset, y / "
+        "corridor_half_width, to the observation (+1 dim). ON for every robot "
+        "since 2026-10-15 (user's call): the finish-line goal sensing gives x and "
+        "heading but no y, so the corridor edge -- where leaving costs 50 and "
+        "ends the episode -- was invisible to the policy. Pass false to "
+        "reproduce earlier runs; their checkpoints load through "
+        "_env_kwarg_candidates.",
+    )
+    parser.add_argument(
+        "--web_style",
+        choices=["tall", "ant"],
+        default="tall",
+        help="[--task laserweb] 'tall' = human-scale web (steep floor beams, "
+        "mostly overhead); 'ant' = beams in the ant's own height band: low "
+        "sweeps, tripwires to step over, low overhead (2026-10-15).",
+    )
+    parser.add_argument(
+        "--web_obs",
+        choices=["ceiling", "voxels", "both", "wide", "objects", "wide_objects"],
+        default="ceiling",
+        help="[--task laserweb] Beam input: 'ceiling' = 13x9 map of the lowest "
+        "beam overhead; 'voxels' = 11x7x4 cubic grid of distance to the nearest "
+        "beam; 'both'. All add per-limb proximity.",
+    )
+    parser.add_argument(
+        "--beam_obs",
+        choices=["segments", "profile"],
+        default="segments",
+        help="[--task laserfield] How beams enter the observation: 'segments' = "
+        "the 4 nearest beams as their nearest point plus both corridor-edge "
+        "crossings; 'profile' = the next 3 beams ahead sampled at 7 lateral "
+        "positions (forward distance, height). Both add per-limb proximity.",
+    )
+    parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=None,
+        help="[--task laserfield] 3D laser beams across the corridor (default "
+        "10, ~1 m apart). Each is diagonal in plan and sloped in height, "
+        "redrawn per layout, with a guaranteed walk-under passage.",
+    )
+    parser.add_argument(
         "--goal_observation",
         type=lambda v: v.lower() not in ("0", "false", "no"),
         default=None,
@@ -1248,8 +1351,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=512,
-        help="512 is where a 6 GiB laptop GPU saturates. Measured 2026-08-16, "
+        default=4096,
+        help="LARGE-BATCH DEFAULTS (2026-10-19, user's call): 4096 envs, 32 minibatches x batch_size 128, learning_rate 2e-4, multiplier lr 6e-5. Laptop A/B on laserfield (100M): on par per step with 1024/32x32/1e-4/1.5e-5 from ~30M, 1.39x the throughput (2.35x for co-design on a 3090). Scaling only num_minibatches with num_envs (128 x 32) learned ~2x worse per step: 512 SGD steps on each stale batch. Runs before this date used 512 or 1024 envs, batch 32, lr 1e-4, multiplier lr 1.5e-5 -- pass those to reproduce. Older history: 512 was where a 6 GiB laptop GPU saturated on MJX-JAX. Measured 2026-08-16, "
         "ant on minefield, compile-corrected training/sps: 1155 at 128 envs, "
         "3593 at 256 (3.11x -- small batches are kernel-launch-bound, not "
         "physics-bound), 4747 at 512 (1.32x), 4900 at 1024 (1.03x), 4735 at "
@@ -1281,8 +1384,8 @@ def build_argparser() -> argparse.ArgumentParser:
         "that product within what --num_envs shows is comfortable.",
     )
     parser.add_argument("--num_eval_episodes", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_minibatches", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=128)  # see --num_envs (2026-10-19)
+    parser.add_argument("--num_minibatches", type=int, default=32)  # see --num_envs (2026-10-19)
     parser.add_argument("--unroll_length", type=int, default=10)
     parser.add_argument(
         "--impl",
@@ -1386,7 +1489,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "(0.97/decision) dominates it by far, but set --healthy_reward 0 if you "
         "want the objective clean.",
     )
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)  # see --num_envs (2026-10-19)
     parser.add_argument("--entropy_cost", type=float, default=1e-4)
     parser.add_argument(
         "--discounting",
@@ -1463,7 +1566,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--design_lr", type=float, default=1e-3,
         help="Adam lr for the design distribution (upstream robot_lr). Scaled "
-        "by a linear 1 - t/num_timesteps decay, as upstream does.",
+        "by 1 - t/tmax, t at the start of the iteration and tmax = "
+        "--design_tmax or --num_timesteps, as upstream does.",
     )
     parser.add_argument(
         "--design_momentum", type=float, default=0.9,
@@ -1549,6 +1653,16 @@ def build_argparser() -> argparse.ArgumentParser:
         "question -- rather than fast alone.",
     )
     parser.add_argument(
+        "--design_score_episodes",
+        choices=["all", "last"],
+        default="all",
+        help="Score each design by the mean over EVERY episode its lanes finish "
+        "in a design iteration ('all', default since 2026-10-19 -- what upstream "
+        "nlimb does), or by each lane's last finished episode ('last', every "
+        "co-design run before that date; at 400M it used ~15%% of the finished "
+        "episodes). Every objective supports both.",
+    )
+    parser.add_argument(
         "--design_cost_weight", type=float, default=0.0,
         help="[--design_objective safe_time] Decisions charged per unit of "
         "episode cost. 1.0 makes a careless nominal-ant crossing (~58 cost "
@@ -1558,9 +1672,72 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chop_freq", type=int, default=0,
         help="Env steps between GMM chops (0 = never). A chop retires the worst "
-        "HALF of the surviving components and resets the design optimizer, so "
+        "HALF of the surviving components and resets the design optimizer "
+        "(and the policy's, see --chop_resets_policy_optimizer), so "
         "8 -> 4 -> 2 -> 1. This is the only thing that makes the distribution "
         "commit to one design, since the mixture weights are frozen.",
+    )
+    parser.add_argument(
+        "--chop_scores", choices=["rollout", "ema"], default="rollout",
+        help="How a chop ranks the live components. 'rollout' (default since "
+        "2026-10-19, upstream's ComponentChopper): --chop_designs designs drawn "
+        "from each live component, one episode per lane from a fresh reset "
+        "under the current stochastic policy, scored by --design_objective. "
+        "'ema': a 0.9 moving average of the scores each component's training "
+        "samples earned -- every co-design run before 2026-10-19.",
+    )
+    parser.add_argument(
+        "--chop_designs", type=int, default=100,
+        help="[--chop_scores rollout] Designs drawn per live component at a "
+        "chop (upstream: 100). Every lane is used, so each design gets "
+        "num_envs // (chop_designs x live components) lanes; needs num_envs >= "
+        "chop_designs x --design_components.",
+    )
+    parser.add_argument(
+        "--chop_resets_policy_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reset the policy, value and cost-value Adam states at every chop, "
+        "as upstream resets its PPO optimizer (nlimb algorithm.py:108). "
+        "--no-chop_resets_policy_optimizer reproduces runs before 2026-10-19, "
+        "which reset only the design optimizer.",
+    )
+    parser.add_argument(
+        "--design_ranking", choices=["objective", "feasibility_first"], default="objective",
+        help="How the design search ranks designs, in the update and at chops. "
+        "'objective' (Schaff): by --design_objective alone, cost never enters. "
+        "'feasibility_first' (2026-10-19): Deb's rules -- a design within "
+        "--safety_budget that arrives in >= --design_min_arrival of its "
+        "episodes beats every design that does not; feasible designs rank by "
+        "the objective, infeasible ones by normalised violation; the update "
+        "uses rank utilities. At a chop a component counts as over budget only "
+        "beyond --chop_cost_z standard errors.",
+    )
+    parser.add_argument(
+        "--design_min_arrival", type=float, default=0.5,
+        help="[--design_ranking feasibility_first] Share of episodes a design "
+        "must finish (arrive) to count as feasible, so that a body that never "
+        "leaves the start cannot win on cost.",
+    )
+    parser.add_argument(
+        "--chop_cost_z", type=float, default=2.0,
+        help="[--design_ranking feasibility_first] At a chop, a component is "
+        "over budget only if its mean cost exceeds the budget by more than this "
+        "many standard errors (chops are irreversible).",
+    )
+    parser.add_argument(
+        "--body_from", type=str, default=None,
+        help="Train a SINGLE fixed body: the mode of a co-design run's design "
+        "distribution (a run dir or step dir holding design_state.npz). No "
+        "genes enter the observation, exactly like a nominal single-body run. "
+        "Written to <checkpoint dir>/fixed_body.npz, which eval_design.py reads.",
+    )
+    parser.add_argument(
+        "--design_grad_clip", type=float, default=0.5,
+        help="Clip EACH design's REINFORCE gradient to this global norm before "
+        "averaging over designs, as upstream clips each worker's robot gradient "
+        "(FlatGrad clip_norm = --grad_clip_norm 0.5). 0 = off, which every "
+        "co-design run before 2026-10-19 was.",
     )
     parser.add_argument(
         "--restore_checkpoint_path",
@@ -1616,12 +1793,30 @@ def validate(args: argparse.Namespace) -> None:
                 "Use --design_objective return to score by episode return "
                 "instead."
             )
-        if args.task not in ("run", "minefield"):
+        if args.task not in ("run", "minefield", "laserfield", "laserweb"):
             raise SystemExit(
                 f"--design_objective time is only defined for the corridor "
                 f"tasks (run, minefield), not --task {args.task}: GoToGoal "
                 f"respawns its goal mid-episode, so 'time to arrive' is not a "
                 f"per-episode property there. Use --design_objective return."
+            )
+    if args.design_optimization and args.design_ranking == "feasibility_first":
+        if args.chop_freq and args.chop_scores != "rollout":
+            raise SystemExit("--design_ranking feasibility_first ranks chops on fresh "
+                             "rollouts: it needs --chop_scores rollout.")
+        if args.penalizer in ("none",):
+            raise SystemExit("--design_ranking feasibility_first needs a cost budget; "
+                             "with --penalizer none there is nothing to be feasible against.")
+    if args.body_from and (args.num_morphologies or args.design_optimization):
+        raise SystemExit("--body_from trains ONE fixed body; drop --num_morphologies/--design_optimization.")
+    if args.design_optimization and args.chop_freq and args.chop_scores == "rollout":
+        need = args.chop_designs * args.design_components
+        if args.num_envs < need:
+            raise SystemExit(
+                f"--chop_scores rollout scores {args.chop_designs} designs from "
+                f"each of {args.design_components} components, one lane each at "
+                f"least: --num_envs {args.num_envs} < {need}. Lower "
+                f"--chop_designs or use --chop_scores ema."
             )
     if args.design_optimization:
         # AN ITERATION SHORTER THAN AN EPISODE BIASES THE SEARCH, quietly.
@@ -1692,6 +1887,73 @@ def resolve_checkpoint_logdir(args: argparse.Namespace) -> Optional[Path]:
     )
 
 
+def build_task_env(args: argparse.Namespace):
+    """The task env exactly as train() builds it (also used by scripts/bench)."""
+    common = dict(
+        robot=args.robot,
+        morphology_conditioning=bool(args.num_morphologies),
+        integrator=args.integrator,
+        solver_iterations=args.solver_iterations,
+        solver_ls_iterations=args.solver_ls_iterations,
+        hazard_size=args.hazard_size,
+        ground_contact_eps=args.ground_contact_eps,
+        hazard_footprint=args.hazard_footprint,
+        hazard_cost_shape=args.hazard_cost_shape,
+        foot_hazard_grid=args.foot_hazard_grid,
+        foot_hazard_grid_spacing=args.foot_hazard_grid_spacing,
+        foot_hazard_rings=args.foot_hazard_rings,
+        foot_hazard_ring_points=args.foot_hazard_ring_points,
+        foot_hazard_ring_r0=args.foot_hazard_ring_r0,
+    )
+    if args.task in ("run", "minefield", "lasers", "laserfield", "laserweb"):
+        corridor = dict(
+            lidar_groups=_HAZARD_LIDAR_GROUPS if args.hazard_lidar else (),
+            corridor_length=args.corridor_length,
+            corridor_half_width=args.corridor_half_width,
+            forward_reward_weight=args.forward_reward_weight,
+            ctrl_cost_weight=args.ctrl_cost_weight,
+            boundary_cost_weight=args.boundary_cost_weight,
+            corridor_walls=args.corridor_walls,
+            terminate_out_of_bounds=args.terminate_out_of_bounds,
+            exit_cost=args.exit_cost,
+            start_y_jitter=args.start_y_jitter,
+            hazard_step_on=args.hazard_step_on,
+            hazard_shaping_weight=args.hazard_shaping_weight,
+            hazard_shaping_radius=args.hazard_shaping_radius,
+            flip_cost=args.flip_cost,
+            foot_obstacle_obs=args.foot_obstacle_obs,
+            healthy_reward=args.healthy_reward,
+            terminate_on_flip=args.terminate_on_flip,
+            terminate_on_goal=args.terminate_on_goal,
+            goal_reward_weight=args.goal_reward_weight,
+            goal_observation=args.goal_observation,
+            finish_line=args.finish_line,
+            hazard_placement=args.hazard_placement,
+            lateral_observation=args.lateral_observation,
+            **common,
+        )
+        if args.task == "laserweb":
+            return LaserWeb(num_beams=args.num_beams, web_obs=args.web_obs, web_style=args.web_style, **corridor)
+        if args.task == "laserfield":
+            # 3D beams replace hazards; LaserField switches off the hazard
+            # lidar and foot grids itself (they would only carry zeros).
+            return LaserField(num_beams=args.num_beams, beam_obs=args.beam_obs, **corridor)
+        if args.task == "minefield":
+            # None lets Minefield apply its own default rather than this
+            # module deciding the count in two places.
+            return Minefield(num_hazards=args.num_hazards, **corridor)
+        if args.task == "lasers":
+            # Lasers has NO hazards, so --num_hazards is meaningless here
+            # and is deliberately not forwarded; --num_lasers is the knob.
+            return Lasers(
+                num_lasers=args.num_lasers,
+                laser_width=args.laser_width,
+                **corridor,
+            )
+        return RunForward(**corridor)
+    return GoToGoal(**common)
+
+
 def configure_backend(args: argparse.Namespace) -> str:
     """Pick the MJX implementation and size Warp's buffers. Must run before
     any env is constructed: envs put their model on the device in __init__."""
@@ -1716,65 +1978,21 @@ def train(args: argparse.Namespace):
         print(f"Checkpoints: {checkpoint_logdir}")
 
     def build_env():
-        common = dict(
-            robot=args.robot,
-            morphology_conditioning=bool(args.num_morphologies),
-            integrator=args.integrator,
-            solver_iterations=args.solver_iterations,
-            solver_ls_iterations=args.solver_ls_iterations,
-            hazard_size=args.hazard_size,
-            ground_contact_eps=args.ground_contact_eps,
-            hazard_footprint=args.hazard_footprint,
-            hazard_cost_shape=args.hazard_cost_shape,
-            foot_hazard_grid=args.foot_hazard_grid,
-            foot_hazard_grid_spacing=args.foot_hazard_grid_spacing,
-            foot_hazard_rings=args.foot_hazard_rings,
-            foot_hazard_ring_points=args.foot_hazard_ring_points,
-            foot_hazard_ring_r0=args.foot_hazard_ring_r0,
-        )
-        if args.task in ("run", "minefield", "lasers"):
-            corridor = dict(
-                lidar_groups=_HAZARD_LIDAR_GROUPS if args.hazard_lidar else (),
-                corridor_length=args.corridor_length,
-                corridor_half_width=args.corridor_half_width,
-                forward_reward_weight=args.forward_reward_weight,
-                ctrl_cost_weight=args.ctrl_cost_weight,
-                boundary_cost_weight=args.boundary_cost_weight,
-                corridor_walls=args.corridor_walls,
-                terminate_out_of_bounds=args.terminate_out_of_bounds,
-                exit_cost=args.exit_cost,
-                start_y_jitter=args.start_y_jitter,
-                hazard_step_on=args.hazard_step_on,
-                hazard_shaping_weight=args.hazard_shaping_weight,
-                hazard_shaping_radius=args.hazard_shaping_radius,
-                flip_cost=args.flip_cost,
-                foot_obstacle_obs=args.foot_obstacle_obs,
-                healthy_reward=args.healthy_reward,
-                terminate_on_flip=args.terminate_on_flip,
-                terminate_on_goal=args.terminate_on_goal,
-                goal_reward_weight=args.goal_reward_weight,
-                goal_observation=args.goal_observation,
-                finish_line=args.finish_line,
-                hazard_placement=args.hazard_placement,
-                **common,
-            )
-            if args.task == "minefield":
-                # None lets Minefield apply its own default rather than this
-                # module deciding the count in two places.
-                return Minefield(num_hazards=args.num_hazards, **corridor)
-            if args.task == "lasers":
-                # Lasers has NO hazards, so --num_hazards is meaningless here
-                # and is deliberately not forwarded; --num_lasers is the knob.
-                return Lasers(
-                    num_lasers=args.num_lasers,
-                    laser_width=args.laser_width,
-                    **corridor,
-                )
-            return RunForward(**corridor)
-        return GoToGoal(**common)
+        return build_task_env(args)
 
     env = build_env()
     eval_env = build_env()
+    if args.body_from:
+        genes = fixed_body_genes(args.body_from)
+        for e in (env, eval_env):
+            install_body(e, genes)
+        mj = env._mj_model
+        print(f"[fixed body] mode of {args.body_from}: genes {np.round(genes, 3).tolist()}, "
+              f"mass {mj.body_subtreemass[mj.body('robot').id]:.1f} kg")
+        if checkpoint_logdir is not None:
+            pathlib.Path(checkpoint_logdir).mkdir(parents=True, exist_ok=True)
+            np.savez(pathlib.Path(checkpoint_logdir) / "fixed_body.npz",
+                     genes=genes, source=str(args.body_from))
 
     # Composition order matters and is NOT arbitrary: any obs-shape-changing
     # wrapper (Saute, morphology randomization) must be applied to the raw
@@ -1816,6 +2034,7 @@ def train(args: argparse.Namespace):
             lr=args.design_lr,
             momentum=args.design_momentum,
             seed=args.seed,
+            clip_norm=args.design_grad_clip,
         )
         replicas = args.num_envs // args.num_morphologies
         init_params, _ = gmm.sample(args.num_morphologies)
@@ -1845,6 +2064,13 @@ def train(args: argparse.Namespace):
             chop_freq=args.chop_freq or None,
             objective=args.design_objective,
             cost_weight=args.design_cost_weight,
+            score_episodes=args.design_score_episodes,
+            chop_scores=args.chop_scores,
+            chop_designs=args.chop_designs,
+            ranking=args.design_ranking,
+            budget=args.safety_budget,
+            min_arrival=args.design_min_arrival,
+            chop_cost_z=args.chop_cost_z,
             action_repeat=args.action_repeat,
             max_decisions=args.episode_length // args.action_repeat,
             # Both movement terms telescope, so a straight full traverse pays
@@ -1911,6 +2137,7 @@ def train(args: argparse.Namespace):
         action_repeat=args.action_repeat,
         already_batched=bool(args.num_morphologies),
         track_episode_stats=bool(design_loop),
+        return_ceiling=design_loop.return_ceiling if design_loop is not None else None,
     )
     eval_env = wrap_for_brax_training(
         eval_env,
@@ -2005,6 +2232,7 @@ def train(args: argparse.Namespace):
         restore_checkpoint_path=args.restore_checkpoint_path,
         design_loop=design_loop,
         design_updates_per_eval=args.design_updates_per_eval,
+        chop_resets_optimizer=args.chop_resets_policy_optimizer,
         lagrange_components=lagrange_components(args),
         # Gated on the co-design path only. It is the faithful behaviour for any
         # gene-conditioned run, but switching it on for the existing path would

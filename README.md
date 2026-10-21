@@ -38,12 +38,31 @@ pip install mjx-safety-gym
 
 ## How to Use
 
-Two tasks and three robots ship here:
+Tasks and robots:
 
 | task (`--task`) | reward | notes |
 |---|---|---|
 | `goal` (`GoToGoal`) | shaped progress toward a randomly placed goal, `+1` per goal reached | the original environment |
 | `run` (`RunForward`) | `+x` displacement along an obstacle-strewn corridor | leaving the corridor is charged as **cost**, not walled off |
+| `minefield` (`Minefield`) | as `run` | 20 hazard discs, no vases (the main task) |
+| `laserfield` (`LaserField`) | as `run` | 3D laser beams, diagonal and sloped, redrawn per layout; any body part touching one pays; every beam blocks part of the corridor and leaves a walk-under passage |
+
+Training defaults since 2026-10-19 are large-batch PPO: 4096 envs, 32 minibatches x 128, learning rate 2e-4, Lagrange multiplier lr 6e-5 (co-design: 64 designs, 3 design updates per eval, design lr 0.08). Earlier runs used 512/1024 envs, batch 32, lr 1e-4, multiplier lr 1.5e-5; the old-run wrappers pin those.
+
+Co-design (`--design_optimization`) follows upstream nlimb (Schaff et al.) line by line since 2026-10-19, apart from its documented deviations (PPO-Lagrangian inner loop, speed objective, batched designs; see `mjx_safety_gym/design.py`). These changed:
+- a design's score averages all its finished episodes;
+- each design's gradient is clipped to norm 0.5;
+- a chop scores every live component with 100 fresh designs and resets the policy optimizer too;
+- the Adam arithmetic and phase boundaries are upstream's.
+
+Earlier co-design runs had none of these. `--design_score_episodes last --design_grad_clip 0 --chop_scores ema --no-chop_resets_policy_optimizer` reproduces them.
+
+Further options:
+- `--design_ranking feasibility_first` (2026-10-19) ranks designs by Deb's feasibility rules, both in the update and at chops. A design counts as feasible if it is under `--safety_budget` and arrives in at least `--design_min_arrival` of its episodes. Feasible designs rank by speed; the rest rank by how far they violate the constraints, and a body that does not arrive always ranks last.
+- `--body_from <co-design run>` trains a single fixed body: the evolved mode of that run.
+- `scripts/bench/` times environment stepping for this repo, the original mjx-safety-gym 0.1.6 and Safety-Gymnasium 1.0.0 on the same tasks. Run it with `cluster/vast/bench/run_bench.sh`.
+
+Corridor tasks observe the robot's lateral offset (y / corridor half-width) since 2026-10-15 (`--lateral_observation`, default on); older checkpoints load without it automatically.
 
 | robot (`--robot`) | what it is |
 |---|---|

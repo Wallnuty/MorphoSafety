@@ -1,0 +1,4 @@
+# 2026-10-19 smoke: feasibility-first co-design, fixed body, eval json
+smoke_ff	NAME=smoke_ff STEPS=40000000 DESIGN_TMAX=40000000 NUM_EVALS=3 DESIGN_UPDATES=2 CHOP_FREQ=10000000 STEPS_BEFORE=5000000 STEPS_AFTER=5000000 bash cluster/vast/remote_codesign.sh --hazard_placement random --seed 0 --design_ranking feasibility_first
+smoke_fixed	SAFE_NAME=smoke_fixed SAFE_BUDGET=2 SAFE_STEPS=10000000 SAFE_NUM_EVALS=2 SAFE_EXTRA="--hazard_placement random --body_from /root/MorphoSafety/checkpoints/smoke_ff" bash cluster/vast/remote_safe.sh
+smoke_eval	python scripts/eval_design.py --run checkpoints/smoke_ff --budget 2 --hazard_placement random --envs 32 --episodes 1 --json logs/eval/smoke_ff.json && python scripts/eval_design.py --run checkpoints/smoke_fixed --budget 2 --hazard_placement random --envs 32 --episodes 1 --json logs/eval/smoke_fixed.json

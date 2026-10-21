@@ -79,4 +79,5 @@ unset SAFE_RESUME                   # from scratch
 export SAFE_EPS=0.05                # this run's 5 cm gate; the default became 2 cm on 2026-09-28
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
+export SAFE_NUM_ENVS=1024 SAFE_NUM_MINIBATCHES=32 SAFE_BATCH_SIZE=32 SAFE_LEARNING_RATE=1e-4   # batch, as the runs these continue (defaults changed 2026-10-19)
 exec bash cluster/ant_minefield_safe_b50.sbatch

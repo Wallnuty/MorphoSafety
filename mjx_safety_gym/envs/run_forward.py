@@ -242,6 +242,13 @@ class RunForward(GoToGoal):
         # lanes (BraxAutoResetWrapper replays first_state), so there each lane
         # keeps ONE layout for the whole run.
         hazard_placement: str = "lattice",
+        # LATERAL OFFSET in the observation (2026-10-15): y / corridor_half_width,
+        # appended after the goal sensing. With the finish line the goal block
+        # carries x and heading but no y, so nothing told the policy how close
+        # the corridor edge was -- and leaving it ends the episode at cost 50.
+        # Off here so bare constructions reproduce older widths; the trainer
+        # turns it on through _ROBOT_DEFAULTS.
+        lateral_observation: bool = False,
         **kwargs,
     ):
         # Corridor dimensions default to a multiple of the robot's own arena
@@ -296,6 +303,7 @@ class RunForward(GoToGoal):
         # the Euclidean distance to a POINT and would pull the ant toward y=0.
         self._goal_reward_weight = 0.0 if self._finish_line else float(goal_reward_weight)
         self._goal_observation = bool(goal_observation)
+        self._lateral_observation = bool(lateral_observation)
 
         # Robots start at -L/2 + margin and run toward +L/2. Obstacles fill the
         # span between the start line and the far end.
@@ -705,8 +713,16 @@ class RunForward(GoToGoal):
         and a heading signal that degrades exactly when the ant is falling over
         would be worst where it is needed most.
         """
-        if not self._goal_observation:
-            return None
+        parts = []
+        if self._goal_observation:
+            parts.append(self._goal_sensing(data))
+        if self._lateral_observation:
+            y = data.site_xpos[self._robot_site_id][1]
+            parts.append(jp.reshape(y / self._corridor_half_width, (1,)))
+        return jp.concatenate(parts) if parts else None
+
+    def _goal_sensing(self, data: mjx.Data) -> jax.Array:
+        """The three goal entries of `task_observations` (see there)."""
         mat = data.xmat[self._robot_body_id].reshape(3, 3)
         yaw = jp.arctan2(mat[1, 0], mat[0, 0])
         if self._finish_line:
@@ -727,7 +743,7 @@ class RunForward(GoToGoal):
         ])
 
     def task_observation_size(self) -> int:
-        return 3 if self._goal_observation else 0
+        return (3 if self._goal_observation else 0) + (1 if self._lateral_observation else 0)
 
     # -- reward / cost -----------------------------------------------------
 

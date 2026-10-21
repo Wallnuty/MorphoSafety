@@ -185,6 +185,9 @@ def train(
     adaptive_budget_horizon: bool = False,
     design_loop=None,
     design_updates_per_eval: int = 1,
+    # Upstream resets the POLICY optimizer at every chop as well as the design
+    # one (nlimb algorithm.py:108). Off reproduces runs before 2026-10-19.
+    chop_resets_optimizer: bool = True,
     unnormalized_obs_tail: int = 0,
     unnormalized_obs_tail_offset: int = 0,
     # >1: one Lagrange multiplier per design-distribution component (co-design
@@ -422,6 +425,61 @@ def train(
             metrics,
         )  # pytype: disable=bad-return-type  # py311-upgrade
 
+    def _reset_optimizers(ts: TrainingState) -> TrainingState:
+        # Fresh Adam moments AND step counts for every network, as
+        # `self.mpi_adam.reset()` after a chop: upstream's one MpiAdam covers
+        # its policy and value nets; here that is policy, value and cost value.
+        # The Lagrange multipliers have no upstream counterpart and keep theirs.
+        return ts.replace(
+            optimizer_state=(
+                policy_optimizer.init(ts.params.policy),
+                value_optimizer.init(ts.params.value),
+                cost_value_optimizer.init(ts.params.cost_value),
+            )
+        )
+
+    reset_optimizers = jax.pmap(_reset_optimizers, axis_name=_PMAP_AXIS_NAME)
+
+    first_episode = None
+    if design_loop is not None:
+        # The *_last latches score the episode; the *_sum ones (which after a
+        # single episode hold that same episode) let design.py cross-check its
+        # two scoring paths on every chop.
+        _latch_keys = (
+            "ep_count", "ep_return_last", "ep_len_last", "ep_arrived_last",
+            "ep_cost_last", "ep_dx_last", "ep_return_sum", "ep_speed_sum",
+            "ep_arrived_sum", "ep_arrived_len_sum", "ep_fitness_sum", "ep_cost_sum",
+        )
+
+        def _first_episode(ts: TrainingState, state: envs.State, key: PRNGKey):
+            # Upstream's ComponentChopper.test_robot: ONE episode per lane from a
+            # fresh reset, under the current STOCHASTIC policy (`actor.act`
+            # samples). Every lane is done by num_decision_steps (truncation). A
+            # lane that ends early auto-resets into a second episode whose
+            # latches would overwrite the first, so each lane's are frozen at its
+            # first done.
+            policy = make_policy(
+                (ts.normalizer_params, ts.params.policy, ts.params.value)
+            )
+
+            def step(carry, _):
+                state, latch, seen, key = carry
+                key, k = jax.random.split(key)
+                action, _ = policy(state.obs, k)
+                state = env.step(state, action)
+                new = (state.info["ep_count"] > 0) & ~seen
+                latch = {n: jnp.where(new, state.info[n], latch[n]) for n in latch}
+                return (state, latch, seen | new, key), None
+
+            latch = {n: jnp.zeros_like(state.info[n]) for n in _latch_keys if n in state.info}
+            seen = jnp.zeros(state.info["ep_count"].shape, dtype=bool)
+            (_, latch, seen, _), _ = jax.lax.scan(
+                step, (state, latch, seen, key), (), length=num_decision_steps
+            )
+            return latch, seen
+
+        first_episode = jax.pmap(_first_episode, axis_name=_PMAP_AXIS_NAME)
+
     # Initialize model params and training state.
     init_params = ppo_losses.SafePPONetworkParams(
         policy=ppo_network.policy_network.init(key_policy),
@@ -604,6 +662,39 @@ def train(
     training_metrics: Metrics = {}
     training_walltime = 0.0
     current_step = 0
+
+    chop_key = jax.random.fold_in(key_env, 0xC40)  # its own stream
+
+    def chop_rollout(fields, genes, components):
+        """One episode per lane on a population `design_loop` built, under the
+        CURRENT training_state's stochastic policy; each lane's first-episode
+        latches, flat. The next iteration's design reset replaces this state."""
+        nonlocal chop_key
+        chop_key, k_reset, k_roll = jax.random.split(chop_key, 3)
+        reset_keys = jnp.reshape(
+            jax.random.split(k_reset, num_envs // process_count),
+            (local_devices_to_use, -1, 2),
+        )
+        state = design_reset_fn(reset_keys, fields, genes, components)
+        t = time.time()
+        latch, seen = first_episode(
+            training_state, state, jax.random.split(k_roll, local_devices_to_use)
+        )
+        seen = np.asarray(seen).ravel()
+        if not seen.all():
+            raise RuntimeError(
+                f"chop rollout: {int((~seen).sum())} lanes never finished an "
+                f"episode in {num_decision_steps} decisions"
+            )
+        count = np.asarray(latch["ep_count"]).ravel()
+        if not np.all(count == 1):
+            raise RuntimeError(
+                f"chop rollout: latched episode counts {np.unique(count)}, not "
+                f"all 1 -- the latch did not freeze at the first episode"
+            )
+        print(f"chop rollout: {seen.size} lanes, one episode each, "
+              f"{time.time() - t:.1f} s", flush=True)
+        return {k: np.asarray(v).ravel() for k, v in latch.items()}
     _total_design_iters = (
         num_evals_after_init * max(num_resets_per_eval, 1) * design_iters_per_eval
     )
@@ -636,8 +727,13 @@ def train(
             current_step = int(_unpmap(training_state.env_steps))
             if design_loop is not None:
                 training_metrics = dict(training_metrics)
-                _dm = design_loop.finish_iteration(env_state, current_step)
+                _dm = design_loop.finish_iteration(
+                    env_state, current_step, rollout_fn=chop_rollout
+                )
                 training_metrics.update(_dm)
+                if _dm.get("design/chopped") and chop_resets_optimizer:
+                    training_state = reset_optimizers(training_state)
+                    print("chop: policy, value and cost-value Adam states reset", flush=True)
                 # ONE LINE PER DESIGN ITERATION.
                 #
                 # `progress_fn` fires only at evals, and `training_metrics` is
@@ -666,6 +762,11 @@ def train(
                     )
                     if k in _dm
                 )
+                _cs = sorted(k for k in _dm if k.startswith("design/chop_score_c"))
+                if _cs:  # what the chop ranked the components by
+                    _flags += " chop_scores=[" + " ".join(
+                        f"c{k[len('design/chop_score_c'):]}:{_dm[k]:.4g}" for k in _cs
+                    ) + "]"
                 if lagrange_components > 1:
                     # Lambda of each LIVE component, epoch-averaged.
                     _lam = " ".join(
@@ -680,8 +781,10 @@ def train(
                     f"score={_dm['design/score_mean']:+9.3f} "
                     f"comp={_dm['design/components']:.0f} "
                     f"ep/design={_dm['design/episodes_per_design']:.1f} "
-                    f"arrive={_dm.get('design/arrival_rate', float('nan')):.2f}"
-                    f" mode=[{_mode}]{_flags}",
+                    f"arrive={_dm.get('design/arrival_rate', float('nan')):.2f} "
+                    f"cost={_dm.get('design/design_cost_mean', float('nan')):.2f}"
+                    + (f" feas={_dm['design/feasible_frac']:.2f}" if "design/feasible_frac" in _dm else "")
+                    + f" mode=[{_mode}]{_flags}",
                     flush=True,
                 )
             key_env, tmp_key = jax.random.split(key_env)

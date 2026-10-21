@@ -46,6 +46,22 @@ DELIBERATE FIDELITY CHOICES, each mirroring the reference:
     clipped into the design box, but `envs.py` keeps `unclipped_params` for the
     gradient -- otherwise a proposal outside the box gets zero gradient and the
     distribution can never be pulled back inward.
+  * EACH DESIGN'S GRADIENT IS CLIPPED TO GLOBAL NORM 0.5 BEFORE AVERAGING
+    (2026-10-19). Upstream gives every MPI worker one robot, takes
+    `FlatGrad(clip_norm=args.clip_norm)` of that robot's loss
+    (`algorithm.py:57`; `--grad_clip_norm 0.5`, `init.py:85`, `train.py:25`)
+    and MpiAdam averages the clipped gradients over workers
+    (`mpi_adam.py:30-32`). One design here is one worker.
+  * Adam is MpiAdam's own arithmetic (`mpi_adam.py:34-38`): eps 1e-5 is added
+    to the UNcorrected sqrt(v).
+  * A chop scores every live component afresh: 100 designs drawn from it, one
+    episode each under the current stochastic policy (`component_chopper.py`),
+    and it resets BOTH optimizers -- the design's here, the policy's in
+    `ppo/train.py` (`algorithm.py:105-109`).
+
+Every co-design run before 2026-10-19 lacked the clip, the policy-optimizer
+reset and the fresh chop rollouts, and scored each lane by its last episode
+only; see `DesignLoop` for the flags that reproduce them.
 
 DEVIATION FROM THE PAPER, the one this project exists for: the inner loop is
 PPO-Lagrangian under a cost budget, not plain PPO, and each GMM component
@@ -101,12 +117,15 @@ def _words_to_u128(words) -> int:
 
 @dataclasses.dataclass
 class Adam:
-    """Minimal Adam, matching `MpiAdam(epsilon=1e-5, beta1=robot_momentum)`.
+    """`MpiAdam(epsilon=1e-5, beta1=robot_momentum)`, arithmetic included.
 
     Separate from the policy optimizer on purpose: upstream keeps a distinct
     `mpi_adam_robot` and RESETS it after every chop, because the surviving
     components face a different objective landscape once their neighbours are
     gone and stale moments would drag them.
+
+    Two instances (means, log-stds) behave exactly like upstream's single one
+    over the flat vector: Adam is elementwise and both step and reset together.
     """
 
     shape: tuple[int, ...]
@@ -126,13 +145,19 @@ class Adam:
         self.t = 0
 
     def step(self, grad: np.ndarray, lr: float) -> np.ndarray:
-        """Returns the update to SUBTRACT from the parameter."""
+        """Returns the update to SUBTRACT from the parameter.
+
+        MpiAdam.update line for line (`mpi_adam.py:34-38`): the bias correction
+        is folded into the step size and eps goes on the UNcorrected sqrt(v).
+        The textbook form, mhat / (sqrt(vhat) + eps), which this used before
+        2026-10-19, is the same with eps / sqrt(1 - beta2^t) in place of eps --
+        3.2e-4 at the first step after a reset, 1e-5 in the limit.
+        """
         self.t += 1
+        a = lr * np.sqrt(1 - self.beta2**self.t) / (1 - self.beta1**self.t)
         self.m = self.beta1 * self.m + (1 - self.beta1) * grad
         self.v = self.beta2 * self.v + (1 - self.beta2) * grad**2
-        mhat = self.m / (1 - self.beta1**self.t)
-        vhat = self.v / (1 - self.beta2**self.t)
-        return lr * mhat / (np.sqrt(vhat) + self.eps)
+        return a * self.m / (np.sqrt(self.v) + self.eps)
 
 
 class GmmDesignDistribution:
@@ -153,11 +178,16 @@ class GmmDesignDistribution:
         beta2: float = 0.999,
         seed: int = 0,
         mean_init: np.ndarray | None = None,
+        clip_norm: float | None = 0.5,
     ) -> None:
         self.n_params = int(n_params)
         self.n_components = int(n_components)
         self.rng = np.random.default_rng(seed)
         self.lr = float(lr)
+        # Per-design gradient clip (upstream --grad_clip_norm 0.5); None or 0
+        # turns it off, as every co-design run before 2026-10-19 had it.
+        self.clip_norm = float(clip_norm) if clip_norm else None
+        self.last_clipped = 0.0  # share of the last update's samples clipped
 
         if mean_init is not None:
             means = np.tile(np.asarray(mean_init, dtype=float), (self.n_components, 1))
@@ -268,6 +298,13 @@ class GmmDesignDistribution:
         accumulated ONLY into the component that drew each sample, and divided
         by the total sample count because the loss is a mean over samples (not
         per component).
+
+        With `clip_norm`, each sample's gradient is first scaled as
+        tf.clip_by_global_norm does, by clip_norm / max(norm, clip_norm), the
+        norm taken over everything that sample touches (its component's means
+        and log-stds; every other entry of upstream's flat gradient is zero).
+        Upstream's per-worker loss is over a batch of ONE robot, so this is its
+        FlatGrad followed by MpiAdam's average over workers.
         """
         params = np.asarray(params, dtype=float)
         scores = np.asarray(scores, dtype=float)
@@ -278,6 +315,12 @@ class GmmDesignDistribution:
 
         d_mu = -(params - mu) / sd**2 * scores[:, None]
         d_logsd = (1.0 - z**2) * scores[:, None]
+        if self.clip_norm:
+            norm = np.sqrt(np.sum(d_mu**2, axis=1) + np.sum(d_logsd**2, axis=1))
+            scale = self.clip_norm / np.maximum(norm, self.clip_norm)
+            d_mu = d_mu * scale[:, None]
+            d_logsd = d_logsd * scale[:, None]
+            self.last_clipped = float(np.mean(norm > self.clip_norm))
 
         g_mu = np.zeros_like(self.means)
         g_logsd = np.zeros_like(self.log_stds)
@@ -301,13 +344,16 @@ class GmmDesignDistribution:
         # Dead components must not drift: they are still indexed by `means`, and
         # a resurrected-looking mean would be misleading in logs.
         dead = ~self.alive
-        return {
+        out = {
             "design/loss": float(np.mean(self.neglogp(params, comps) * norm)),
             "design/grad_norm": float(np.linalg.norm(g_mu)),
             "design/components": float(self.components_left()),
             "design/mean_std": float(np.exp(self.log_stds[self.alive]).mean()),
             "design/dead": float(dead.sum()),
         }
+        if self.clip_norm:
+            out["design/clipped_frac"] = self.last_clipped
+        return out
 
     # -- annealing ---------------------------------------------------------
 
@@ -337,8 +383,9 @@ class GmmDesignDistribution:
             self.log_mixprobs[i] = _DEAD
             killed.append(int(i))
         if killed:
-            # Upstream resets BOTH optimizers after a chop; the policy's is
-            # reset by the caller.
+            # Upstream resets BOTH optimizers after a chop. The policy's is
+            # reset in ppo/train.py when it sees design/chopped -- which it did
+            # NOT do before 2026-10-19, although this comment already said so.
             self._adam_mean.reset()
             self._adam_logstd.reset()
         return killed
@@ -470,6 +517,58 @@ class GmmDesignDistribution:
             )
 
 
+def feasibility_first_order(
+    score: np.ndarray,
+    cost: np.ndarray,
+    arrival: np.ndarray,
+    budget: float,
+    min_arrival: float,
+    cost_slack: np.ndarray | float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Deb's feasibility rules (Deb 2000), best first, with the two
+    constraints in priority order. Returns (order, feasible, violation).
+
+    A design is FEASIBLE when its mean episode cost is within the budget AND it
+    arrives in at least `min_arrival` of its episodes. The order is:
+
+      1. feasible designs, by `score` (the design objective, higher first);
+      2. designs that arrive but exceed the budget, by cost excess (lower first);
+      3. designs that do not arrive often enough, by arrival shortfall, then
+         cost excess.
+
+    Arrival comes before cost on purpose. Summing normalised violations (Deb's
+    usual choice) caps a body that never leaves the start at a violation of 1
+    while cost excess is unbounded, so on a task where no body meets the budget
+    the motionless body would win -- "safe by not moving". Here no body that
+    fails to arrive can outrank one that crosses. `cost_slack` widens the
+    budget per design (the chop passes z x SE, so a component counts as over
+    budget only when it is CLEARLY over). `violation` (logged only) is the
+    normalised sum.
+    """
+    score = np.asarray(score, dtype=float)
+    excess = np.asarray(cost, dtype=float) - budget - np.asarray(cost_slack, dtype=float)
+    short = min_arrival - np.asarray(arrival, dtype=float)
+    arrives = short <= 0.0
+    feasible = (excess <= 0.0) & arrives
+    tier = np.where(feasible, 0, np.where(arrives, 1, 2))
+    within = np.where(tier == 0, -score, np.where(tier == 1, excess, short))
+    tiebreak = np.where(tier == 2, excess, 0.0)
+    order = np.lexsort((tiebreak, within, tier))
+    violation = np.maximum(excess, 0.0) / max(budget, 1.0)
+    if min_arrival > 0:
+        violation = violation + np.maximum(short, 0.0) / min_arrival
+    return order, feasible, violation
+
+
+def rank_utilities(order: np.ndarray) -> np.ndarray:
+    """Utility per item from a best-first order: n-1 for the best, 0 for the
+    worst. normalize_scores then standardises them, which makes the REINFORCE
+    weights the centred ranks of NES fitness shaping."""
+    u = np.empty(len(order), dtype=float)
+    u[order] = np.arange(len(order) - 1, -1, -1, dtype=float)
+    return u
+
+
 class DesignLoop:
     """Host-side driver: sample designs, build bodies, score them, update the GMM.
 
@@ -492,16 +591,31 @@ class DesignLoop:
                                            so the policy fine-tunes on the one
                                            body that will be reported.
 
-    DEVIATION, stated plainly: upstream scores a component for chopping by
-    drawing 100 designs from it and rolling each out under the current policy
-    (`component_chopper.py`). Here each component's score is an exponential
-    moving average of the scores its own samples already earned during
-    training (see `scores_from` -- time-to-goal by default, not return). The
-    DECISION RULE is unchanged -- kill the worst half, 8 -> 4 -> 2 -> 1, reset
-    Adam -- but the estimate costs no extra rollouts and is
-    pooled over far more samples than 100. It is lagged, though: the average
-    spans a window over which both the component and the policy moved, where
-    upstream's is computed fresh at the moment of the chop.
+    Upstream's step order (`core.py:step`) is _before_step at t, rollout,
+    t += steps, _update_model at the new t. So, with `start`/`end` the design
+    axis at either end of an iteration, everything below is upstream's
+    condition verbatim:
+
+        sampled stochastically   tmax - start >= steps_after
+        design update            end >= steps_before and tmax - end >= steps_after
+        its lr                   robot_lr * max(0, 1 - start / tmax)
+        chop, after the update   end // chop_freq != start // chop_freq
+                                 and start > steps_before and end < tmax
+                                 (the loop stops at t >= tmax first)
+
+    CHOP SCORES (`chop_scores`). "rollout" (default since 2026-10-19) is
+    upstream's ComponentChopper: `chop_designs` (100) designs drawn from EACH
+    live component, one episode per lane from a fresh reset under the current
+    stochastic policy, scored by the design objective, averaged per component.
+    Every lane is used, so each design gets num_envs // (100 x live) lanes (5
+    at 4096 envs and 8 components) where upstream ran one episode: the same
+    estimate with less episode noise. "ema" is what every run before then did:
+    an exponential moving average (0.9) of the scores the component's own
+    samples earned in training. That was documented as pooling far more than
+    100 samples, but per DESIGN its effective window is ~19 samples, spread
+    over iterations in which both the component and the policy moved, and the
+    components are compared on scores taken at different times. Upstream
+    compares them under one policy at one moment.
     """
 
     def __init__(
@@ -522,7 +636,39 @@ class DesignLoop:
         max_decisions: int | None = None,
         return_ceiling: float | None = None,
         cost_weight: float = 0.0,
+        score_episodes: str = "all",
+        chop_scores: str = "rollout",
+        chop_designs: int = 100,
+        ranking: str = "objective",
+        budget: float | None = None,
+        min_arrival: float = 0.5,
+        chop_cost_z: float = 2.0,
     ) -> None:
+        # How designs are ranked for the update AND the chops. "objective"
+        # (Schaff): by the design objective alone; cost never enters.
+        # "feasibility_first": Deb's rules on (objective, cost, arrival) via
+        # `feasibility_first_order`, with rank utilities in the update and a
+        # cost allowance of chop_cost_z standard errors at the chops (a chop
+        # is irreversible, so only a CLEARLY infeasible component loses on
+        # feasibility).
+        if ranking not in ("objective", "feasibility_first"):
+            raise ValueError(f"ranking must be 'objective' or 'feasibility_first', got {ranking!r}")
+        if ranking == "feasibility_first" and budget is None:
+            raise ValueError("ranking='feasibility_first' needs the safety budget")
+        self.ranking = ranking
+        self.budget = budget
+        self.min_arrival = float(min_arrival)
+        self.chop_cost_z = float(chop_cost_z)
+        if chop_scores not in ("rollout", "ema"):
+            raise ValueError(f"chop_scores must be 'rollout' or 'ema', got {chop_scores!r}")
+        self.chop_scores = chop_scores
+        self.chop_designs = int(chop_designs)
+        # "all" (default since 2026-10-19, as upstream): a design's score is the
+        # mean over EVERY episode its lanes finished this iteration. "last"
+        # reproduces earlier runs: one (the most recent) episode per lane.
+        if score_episodes not in ("all", "last"):
+            raise ValueError(f"score_episodes must be 'all' or 'last', got {score_episodes!r}")
+        self.score_episodes = score_episodes
         self.gmm = gmm
         self._spec_factory = spec_factory  # genes array -> MorphologySpec
         self._batch_builder = batch_builder  # (specs, replicas) -> (base, fields, genes)
@@ -604,17 +750,58 @@ class DesignLoop:
     # -- per-iteration ----------------------------------------------------
 
     def _frozen(self, step: int) -> bool:
-        """Is the design frozen at the mode for the final fine-tune phase?
+        """Is the design sampled at the mode (final fine-tune) from `step` on?
 
-        The `> 0` guard is load-bearing: without it the default
-        `steps_after_update = 0` makes this true the moment `step` passes
-        `tmax`, which silently stops updating the distribution for the last
-        iterations of every run. Caught in the first smoke test, where
-        `design/updating` read 0 at the final eval.
+        Upstream's `not stochastic`, `tmax - t < steps_after_robot_update`,
+        verbatim. Before 2026-10-19 this carried a `steps_after_update > 0`
+        guard; it only ever differed past tmax, where upstream's loop has
+        already stopped.
         """
-        return self.steps_after_update > 0 and (
-            self.tmax - step
-        ) < self.steps_after_update
+        return (self.tmax - step) < self.steps_after_update
+
+    def _updating(self, step: int) -> bool:
+        """Upstream's design-update condition at the END of an iteration
+        (`algorithm.py:116`): the burn-in is over and the fine-tune has not
+        begun. Its last iteration can end past tmax, which this excludes as
+        upstream does (`tmax - t >= steps_after` fails there even at 0)."""
+        return (
+            step >= self.steps_before_update
+            and (self.tmax - step) >= self.steps_after_update
+        )
+
+    def _lanes(self, params: np.ndarray, comps: np.ndarray, n_devices: int, n_envs: int, reps: int):
+        """Build `params` as bodies, `reps` contiguous lanes each, padded to
+        `n_envs` lanes with copies of design 0. Device-shaped (fields, genes,
+        components), plus how many leading lanes are real.
+
+        Built 64 designs at a time: build_design_batch puts every model on the
+        device before stacking its fields, and a chop draws up to 800.
+        """
+        import jax.numpy as jp
+
+        n_real = len(params) * reps
+        if n_real > n_envs or reps < 1:
+            raise ValueError(f"{len(params)} designs x {reps} lanes do not fit {n_envs} lanes")
+        chunks = []
+        genes01 = self.gmm.to_genes(params)
+        for i in range(0, len(params), 64):
+            specs = [self._spec_factory(g) for g in genes01[i : i + 64]]
+            _, f, g = self._batch_builder(specs, reps)
+            chunks.append((f, g))
+        fields = {k: jp.concatenate([f[k] for f, _ in chunks]) for k in chunks[0][0]}
+        genes = jp.concatenate([g for _, g in chunks])
+        lane_comps = np.repeat(comps, reps)
+        if n_real < n_envs:
+            pad = n_envs - n_real
+            fields = {k: jp.concatenate([v, jp.repeat(v[:1], pad, axis=0)]) for k, v in fields.items()}
+            genes = jp.concatenate([genes, jp.repeat(genes[:1], pad, axis=0)])
+            lane_comps = np.concatenate([lane_comps, np.full(pad, lane_comps[0])])
+        fields = {k: jp.reshape(v, (n_devices, -1) + v.shape[1:]) for k, v in fields.items()}
+        genes = jp.reshape(genes, (n_devices, -1) + genes.shape[1:])
+        # Lanes are BLOCKED (each design's `reps` lanes are contiguous), so the
+        # lane -> component map is a repeat.
+        components = jp.reshape(jp.asarray(lane_comps, dtype=jp.int32), (n_devices, -1))
+        return fields, genes, components, n_real
 
     def sample(self, n_devices: int, n_envs: int):
         """Draw a population and compile it.
@@ -631,20 +818,9 @@ class DesignLoop:
         else:
             params, comps = self.gmm.sample(self.num_morphologies)
         self._pending = (params, comps)
-
-        specs = [self._spec_factory(g) for g in self.gmm.to_genes(params)]
-        replicas = n_envs // self.num_morphologies
-        _, fields, genes = self._batch_builder(specs, replicas)
-        import jax.numpy as jp
-
-        fields = {
-            k: jp.reshape(v, (n_devices, -1) + v.shape[1:]) for k, v in fields.items()
-        }
-        genes = jp.reshape(genes, (n_devices, -1) + genes.shape[1:])
-        # Lanes are BLOCKED by design (build_design_batch repeats each spec
-        # `replicas` times contiguously), so the lane->component map is a repeat.
-        components = jp.reshape(
-            jp.asarray(np.repeat(comps, replicas), dtype=jp.int32), (n_devices, -1)
+        self._shape = (n_devices, n_envs)  # the chop rollouts reuse it
+        fields, genes, components, _ = self._lanes(
+            params, comps, n_devices, n_envs, n_envs // self.num_morphologies
         )
         return fields, genes, components
 
@@ -655,9 +831,12 @@ class DesignLoop:
         spec `replicas` times contiguously -- so a flat reshape recovers the
         per-design grouping.
 
-        TWO OBJECTIVES, and the default is NOT the upstream one:
+        FOUR OBJECTIVES, and the default is NOT the upstream one. `"speed"`
+        (default since 2026-09-18, the user's call) is net +x per decision with
+        a non-arrival charged the full horizon; see `_lane_scores`. `"safe_time"`
+        is `"time"` plus cost_weight x episode cost. The other two:
 
-        `objective="time"` (default) scores a design by how long it takes to
+        `objective="time"` scores a design by how long it takes to
         reach the goal, negated so that higher is better. This is the same
         scalar `scripts/eval_morphology.time_fitness` computes, so a design's
         training score and its offline evaluation are the same quantity:
@@ -697,19 +876,45 @@ class DesignLoop:
         objective silently degenerates to a constant.
         """
         info = env_state.info
+        counts = np.asarray(info["ep_count"]).reshape(self.num_morphologies, -1).sum(axis=1)
+        if self.score_episodes == "all":
+            scores, self._aux = self._episode_means(info, counts)
+        else:
+            lane, self._aux = self._lane_scores(info)
+            scores = lane.reshape(self.num_morphologies, -1).mean(axis=1)
+        return scores, counts
+
+    def _cost_arrival(self, info, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per design: mean episode cost and share of episodes that arrived,
+        over the same episodes its score uses (all finished ones, or each
+        lane's last)."""
         shape = (self.num_morphologies, -1)
-        cnt = np.asarray(info["ep_count"]).reshape(shape)
-        ret = np.asarray(info["ep_return_last"]).reshape(shape)
-        counts = cnt.sum(axis=1)
+        if self.score_episodes == "all":
+            n = np.maximum(counts, 1.0)
+            tot = lambda k: np.asarray(info[k], dtype=float).reshape(shape).sum(axis=1)
+            return tot("ep_cost_sum") / n, tot("ep_arrived_sum") / n
+        cost = np.asarray(info["ep_cost_last"], dtype=float).reshape(shape).mean(axis=1)
+        arr = (np.asarray(info["ep_arrived_last"]).reshape(shape) > 0).mean(axis=1)
+        return cost, arr
 
+    def _lane_scores(self, info) -> tuple[np.ndarray, dict[str, float]]:
+        """Each lane's LAST finished episode, scored (higher is better), flat
+        over lanes; plus the aux metrics in natural units.
+
+        `score_episodes="last"` averages these per design. The chop rollouts
+        use them too: there every lane has run exactly one episode.
+        """
+        ret = np.asarray(info["ep_return_last"], dtype=float).ravel()
         if self.objective == "return":
-            self._aux = {}
-            return ret.mean(axis=1), counts
-
-        arrived = np.asarray(info["ep_arrived_last"]).reshape(shape) > 0
-        decisions = (
-            np.asarray(info["ep_len_last"]).reshape(shape) / self.action_repeat
-        )
+            return ret, {}
+        arrived = np.asarray(info["ep_arrived_last"]).ravel() > 0
+        decisions = np.asarray(info["ep_len_last"], dtype=float).ravel() / self.action_repeat
+        arr = {
+            "design/arrival_rate": float(arrived.mean()),
+            "design/arrival_decisions": (
+                float(decisions[arrived].mean()) if arrived.any() else float("nan")
+            ),
+        }
         if self.objective == "speed":
             # THE DEFAULT SINCE 2026-09-18 (user's call): distance travelled per
             # decision. Net +x displacement of the episode over its duration --
@@ -722,68 +927,169 @@ class DesignLoop:
             # the corridor tasks provide (RunForward info["dx"]).
             if "ep_dx_last" not in info:
                 raise KeyError("objective='speed' needs info['ep_dx_last'] (corridor tasks only)")
-            dx = np.asarray(info["ep_dx_last"]).reshape(shape)
+            dx = np.asarray(info["ep_dx_last"], dtype=float).ravel()
             charged = np.where(arrived, decisions, float(self.max_decisions))
             speed = dx / np.maximum(charged, 1.0)
-            self._aux = {
-                "design/speed_mean": float(speed.mean()),
-                "design/arrival_rate": float(arrived.mean()),
-                "design/arrival_decisions": (
-                    float(decisions[arrived].mean()) if arrived.any() else float("nan")
-                ),
-            }
-            return speed.mean(axis=1), counts
+            return speed, {"design/speed_mean": float(speed.mean()), **arr}
         shortfall = np.clip(1.0 - ret / self.return_ceiling, 0.0, 1.0)
-        fitness = np.where(
-            arrived, decisions, self.max_decisions * (1.0 + shortfall)
-        )
+        fitness = np.where(arrived, decisions, self.max_decisions * (1.0 + shortfall))
+        aux: dict[str, float] = {}
         if self.objective == "safe_time":
-            cost = np.asarray(info["ep_cost_last"]).reshape(shape)
+            cost = np.asarray(info["ep_cost_last"], dtype=float).ravel()
             fitness = fitness + self.cost_weight * cost
-            self._aux = {"design/cost_mean": float(cost.mean())}
-        else:
-            self._aux = {}
+            aux["design/cost_mean"] = float(cost.mean())
         # Reported in the natural units as well as the negated score, because
         # "design/score_mean = -212" is not a number anyone can sanity-check
         # against a rollout, and 212 decisions is.
-        self._aux.update({
-            "design/fitness_decisions": float(fitness.mean()),
-            "design/arrival_rate": float(arrived.mean()),
+        aux.update({"design/fitness_decisions": float(fitness.mean()), **arr})
+        return -fitness, aux
+
+    def _episode_means(
+        self, info, counts: np.ndarray, groups: int | None = None
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        """Per design, the mean score over EVERY episode its lanes finished
+        this iteration (upstream: np.mean(ep_rews), `envs.py:296`), from the
+        per-lane sums EpisodeStatsWrapper keeps. Same per-episode quantity as
+        `_lane_scores`; aux metrics are means over all finished episodes.
+        `groups` (default: one per design) is how many blocks the lanes form."""
+        shape = (groups or self.num_morphologies, -1)
+
+        def total(key):
+            if key not in info:
+                raise KeyError(f"score_episodes='all' needs info[{key!r}] (EpisodeStatsWrapper)")
+            return np.asarray(info[key], dtype=float).reshape(shape).sum(axis=1)
+
+        n = np.maximum(counts, 1.0)
+        n_all = max(float(counts.sum()), 1.0)
+        n_arr = float(total("ep_arrived_sum").sum())
+        arr = {
+            "design/arrival_rate": n_arr / n_all,
             "design/arrival_decisions": (
-                float(decisions[arrived].mean()) if arrived.any() else float("nan")
+                float(total("ep_arrived_len_sum").sum()) / n_arr / self.action_repeat
+                if n_arr > 0 else float("nan")
             ),
-        })
-        return -fitness.mean(axis=1), counts
+        }
+        if self.objective == "return":
+            return total("ep_return_sum") / n, {}
+        if self.objective == "speed":
+            if "ep_dx_last" not in info:
+                raise KeyError("objective='speed' needs info['ep_dx_last'] (corridor tasks only)")
+            # Per-episode speeds are summed in inner steps; x action_repeat
+            # makes them per decision.
+            speed = total("ep_speed_sum") * self.action_repeat
+            return speed / n, {"design/speed_mean": float(speed.sum()) / n_all, **arr}
+        fitness = total("ep_fitness_sum")
+        if not np.all(np.isfinite(fitness)):
+            raise RuntimeError(
+                "ep_fitness_sum is NaN: EpisodeStatsWrapper was built without "
+                "return_ceiling, so the time fitness was never accumulated."
+            )
+        aux: dict[str, float] = {}
+        if self.objective == "safe_time":
+            cost = total("ep_cost_sum")
+            fitness = fitness + self.cost_weight * cost
+            aux["design/cost_mean"] = float(cost.sum()) / n_all
+        aux.update({"design/fitness_decisions": float(fitness.sum()) / n_all, **arr})
+        return -fitness / n, aux
 
-    def _chop_due(self, step: int) -> bool:
-        """Upstream's chop rule (`algorithm.py:_before_step`), 2026-09-28.
+    def _chop_due(self, start: int, end: int) -> bool:
+        """Upstream's chop rule (`algorithm.py:102-106`), verbatim since
+        2026-10-19: at `_before_step` with t = `end` and t_prev = `start`,
+        chop when the iteration crossed a multiple of chop_freq and began after
+        the burn-in. With Schaff's ant schedule (burn-in 200M, chop_freq 200M)
+        that is 400M, 600M, 800M. `end < tmax` because upstream's loop stops at
+        t >= tmax before another _before_step can run.
 
-        Chop at every multiple of `chop_freq` crossed AFTER the burn-in: the
-        first is the first multiple strictly past `steps_before_update`, the
-        next the multiple after the last chop. With Schaff's ant schedule
-        (burn-in 200M, chop_freq 200M) that is 400M, 600M, 800M.
-
-        The previous rule, `step - last_chop >= chop_freq` with last_chop
-        starting at 0, agrees when there is no burn-in, but with burn-in ==
-        chop_freq it chopped at the very first design update -- halving the
-        mixture before the distribution had moved at all. Keyed to the last
-        chop's multiple rather than to "a crossing this iteration", so a chop
-        whose boundary falls in a skipped iteration still happens at the next
-        active one.
+        INDEPENDENT OF THE DESIGN UPDATE, as upstream. Until 2026-10-19 a chop
+        could only happen on an iteration that also updated the design, so
+        none happened in the final fine-tune or on a skipped update; on every
+        schedule actually run the chops fell on the same iterations.
         """
         if not self.chop_freq:
             return False
         f = int(self.chop_freq)
-        first = (self.steps_before_update // f + 1) * f
-        boundary = max(first, (self._last_chop // f + 1) * f)
-        return step >= boundary
+        return (
+            end // f != start // f
+            and start > self.steps_before_update
+            and end < self.tmax
+            and self.gmm.components_left() > 1
+        )
 
-    def finish_iteration(self, env_state, step: int) -> dict:
+    def _chop_component_scores(self, rollout_fn) -> tuple[dict[int, float], dict[str, float]]:
+        """Upstream's ComponentChopper.chop scoring (`component_chopper.py:30-42`).
+
+        `chop_designs` designs from EACH live component (`sample_gaussian(i)`),
+        one episode per lane from a fresh reset under the current stochastic
+        policy (`test_robot` -> `actor.act`, which samples), scored by this
+        loop's objective and averaged per component. `rollout_fn(fields, genes,
+        components)` runs the episodes and returns each lane's FIRST finished
+        episode as flat EpisodeStatsWrapper latches; see ppo/train.py.
+        """
+        if rollout_fn is None:
+            raise RuntimeError(
+                "chop_scores='rollout' needs a rollout_fn from the trainer to "
+                "score the components before a chop"
+            )
+        live = np.flatnonzero(self.gmm.alive)
+        params = np.concatenate(
+            [self.gmm.sample_component(int(i), self.chop_designs) for i in live]
+        )
+        comps = np.repeat(live, self.chop_designs)
+        n_devices, n_envs = self._shape
+        reps = n_envs // len(params)
+        fields, genes, components, n_real = self._lanes(params, comps, n_devices, n_envs, reps)
+        info = rollout_fn(fields, genes, components)
+        lane, _ = self._lane_scores(info)
+        # SELF-CHECK. Each lane ran exactly one episode, so its sums hold that
+        # same episode: the all-episode path must give the same score as the
+        # last-episode path, lane for lane, or the two have drifted apart.
+        real = {k: v[:n_real] for k, v in info.items()}
+        via_sums, _ = self._episode_means(real, real["ep_count"], groups=n_real)
+        gap = float(np.max(np.abs(via_sums - lane[:n_real]) / (1.0 + np.abs(lane[:n_real]))))
+        if not gap < 1e-4:
+            raise RuntimeError(
+                f"chop rollout: the all-episode and last-episode scores of the "
+                f"same single episodes differ by {gap:.3g} (relative)"
+            )
+        design = lane[:n_real].reshape(len(params), reps).mean(axis=1)
+        scores = {int(c): float(design[comps == c].mean()) for c in live}
+        metrics = {
+            "design/chop_designs": float(len(params)),
+            "design/chop_lanes_per_design": float(reps),
+            "design/chop_paths_gap": gap,
+            **{f"design/chop_score_c{c}": v for c, v in scores.items()},
+        }
+        if self.ranking == "feasibility_first":
+            # Per component, over its designs (each the mean of its lanes):
+            # mean cost with its standard error, and the arrival share.
+            cost_d = real["ep_cost_last"].reshape(len(params), reps).mean(axis=1)
+            arr_d = (real["ep_arrived_last"] > 0).reshape(len(params), reps).mean(axis=1)
+            sel = [comps == c for c in live]
+            cost = np.array([cost_d[m].mean() for m in sel])
+            se = np.array([cost_d[m].std() / np.sqrt(max(m.sum(), 1)) for m in sel])
+            arr = np.array([arr_d[m].mean() for m in sel])
+            obj = np.array([scores[int(c)] for c in live])
+            order, feas, _ = feasibility_first_order(
+                obj, cost, arr, self.budget, self.min_arrival, self.chop_cost_z * se
+            )
+            util = rank_utilities(order)
+            for c, k, e, a, f in zip(live, cost, se, arr, feas):
+                metrics[f"design/chop_cost_c{c}"] = float(k)
+                metrics[f"design/chop_cost_se_c{c}"] = float(e)
+                metrics[f"design/chop_arrival_c{c}"] = float(a)
+                metrics[f"design/chop_feasible_c{c}"] = float(f)
+            scores = {int(c): float(u) for c, u in zip(live, util)}
+        return scores, metrics
+
+    def finish_iteration(self, env_state, step: int, rollout_fn=None) -> dict:
         """Score the population, take one REINFORCE step, chop on schedule.
 
         `step` arrives on the TRAINER's axis, which restarts at zero after a
         resume; `_step_offset` maps it onto the design axis. See __init__.
+        `rollout_fn` is needed only when a chop is due under
+        chop_scores="rollout"; see `_chop_component_scores`.
         """
+        start = self._last_step  # the design axis when this iteration began
         step = int(step) + self._step_offset
         params, comps = self._pending
         scores, counts = self.scores_from(env_state)
@@ -802,50 +1108,71 @@ class DesignLoop:
         # distribution on a number that was never measured. Bodies that neither
         # flip nor arrive inside the iteration window hit this; the first smoke
         # run had 2 of 8. Masking is the honest fix, a long enough iteration is
-        # the real one, which is why episodes_per_design is reported.
+        # the real one, which is why episodes_per_design is reported. (Upstream
+        # never meets this on the ant: a 1000-step episode always ends inside
+        # its 1024-step rollout.)
         valid = counts >= 1
         if not valid.all():
             metrics["design/UNSCORED_DESIGNS"] = float((~valid).sum())
 
-        for c, s in zip(comps[valid], scores[valid]):
-            prev = self._comp_scores.get(int(c))
-            self._comp_scores[int(c)] = (
-                float(s) if prev is None else self.ema * prev + (1 - self.ema) * float(s)
-            )
+        if self.chop_scores == "ema":
+            for c, s in zip(comps[valid], scores[valid]):
+                prev = self._comp_scores.get(int(c))
+                self._comp_scores[int(c)] = (
+                    float(s) if prev is None else self.ema * prev + (1 - self.ema) * float(s)
+                )
 
         # Two valid designs is the minimum for a meaningful baseline: the
         # standardisation in `normalize_scores` is taken over the designs
         # sampled this iteration, and a lone sample standardises to 0.
         n_valid = int(valid.sum())
-        active = (
-            step >= self.steps_before_update
-            and not self._frozen(step)
-            and n_valid >= 2
-        )
+        active = self._updating(step) and n_valid >= 2
         if n_valid < 2:
             metrics["design/SKIPPED_UPDATE"] = 1.0
+        utility = scores
+        cost, arr = self._cost_arrival(env_state.info, counts)
+        if valid.any():  # logged under every ranking, for the training curves
+            metrics["design/design_cost_mean"] = float(cost[valid].mean())
+            metrics["design/design_arrival_mean"] = float(arr[valid].mean())
+            if self.budget is not None:
+                metrics["design/under_budget_frac"] = float((cost[valid] <= self.budget).mean())
+        if self.ranking == "feasibility_first":
+            utility = np.full_like(scores, np.nan)
+            if valid.any():
+                order, feas, viol = feasibility_first_order(
+                    scores[valid], cost[valid], arr[valid], self.budget, self.min_arrival
+                )
+                utility[valid] = rank_utilities(order)
+                metrics["design/feasible_frac"] = float(feas.mean())
+                metrics["design/violation_mean"] = float(viol.mean())
         if active:
-            lr_frac = max(0.0, 1.0 - step / self.tmax)
+            # Upstream computes _lr_frac in _before_step, i.e. at the START.
+            lr_frac = max(0.0, 1.0 - start / self.tmax)
             metrics.update(
-                self.gmm.update(params[valid], comps[valid], scores[valid], lr_frac)
+                self.gmm.update(params[valid], comps[valid], utility[valid], lr_frac)
             )
             metrics["design/lr_frac"] = lr_frac
-            if self._chop_due(step):
-                killed = self.gmm.chop(dict(self._comp_scores))
-                if killed:
-                    self._last_chop = step
-                    self._comp_scores = {
-                        k: v for k, v in self._comp_scores.items() if k not in killed
-                    }
-                    metrics["design/chopped"] = float(len(killed))
-                    # Re-read AFTER the chop. `design/components` is captured
-                    # at the top of this method, before the chop that happens
-                    # below it, so a chop iteration reported the PRE-chop count
-                    # -- job 46267 logged `components=8` and `chopped=4` on the
-                    # same line, which reads like a contradiction. This is the
-                    # metric anyone uses to follow the 8->4->2->1 schedule, so
-                    # it should name the state the iteration ended in.
-                    metrics["design/components"] = float(self.gmm.components_left())
+        if self._chop_due(start, step):
+            if self.chop_scores == "rollout":
+                comp_scores, chop_metrics = self._chop_component_scores(rollout_fn)
+                metrics.update(chop_metrics)
+            else:
+                comp_scores = dict(self._comp_scores)
+            killed = self.gmm.chop(comp_scores)
+            if killed:
+                self._last_chop = step
+                self._comp_scores = {
+                    k: v for k, v in self._comp_scores.items() if k not in killed
+                }
+                metrics["design/chopped"] = float(len(killed))
+                # Re-read AFTER the chop. `design/components` is captured
+                # at the top of this method, before the chop that happens
+                # below it, so a chop iteration reported the PRE-chop count
+                # -- job 46267 logged `components=8` and `chopped=4` on the
+                # same line, which reads like a contradiction. This is the
+                # metric anyone uses to follow the 8->4->2->1 schedule, so
+                # it should name the state the iteration ended in.
+                metrics["design/components"] = float(self.gmm.components_left())
         metrics["design/updating"] = float(active)
 
         mode = self.gmm.mode()

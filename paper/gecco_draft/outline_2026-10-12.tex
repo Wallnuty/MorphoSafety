@@ -1,0 +1,768 @@
+%% =========================================================================
+%% MorphoSafety -- working draft in GECCO format (outline + bullet points)
+%% Started 2026-10-12. Serves the end-of-October report first, and a later
+%% GECCO 2027 submission. Every bullet is content to expand into prose.
+%%
+%% GECCO format (2026 instructions; the 2027 call is not out yet):
+%%   * ACM sigconf template (acmart >= 2.16, Libertine fonts), US Letter
+%%   * at most 8 pages excluding references; abstract at most 200 words
+%%   * double-blind: no names, affiliations or acknowledgments, and own
+%%     work cited in the third person -> switch to the submission line below
+%%   * GECCO 2027: Krakow, Poland, 12-16 July 2027 (third-party listing);
+%%     deadline expected late January 2027 (2026: 19 Jan abstract, 26 Jan paper)
+%%   * Track: Complex Systems (CS), which covers evolutionary robotics
+%%     (evolved controllers, morphologies and sensors)
+%%
+%% Status tags used in the text:
+%%   [HAVE]  result in hand (preliminary unless stated)
+%%   [RUN]   experiment still to run
+%%   [CHECK] number or claim to verify / re-measure
+%%   [WRITE] prose, figure or diagram still to produce
+%%   [OPTIONAL] stretch goal
+%%
+%% Build: tectonic main.tex   |   latexmk -pdf main.tex   |   upload to Overleaf
+%% =========================================================================
+
+\documentclass[sigconf,review]{acmart}
+%% Submission version (anonymous, line numbers):
+%% \documentclass[sigconf,review,anonymous]{acmart}
+
+%% Draft-only front matter: no copyright block or ACM reference box.
+\settopmatter{printacmref=false, printfolios=true}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\acmConference[GECCO '27]{Genetic and Evolutionary Computation Conference}{July 12--16, 2027}{Krak\'{o}w, Poland}
+\acmYear{2027}
+\copyrightyear{2027}
+\acmDOI{}
+\acmISBN{}
+
+%% ---- draft helpers -------------------------------------------------------
+\newcommand{\statustag}[2]{\textcolor{#1}{\textsf{\scriptsize\bfseries[#2]}}}
+\newcommand{\HAVE}{\statustag{teal!70!black}{HAVE}\hspace{0.3em}}
+\newcommand{\RUN}{\statustag{red!75!black}{RUN}\hspace{0.3em}}
+\newcommand{\CHECK}{\statustag{orange!85!black}{CHECK}\hspace{0.3em}}
+\newcommand{\WRITE}{\statustag{blue!70!black}{WRITE}\hspace{0.3em}}
+\newcommand{\OPT}{\statustag{gray}{OPTIONAL}\hspace{0.3em}}
+\newcommand{\sectarget}[1]{\par\noindent{\color{gray}\sffamily\scriptsize Target length: #1}\par\smallskip}
+\newcommand{\figbox}[2]{\fbox{\parbox[c][#1][c]{0.95\linewidth}{\centering\sffamily\footnotesize #2}}}
+
+\begin{document}
+
+%% Alternative titles:
+%%   "Safety Is Also a Body Problem: Constrained Co-Design of Morphology and Control"
+%%   "Evolving Safer Bodies: Constraint-Aware Co-Design of Legged Robots"
+\title[Morphology as a Lever for Safe RL]{Morphology as a Lever for Safe Reinforcement Learning: Constrained Co-Design of Body and Controller}
+
+\author{Author One}
+\affiliation{%
+  \institution{Institution (TODO)}
+  \city{City}
+  \country{Country}}
+\email{author@example.org}
+
+\author{Author Two}
+\affiliation{%
+  \institution{Institution (TODO)}
+  \city{City}
+  \country{Country}}
+\email{author2@example.org}
+
+\renewcommand{\shortauthors}{Anonymous et al.}
+
+\begin{abstract}
+\noindent\textit{Final version: one paragraph, at most 200 words. Content, in order:}
+\begin{itemize}
+\item \textbf{Problem.} Safe reinforcement learning (RL) optimises the controller for a fixed body, but whether a fast and safe behaviour exists, and whether it can be learned, depends on the body.
+\item \textbf{Approach.} Constrained co-design: an evolved Gaussian-mixture search distribution over ant limb and torso dimensions, a morphology-conditioned PPO-Lagrangian controller trained across a population of bodies simulated side by side on one GPU, one Lagrange multiplier per mixture component, and feasibility-first ranking of designs.
+\item \textbf{Result 1.} On a hazard-field crossing task the co-designed ant is about 55\% faster than the nominal ant at a comparable safety cost (1.89 vs 1.20--1.22\,m/s). \CHECK{} final numbers.
+\item \textbf{Result 2.} Long legs and a small torso evolve consistently; shin length tracks the hazard statistics. Ranking designs by speed alone selects bodies 5$\times$ over the budget when the constraint is hard to meet, so the outer loop needs constraint handling too.
+\item \textbf{Result 3.} An open GPU stack for safe RL and safe co-design on MuJoCo Warp: 118--133k steps/s on one RTX 3090, and a 2-billion-step co-design run in about 4\,h.
+\item \textbf{Takeaway.} Morphology is a lever for safety, not only for performance.
+\end{itemize}
+\end{abstract}
+
+%% TODO generate the CCSXML block at https://dl.acm.org/ccs and paste it here.
+\ccsdesc[500]{Computing methodologies~Reinforcement learning}
+\ccsdesc[500]{Computer systems organization~Evolutionary robotics}
+\ccsdesc[300]{Computing methodologies~Physical simulation}
+
+\keywords{morphology-control co-design, safe reinforcement learning, constrained Markov decision processes, constraint handling, evolutionary robotics, legged locomotion, GPU simulation}
+
+\maketitle
+
+%% =========================================================================
+\section*{Draft status and plan (delete before submission)}
+\begin{itemize}
+\item \textbf{What this is.} An outline for the end-of-October report and a later GECCO 2027 submission (Complex Systems track). Tags: \HAVE result in hand, \RUN experiment to run, \CHECK number or claim to verify, \WRITE prose or figure to produce, \OPT stretch.
+\item \textbf{Claim we can make today.} The co-designed ant is about 55\% faster than the nominal ant at a comparable episode cost (one seed). \textbf{Claim we want.} Co-design moves the safety--performance frontier (faster at equal cost \emph{and} cheaper at equal speed), and the safety constraint changes which body evolves.
+\item \textbf{Every \HAVE number is preliminary.} They come from the pre-Warp stack (git tag \texttt{pre-warp}: MJX-JAX, MuJoCo 3.3.2, solver capped at 4 iterations / 8 line-search steps) with one seed. The same policy runs 4.5\% slower on the current stack, so regenerate every table on MuJoCo Warp with the full solver and never mix the two stacks in one table.
+\item \textbf{Experiment queue.} Costs in RTX 3090 GPU-hours on Warp: about 1\,h per 300M-step single-body run and 5\,h per 2B-step co-design run.
+  \begin{enumerate}
+  \item \emph{P1, needed for any claim (report):} nominal ant with PPO-Lagrangian at $d=2$, 3 seeds (3\,h); co-design at $d=2$ on the lattice, 3 seeds (15\,h); the evolved body retrained from scratch at $d=2$, 3 seeds (3\,h); unconstrained co-design, 3 seeds (15\,h), then its body trained with the constraint (3\,h).
+  \item \emph{P2, method contribution:} implement feasibility-first ranking; on random fields, speed-only vs feasibility-first, 3 seeds each (30\,h); shared vs per-component $\lambda$ (15\,h).
+  \item \emph{P3, headline figure:} budget sweep $d \in \{0, 5, 25\}$ for the nominal ant and for co-design (20--45\,h).
+  \item \emph{Optional:} the lasers + mines task (body pressures that oppose each other); same-task throughput against the original mjx-safety-gym, Safety-Gymnasium (CPU) and CRAX.
+  \end{enumerate}
+  About 100--125 GPU-hours in all; roughly a week of wall clock with 4--6 cluster jobs in parallel.
+\item \textbf{Open decisions.}
+  \begin{enumerate}
+  \item Keep actuator rescaling (search shape at constant torque margin), or fix the gear or add an energy cost so that size is not free.
+  \item Widen the design box: 4 of 7 genes sit at the 1.4 edge, and Schaff et al. used 0.5--1.5.
+  \item Envs per GPU: stay at 1024 (as all current runs) or move to 4096. 4096 is 1.75$\times$ faster, but co-design iterations must lengthen and learning at that size is unverified.
+  \item Scope of the simulator contribution (Sec.~\ref{sec:res-sim}).
+  \end{enumerate}
+\end{itemize}
+
+%% =========================================================================
+\section{Introduction}
+\label{sec:intro}
+\sectarget{1 page including Fig.~\ref{fig:teaser}}
+\begin{itemize}
+\item \textbf{Hook.} Legged robots increasingly have to move quickly through places where some contacts are unacceptable: crop rows they must not trample, clutter they must not disturb, hazards they must not step on. Safe RL formalises this as a constrained Markov decision process (CMDP): maximise return subject to a bound on expected cost~\cite{altman1999constrained,achiam2017cpo,ray2019benchmarking}.
+\item \textbf{The overlooked variable.} Safe RL optimises the \emph{controller} for a \emph{fixed} body. Yet the safety--performance trade-off a robot can reach belongs to body and controller together: morphology shapes which behaviours are possible, robust and easy to learn~\cite{pfeifer2006body,bongard2011morphological}. Example from our task: legs long enough to clear a hazard turn ``weave around it'' into ``step over it''.
+\item \textbf{Research question.} Can optimising morphology improve the safety--performance trade-off beyond what constrained policy optimisation reaches on the nominal body? That is, is morphology a lever for safety and not only for performance?
+\item \textbf{Gap.}
+  \begin{itemize}
+  \item Co-design work optimises reward only~\cite{sims1994evolving,ha2019reinforcement,schaff2019jointly,wang2019nge,yuan2022transform2act,gupta2021embodied}.
+  \item Where safety appears in co-design, it is a penalty inside the reward~\cite{codesign2025notfree}, the task itself (fall recovery~\cite{yue2025humanoid}), or a design specification such as velocity, power or payload~\cite{glamdring2026}.
+  \item Safe-RL work keeps the body fixed~\cite{ray2019benchmarking,ji2023safetygymnasium,kim2024constraints,chanesane2024cat}.
+  \item A systematic citation search (Sec.~\ref{sec:related}) found no work that trains the controller with constrained RL inside a design loop. \CHECK{} rerun before submission.
+  \end{itemize}
+\item \textbf{Why it is not just ``add a cost term''.} There are two coupled constraint problems:
+  \begin{enumerate}
+  \item \emph{Inner.} The budget must hold for every body, not on average over the population the shared policy trains on; otherwise a reckless body can hide behind safe ones.
+  \item \emph{Outer.} Ranking designs by speed assumes the inner loop has already met the budget. When it has not, the search selects fast, unsafe bodies, which we observe (Sec.~\ref{sec:res-outer}). This is the classic constraint-handling problem of evolutionary computation~\cite{deb2000efficient,runarsson2000stochastic,coello2002theoretical}, with one twist: feasibility is a noisy estimate that depends on a controller that is still learning.
+  \end{enumerate}
+\item \textbf{Compute.} Population-based co-design needs billions of simulation steps. GPU simulation makes that practical~\cite{freeman2021brax,makoviychuk2021isaac,zakka2025playground}; we give every body its own lanes in one GPU batch.
+\item \textbf{Contributions.}
+  \begin{enumerate}
+  \item \emph{A safe co-design method.} A constrained bilevel formulation; a Schaff-style Gaussian-mixture design search~\cite{schaff2019jointly} with a morphology-conditioned PPO-Lagrangian controller; one Lagrange multiplier per mixture component; and feasibility-first design ranking in the outer loop.
+  \item \emph{Evidence that morphology is a safety lever.} On a hazard-field locomotion task the co-designed ant crosses about 55\% faster than the nominal ant at comparable constraint cost, and the evolved body changes with the hazard statistics. \HAVE (1 seed) \RUN seeds and controls.
+  \item \emph{A failure mode of naive safe co-design.} With speed-only design ranking, the search returns a body 5$\times$ over budget when the constraint is hard to meet (random hazard fields). \HAVE \RUN the fix.
+  \item \emph{An open-source GPU stack} for safe RL and safe co-design on MuJoCo Warp, with a different body in every environment lane. It runs 3.1--3.3$\times$ faster than the MJX-JAX implementation it extends on the same task (about 19$\times$ at equal solver accuracy), with physics equivalence checked; a 2B-step co-design run takes about 4\,h on one RTX 3090. \HAVE
+  \end{enumerate}
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\figbox{4.2cm}{Teaser: path-traced frames of the nominal ant (top) and the co-designed ant (bottom) crossing the same hazard field at equal times.\\[3pt]
+\HAVE renders: \texttt{renders/comparison/evolved\_vs\_nominal.mp4} and stills;\\ crossing time 9.3\,s (nominal) vs 5.4\,s (evolved) in these episodes.}
+\caption{Same task, same safety budget, different body. \WRITE{} caption with the main numbers once final.}
+\label{fig:teaser}
+\end{figure}
+
+%% =========================================================================
+\section{Related Work}
+\label{sec:related}
+\sectarget{0.75 page}
+\begin{itemize}
+\item \textbf{Safe RL and its benchmarks.}
+  \begin{itemize}
+  \item CMDPs~\cite{altman1999constrained}; Lagrangian and primal-dual methods, including PPO-Lagrangian~\cite{ray2019benchmarking}.
+  \item PID Lagrangian~\cite{stooke2020responsive}: relevant because we observed integral windup of the multiplier (Appendix~\ref{app:history}).
+  \item CPO~\cite{achiam2017cpo}, CRPO~\cite{xu2021crpo}, Saut\'e RL~\cite{sootla2022saute}; surveys~\cite{garcia2015comprehensive,brunke2022safe}.
+  \item Benchmarks: Safety Gym~\cite{ray2019benchmarking}, Safety-Gymnasium~\cite{ji2023safetygymnasium}, OmniSafe~\cite{ji2024omnisafe}.
+  \item On accelerators: mjx-safety-gym~\cite{vanderhart_mjxsafetygym}, the MJX port our code extends, and CRAX~\cite{tomilin2026crax}: 8 tasks at 3 difficulty levels (Point, Ant, Humanoid and other agents), 100--200$\times$ faster than CPU benchmarks. Its physics steps on MJX-JAX; it already ships MuJoCo Warp for its pixel renderer (checked October 2026).
+  \item All of these fix the body.
+  \end{itemize}
+\item \textbf{Constrained legged locomotion.} Constraints instead of reward shaping~\cite{kim2024constraints}, constraints as terminations~\cite{chanesane2024cat}, constrained visual parkour~\cite{chanesane2024soloparkour}, collision-free agile locomotion~\cite{he2024agile}. All on fixed bodies.
+\item \textbf{Morphology--control co-design.}
+  \begin{itemize}
+  \item Evolutionary roots: virtual creatures~\cite{sims1994evolving}, physical robots~\cite{lipson2000automatic}, soft robots~\cite{cheney2013unshackling,bhatia2021evolution}.
+  \item RL-based: learned design distributions~\cite{ha2019reinforcement,schaff2019jointly,schaff2022nlimb}, graph and transform policies~\cite{wang2019nge,yuan2022transform2act}, Darwinian evolution with learning~\cite{gupta2021embodied}, co-adaptation~\cite{luck2019data}, universal controllers~\cite{huang2020one,kurin2021my,gupta2022metamorph}.
+  \item Constraints so far act on the \emph{design} (fixed parts and allowed ranges~\cite{constrainedevolution2022}; performance specifications~\cite{glamdring2026}) or enter as reward penalties~\cite{codesign2025notfree}; fall recovery as the objective~\cite{yue2025humanoid}.
+  \item Literature search (2026-09-29, Semantic Scholar, arXiv and OpenAlex): of 911 papers citing 11 co-design seed papers, 57 mention safety and none trains the controller with constrained RL; of 2,552 papers citing 5 safe-RL seed papers, 21 mention design or morphology and none optimises a body. \CHECK{} update.
+  \item Positioning: the first to put a budgeted, constrained-RL inner loop \emph{and} constraint handling into the design loop.
+  \end{itemize}
+\item \textbf{Constraint handling in evolutionary computation.}
+  \begin{itemize}
+  \item Penalties, feasibility rules~\cite{deb2000efficient}, stochastic ranking~\cite{runarsson2000stochastic}, $\varepsilon$-constrained methods~\cite{takahama2006constrained}; survey~\cite{coello2002theoretical}.
+  \item Our outer loop is a search-distribution method in the EDA / natural-evolution-strategy family~\cite{larranaga2002estimation,wierstra2014natural}, updated by score-function gradients~\cite{williams1992simple}. Feasibility-first ranking is Deb's rule applied to its utilities.
+  \item What is new: constraint values are noisy, non-stationary estimates, because the controller co-adapts with the design.
+  \end{itemize}
+\item \textbf{GPU simulation.}
+  \begin{itemize}
+  \item Brax~\cite{freeman2021brax}, Isaac Gym~\cite{makoviychuk2021isaac}, MJX and MuJoCo Playground~\cite{zakka2025playground}, MuJoCo Warp~\cite{mujocowarp2025}, Genesis~\cite{genesis2024}; massively parallel locomotion RL~\cite{rudin2022learning}.
+  \item GPU simulators batch one kinematic structure, which is why our design space is parametric rather than topological (Sec.~\ref{sec:limits}).
+  \end{itemize}
+\end{itemize}
+
+%% =========================================================================
+\section{Problem Formulation}
+\label{sec:problem}
+\sectarget{0.5 page}
+\begin{itemize}
+\item \textbf{Design space.}
+  \begin{itemize}
+  \item $\xi \in \Xi = [0.6, 1.4]^7$: scale factors on the Safety Gym ant~\cite{ray2019benchmarking}, namely hip, thigh and shin lengths; hip, thigh and shin radii; and torso radius.
+  \item Shared by all four legs. Nominal $\xi = \mathbf{1}$ (42.3\,kg).
+  \item The kinematic structure is the same for every $\xi$ (a parametric design space).
+  \end{itemize}
+\item \textbf{Actuation.}
+  \begin{itemize}
+  \item Actuator gear is rescaled with mass $\times$ reach so the torque margin stays constant: we search over shape at constant relative strength.
+  \item Without this, gear-to-gravity ratios spanned 0.94--3.82 and some bodies could not hold their own legs up.
+  \item Bodies outside 15--90\,kg are rejected.
+  \item \CHECK{} keep or change this (Limitations).
+  \end{itemize}
+\item \textbf{Fixed-design CMDP.} For a given $\xi$, $\max_\pi J_R(\pi;\xi)$ s.t.\ $J_C(\pi;\xi) \le d$, where $J_C$ is the expected \emph{total} cost of an episode and $d$ the budget.
+\item \textbf{Safe co-design} (bilevel):
+\begin{equation}
+\max_{\xi \in \Xi}\; v(\pi^*_\xi;\xi) \quad \text{s.t.} \quad J_C(\pi^*_\xi;\xi) \le d,
+\qquad \pi^*_\xi \in \arg\max_{\pi:\,J_C(\pi;\xi)\le d} J_R(\pi;\xi),
+\label{eq:bilevel}
+\end{equation}
+with $v$ the crossing speed.
+\item \textbf{Amortisation.} One policy $\pi_\theta(a \mid s, \xi)$, conditioned on the design~\cite{schaff2019jointly}, trained on bodies drawn from a search distribution $p_\phi(\xi)$, solves the inner problem for the whole population at once.
+\item \textbf{Why speed and not return.}
+  \begin{itemize}
+  \item Return telescopes to distance travelled, so it saturates as soon as bodies arrive. In an early run all 8 bodies scored 22.49--22.50 of a 22.50 ceiling while their arrival times differed by 1.85$\times$.
+  \item Design score $v$ = net forward displacement per decision. A non-arrival is charged the full 625-decision horizon, so ``dash two metres and fall'' never scores like a crossing.
+  \end{itemize}
+\end{itemize}
+
+%% =========================================================================
+\section{Method}
+\label{sec:method}
+\sectarget{1.25 pages including Fig.~\ref{fig:method} and Alg.~1}
+
+\begin{figure*}[t]
+\centering
+\figbox{4.0cm}{Method diagram \WRITE: GMM design distribution $p_\phi$ $\rightarrow$ 16 designs per iteration $\rightarrow$ 1024 GPU lanes (64 per body) $\rightarrow$ morphology-conditioned PPO-Lagrangian with one $\lambda_k$ per mixture component $\rightarrow$ per-design (speed, cost) $\rightarrow$ feasibility-first ranking $\rightarrow$ REINFORCE update of $p_\phi$; chopping of mixture components at 400M / 600M / 800M; final fine-tune on the mode.}
+\caption{Constrained co-design. Inner loop: a constrained controller for a population of bodies. Outer loop: an evolving design distribution that ranks designs feasibility-first.}
+\label{fig:method}
+\end{figure*}
+
+\subsection{Population training on one GPU}
+\begin{itemize}
+\item Each design iteration samples $K = 16$ designs from $p_\phi$ and spreads them over 1024 parallel environments in blocks of 64 lanes per design.
+\item Per-lane MuJoCo models differ only in 14 batched fields (geometry, inertia, gear). The structure is identical, so one compiled step function serves every body: no recompilation between iterations. Batched and individually compiled physics agree to about $10^{-8}$.
+\item The design genes are appended to the observation (243 + 7 = 250 inputs).
+\end{itemize}
+
+\subsection{Inner loop: per-component PPO-Lagrangian}
+\begin{itemize}
+\item PPO~\cite{schulman2017proximal} with a separate cost critic; Lagrangian relaxation as in PPO-Lagrangian~\cite{ray2019benchmarking}:
+\begin{equation}
+\min_{\lambda \ge 0}\max_\theta\; \mathbb{E}_{k,\;\xi\sim p_\phi^{k}}\Big[J_R(\pi_\theta;\xi) - \lambda_k\big(J_C(\pi_\theta;\xi) - d\big)\Big].
+\end{equation}
+\item \textbf{One multiplier per mixture component $k$} (contribution). Each sample's cost advantage is weighted by $\lambda_{k(\xi)}$, so the budget has to hold for each subpopulation, not only on average.
+\item Update: $\lambda_k \leftarrow \operatorname{clip}\big(\lambda_k + \eta_\lambda(\hat J_C^{k} - d),\,0,\,\lambda_{\max}\big)$ once per minibatch, with $\eta_\lambda = 1.5\times10^{-5}$, $\lambda_{\max} = 3$ (anti-windup) and $\lambda_0 = 0.01$.
+\item Why the cap: without it, the integral-only multiplier ratcheted up and collapsed a working gait in earlier runs.
+\item The budget is normalised by the episode length actually observed, so $d$ is an episode total and a policy cannot gain budget by loitering.
+\item Flips and corridor exits end the episode with a one-off cost of 50. This closes the ``end the episode to escape future cost'' loophole that we observed with CRPO.
+\end{itemize}
+
+\subsection{Outer loop: an evolving design distribution}
+\begin{itemize}
+\item \textbf{Search distribution (following Schaff et al.~\cite{schaff2019jointly}).}
+  \begin{itemize}
+  \item A mixture of 8 diagonal Gaussians on $[-1, 1]^7$: means drawn from $U(-0.8, 0.8)$, standard deviation 0.577.
+  \item Mixture weights frozen and uniform.
+  \end{itemize}
+\item \textbf{Update.}
+  \begin{itemize}
+  \item Score-function gradient through the sampled component only, evaluated at the unclipped sample $\tilde\xi$:
+  \begin{equation}
+  \nabla_\phi \approx \tfrac{1}{K}\textstyle\sum_{i=1}^{K} u_i\,\nabla_\phi \log p_\phi^{k_i}(\tilde\xi_i),
+  \end{equation}
+  where $u_i$ are scores standardised across the iteration's designs (current) or rank utilities (proposed, Sec.~\ref{sec:ffr}).
+  \item Adam with learning rate 0.03.
+  \item Designs with no completed episode are masked out.
+  \end{itemize}
+\item \textbf{Commitment by chopping.} The worst half of the live components is retired at 400M, 600M and 800M steps (8$\to$4$\to$2$\to$1), after a 200M warm-up with the distribution frozen. The last 300M steps fine-tune on the mode.
+\item \textbf{Read as an evolutionary algorithm:} an EDA / NES-like search distribution~\cite{larranaga2002estimation,wierstra2014natural} with truncation selection between subpopulations.
+\item \textbf{Sizing rule.} Each design iteration must contain at least one episode per lane: we use 3.85M steps, about 1.5 episodes. With shorter iterations only flips end episodes early, so scoring is biased against stable bodies.
+\end{itemize}
+
+\subsection{Constraint-aware design ranking (proposed)}
+\label{sec:ffr}
+\begin{itemize}
+\item \RUN{} implement and evaluate.
+\item Score each design by $(\hat v_i, \hat c_i)$: the mean speed and mean episode cost of its lanes in the iteration (about 96 episodes per design).
+\item \textbf{Feasibility first} (Deb's rules~\cite{deb2000efficient}). Design $i$ ranks above $j$ if:
+  \begin{itemize}
+  \item $\hat c_i \le d < \hat c_j$; or
+  \item both are feasible and $\hat v_i > \hat v_j$; or
+  \item both are infeasible and $\hat c_i < \hat c_j$.
+  \end{itemize}
+\item Replace the standardised speeds with centred rank utilities (fitness shaping as in NES~\cite{wierstra2014natural}). Use the same ordering when chopping.
+\item \textbf{Guards.}
+  \begin{enumerate}
+  \item Minimum progress: a body that does not arrive cannot be ``feasible'', so immobility is never rewarded.
+  \item Noise: a confidence bound $\hat c_i + z\,\mathrm{SE}_i \le d$, or stochastic ranking~\cite{runarsson2000stochastic}.
+  \end{enumerate}
+\item \textbf{Ablation set:} speed only (Schaff, current); static penalty $v - \mu \max(0, c - d)$; feasibility first. \OPT a learned per-design multiplier $\lambda(\xi)$.
+\end{itemize}
+
+\begin{figure}[t]
+\small
+\fbox{\begin{minipage}{0.95\linewidth}
+\textbf{Algorithm 1: one design iteration} \WRITE{} typeset properly (e.g.\ algorithm2e)
+\begin{enumerate}
+\item Sample $K$ designs $\tilde\xi_i \sim p_\phi$ (component $k_i$); clip into $\Xi$; build per-lane models.
+\item Reset all lanes (redrawing random hazard fields if enabled).
+\item Run PPO-Lagrangian epochs on the population. Update $\theta$, the critics and $\lambda_{k}$.
+\item From completed episodes, estimate $\hat v_i$ and $\hat c_i$ for each design.
+\item Rank the designs (speed only, or feasibility first) and compute utilities $u_i$.
+\item Take a REINFORCE step on $\phi$. If a chop is due, retire the worst half of the components and reset the design optimiser.
+\end{enumerate}
+\end{minipage}}
+\end{figure}
+
+\subsection{Implementation}
+\begin{itemize}
+\item JAX with brax-style PPO; MuJoCo Warp~\cite{mujocowarp2025} through the MJX interface.
+\item Everything runs on the device except the design update, which runs on the host between epochs.
+\item Safe-RL algorithm implementations (PPO-Lagrangian, CRPO, Saut\'e) adapted from the ss2r and safe-learning codebases. \CHECK{} citations.
+\item Details and measurements in Sec.~\ref{sec:res-sim} and Appendix~\ref{app:equiv}.
+\end{itemize}
+
+%% =========================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+\sectarget{1 page including Tables~\ref{tab:conditions} and \ref{tab:hparams}}
+
+\subsection{Task: Minefield}
+\begin{itemize}
+\item \textbf{Corridor.} 11\,m long (start $x = -5$, finish line at $x = +6$) and 2\,m wide. Leaving it ends the episode with an exit cost of 50.
+\item \textbf{Hazards.}
+  \begin{itemize}
+  \item 20 discs of radius 0.16\,m in the 10\,m $\times$ 2\,m band.
+  \item Staggered lattice: 10 columns at 1\,m pitch, two discs per column, alternate columns shifted by $\pm 0.21$\,m.
+  \item Fixed spawn at the corridor start, so on the lattice every episode has the same layout.
+  \item Hazards do not collide: they are cost regions, as in Safety Gym.
+  \end{itemize}
+\item \textbf{Variants.}
+  \begin{itemize}
+  \item Radius 0.23\,m: 2.07$\times$ the area, covering 16.6\% of the band instead of 8.0\%.
+  \item Random placement: rejection-sampled at every reset, so a 2B-step run sees about 530k distinct fields. Here safety cannot be a memorised stride.
+  \end{itemize}
+\item \textbf{The constraint is feasible.} A kinematic check shows a zero-cost crossing exists for the \emph{nominal} ant on the lattice: 77\% of torso positions in the band admit a cost-free four-foot stance, and they connect start to finish. Residual cost therefore reflects what the policy learned, not infeasibility.
+\end{itemize}
+
+\subsection{Robot and observations}
+\begin{itemize}
+\item \textbf{Robot.} The Safety Gym ant: 8 actuators, 42.3\,kg, condim 3.
+\item \textbf{Timing.} RK4 with $\Delta t = 0.01$\,s and 2 substeps; action repeat 4, so one decision every 0.08\,s. An episode is at most 625 decisions (50\,s).
+\item \textbf{Observation (243 values).}
+  \begin{itemize}
+  \item Proprioception and goal sensing (31).
+  \item A 16-bin hazard lidar.
+  \item A per-foot 7$\times$7 grid giving the cost that foot would incur if placed at each cell ($4 \times 49$).
+  \item \CHECK{} the breakdown of the 31.
+  \end{itemize}
+\item \textbf{Co-design input.} The 7 design genes are added for co-design.
+\item \textbf{Why the foot grid is there:} without it the Lagrangian could not reduce cost by improving foot placement (Appendix~\ref{app:history}).
+\end{itemize}
+
+\subsection{Reward, cost and budget}
+\begin{itemize}
+\item \textbf{Reward.} Forward progress $\Delta x$, plus goal-distance shaping, plus an upright bonus of 0.0002 per step. The episode ends on arrival, flip, exit or after 625 decisions.
+\item \textbf{Cost per step.}
+  \begin{itemize}
+  \item For each hazard: linear penetration $\operatorname{clip}(1 - \delta/R, 0, 1)$ of the closest \emph{grounded} body part, where $\delta$ is the surface distance to the hazard centre and ``grounded'' means the part's lowest point is within 2\,cm of the floor. Summed over hazards.
+  \item Plus a one-off 50 for a flip or exit.
+  \item Graded like the hazard costs of Safety Gym and CRAX~\cite{ray2019benchmarking,tomilin2026crax}.
+  \end{itemize}
+\item \textbf{Budget.} $d$ is the expected episode total. The main experiments use $d = 2$, a strict budget.
+\item \CHECK{} report what a careless crossing costs on the 2\,cm scale, to put $d = 2$ in context.
+\end{itemize}
+
+\subsection{Training and evaluation}
+\begin{itemize}
+\item \textbf{Training.} Hyperparameters in Table~\ref{tab:hparams}. Co-design runs take 2B steps: 520 design iterations of 3.85M steps. Single-body runs take 250--300M steps.
+\item \textbf{Evaluation.}
+  \begin{itemize}
+  \item 512 stochastic episodes (128 environments $\times$ 4) on held-out layouts.
+  \item Metrics: return, speed (m/s), cost (per-environment mean $\pm$ SE, $n = 128$), hazard steps (steps with any grounded part inside a disc), flipped \%, out-of-bounds \%, and the share of environments under budget.
+  \end{itemize}
+\item \textbf{Pitfall to state.} The trainer's periodic evaluations use 16 fixed random bodies, not the evolved one. Final bodies are evaluated separately with \path{scripts/eval_design.py}.
+\item \textbf{Seeds.} 3 per co-design condition and 5 per single-body condition. \RUN
+\item \textbf{Hardware.} RTX 3090 (cluster) and an RTX 4050 laptop. A 2B-step co-design run takes about 4--5\,h on Warp, against 13.9\,h on MJX-JAX.
+\end{itemize}
+
+\begin{table*}[t]
+\caption{Experimental conditions. Hazards: L = lattice, R = random placement; radius in metres. Unless noted, the outer loop ranks designs by speed and the inner loop is PPO-Lagrangian with one $\lambda$ per mixture component.}
+\label{tab:conditions}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lllllll}
+\toprule
+ID & Body & Inner loop & Outer ranking & Hazards & Question & Status \\
+\midrule
+N & nominal, fixed & PPO-Lag, $d \in \{0, 2, 5\}$ & -- & L 0.16 & fixed-body baseline & $d=0,5$ \HAVE $d=2$ \RUN \\
+CD & co-designed & PPO-Lag, $d=2$ & speed & L 0.16 & main method & \HAVE 1 seed \\
+CD-0.23 & co-designed & PPO-Lag, $d=2$ & speed & L 0.23 & hazard size & \HAVE 1 seed \\
+CD-R & co-designed & PPO-Lag, $d=2$ & speed & R 0.16 & hard constraint & \HAVE 1 seed \\
+CD-R-FF & co-designed & PPO-Lag, $d=2$ & feasibility first & R 0.16 & outer-loop constraints & \RUN \\
+E & evolved, fixed & PPO-Lag, $d=2$ (scratch) & -- & L 0.16 & body vs.\ co-training & \RUN \\
+U & co-designed & none (unconstrained) & speed & L 0.16 & does safety shape the body? & \RUN \\
+U$\to$S & U's body, fixed & PPO-Lag, $d=2$ & -- & L 0.16 & evolve, then add safety & \RUN \\
+CD-shared & co-designed & PPO-Lag, one $\lambda$ & speed & L 0.16 & per-component $\lambda$ & \RUN \\
+Sweep & both & PPO-Lag, $d \in \{0, 5, 25\}$ & speed or FF & L 0.16 & frontier (headline) & \RUN \\
+UNI & uniform designs & PPO-Lag, $d=2$ & none; pick best & L 0.16 & is design learning needed? & \OPT \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table}[t]
+\caption{Hyperparameters (all runs). \CHECK{} against the launchers before submission.}
+\label{tab:hparams}
+\footnotesize
+\begin{tabular}{ll}
+\toprule
+Parallel environments & 1024 (64 per design, 16 designs) \\
+Policy / value networks & MLP $256\times4$ / $256\times5$ \\
+Learning rate, entropy cost, clip & $10^{-4}$, $10^{-4}$, 0.3 \\
+Discount (reward / cost) & 0.97 / 0.9 \\
+Unroll, batch, minibatches & 10, 32, 32 \\
+Multiplier lr / cap / initial value & $1.5\times10^{-5}$ / 3.0 / 0.01 \\
+Flip / exit cost & 50 / 50 \\
+Design components / lr / std init & 8 / 0.03 (Adam) / 0.577 \\
+Design iteration length & 3.85M steps ($\approx$1.5 episodes per lane) \\
+Warm-up / chops / fine-tune & 200M / 400, 600, 800M / last 300M \\
+Total steps (co-design / single body) & 2B / 250--300M \\
+Matmul precision & float32 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =========================================================================
+\section{Results}
+\label{sec:results}
+\sectarget{2.5 pages}
+
+\subsection{Morphology improves the safety--performance trade-off}
+\label{sec:res-main}
+\begin{itemize}
+\item \textbf{Headline (Table~\ref{tab:main}).} At budget 2 the evolved body crosses at 1.89\,m/s with cost $2.55 \pm 0.34$, and 66\% of environments stay under budget. The nominal ant reaches 1.20\,m/s at cost 1.9 ($d=0$) and 1.22\,m/s at cost 2.7 ($d=5$). That is about 55\% faster at comparable total cost. \HAVE (pre-Warp, 1 seed)
+\item \textbf{Teaser numbers.} In the rendered episodes the crossing takes 5.4\,s against 9.3\,s (Fig.~\ref{fig:teaser}).
+\item \textbf{State the claim precisely.} Today it is ``faster at matched cost'', not ``safer''.
+  \begin{itemize}
+  \item The evolved body's \emph{hazard} cost alone is about 1.48, against 0.65 ($d=0$) and 1.1 ($d=5$) for the nominal ant.
+  \item It spends less of its budget on flips and exits (1.07, against 1.25 and 1.6).
+  \item ``Safer'' needs the frontier: lower cost at equal speed, from the budget sweep (Fig.~\ref{fig:frontier}).
+  \end{itemize}
+\item \textbf{Confounds to close.}
+  \begin{enumerate}
+  \item Seeds. \RUN
+  \item The nominal ant at exactly $d = 2$. \RUN
+  \item Training budget: the nominal ant had 250M single-body steps; co-design had 2B steps in total, ending with a 300M fine-tune on the evolved body. Condition E (evolved body trained from scratch) separates ``better body'' from ``more training''. \RUN
+  \item Evaluation protocol: the nominal numbers are means of the trainer's last three evaluations, the evolved ones come from the 512-episode protocol. Re-evaluate the nominal checkpoints with the same script. \CHECK
+  \end{enumerate}
+\end{itemize}
+
+\begin{table*}[t]
+\caption{Evaluation at budget $d = 2$ on the lattice field (radius 0.16). Cost is the per-environment episode total ($\pm$ SE, $n=128$); ``under budget'' is the share of environments whose mean cost is $\le d$. \HAVE rows are from the pre-Warp stack with one seed and must be regenerated. \CHECK{} the nominal rows are means of the trainer's last three evaluations, not the 512-episode protocol, and the $d=5$ run had not converged.}
+\label{tab:main}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccccccl}
+\toprule
+Body & Training & Return & Speed (m/s) & Cost & Hazard steps & Flipped (\%) & OOB (\%) & Under budget (\%) & Status \\
+\midrule
+Nominal & PPO-Lag $d=0$, 250M & 11.01 & 1.20 & 1.9 & 3.5 & 1.4 & 1.1 & -- & \HAVE \CHECK \\
+Nominal & PPO-Lag $d=5$, 250M & 10.99 & 1.22 & 2.7 & 5.1 & 2.1 & 1.1 & -- & \HAVE \CHECK \\
+Nominal & PPO-Lag $d=2$ & & & & & & & & \RUN \\
+Co-designed & CD, 2B & 11.09 & 1.89 & $2.55 \pm 0.34$ & 6.6 & 0.4 & 1.8 & 66 & \HAVE \\
+Co-designed, fixed & E, from scratch & & & & & & & & \RUN \\
+Unconstrained design & U$\to$S & & & & & & & & \RUN \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\figbox{5.0cm}{Headline figure \RUN: speed (m/s, $y$) against episode cost ($x$, log scale) for the nominal ant across budgets $d \in \{0, 2, 5, 25\}$ (the fixed-body frontier) and for co-designed bodies at the same budgets; budget lines dashed; error bars over seeds. The claim holds if the co-design frontier dominates.}
+\caption{Safety--performance frontier: fixed body vs.\ co-designed body.}
+\label{fig:frontier}
+\end{figure}
+
+\subsection{What evolves}
+\label{sec:res-what}
+\begin{itemize}
+\item \textbf{Lattice, radius 0.16} (Table~\ref{tab:genes}). Hip, thigh and shin lengths $\times$1.40 and hip radius $\times$1.40, all at the box edge; thigh radius $\times$0.94, shin $\times$0.83, torso $\times$0.72. Mass 38.5\,kg (nominal 42.3); gear 191 (nominal 150). \HAVE
+\item \textbf{Consistent across all three regimes:} hip and thigh at the length limit, thick hips, a small torso.
+\item \textbf{What changes:} shin length, 1.40 (lattice 0.16) $\to$ 1.22 (lattice 0.23) $\to$ 1.03 (random). One seed each, so a hint only.
+\item \textbf{Interpretation} (to test):
+  \begin{itemize}
+  \item Long legs give clearance to step over discs, and longer strides.
+  \item A small torso lowers mass and inertia.
+  \item On random fields, shorter shins may favour precise placement over clearance.
+  \end{itemize}
+\item \textbf{Gait analysis to back it} \RUN: share of time the torso is above a disc, foot-placement histograms relative to discs, step length.
+\item \textbf{Weakness to own:} 4 of 7 genes end at the upper bound, so the bounds bind (Sec.~\ref{sec:limits}).
+\item \textbf{Fig.~\ref{fig:genes}:} the mode of each component across training, with chop events. \HAVE design logs; \WRITE plot.
+\end{itemize}
+
+\begin{table}[t]
+\caption{Evolved designs (scale factors on the nominal ant). Hip = \texttt{aux}, thigh = \texttt{leg}, shin = \texttt{ankle} segments of the Safety Gym ant. \HAVE (pre-Warp, 1 seed).}
+\label{tab:genes}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccccccc}
+\toprule
+ & \multicolumn{3}{c}{Length} & \multicolumn{3}{c}{Radius} & Torso & Mass & Gear \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Run & hip & thigh & shin & hip & thigh & shin & radius & (kg) & \\
+\midrule
+Nominal & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 42.3 & 150 \\
+L 0.16 & 1.40 & 1.40 & 1.40 & 1.40 & 0.94 & 0.83 & 0.72 & 38.5 & 191 \\
+L 0.23 & 1.40 & 1.40 & 1.22 & 1.31 & 0.76 & 0.96 & 0.60 & 46.2 & 219 \\
+R 0.16 & 1.40 & 1.40 & 1.03 & 1.32 & 0.82 & 0.99 & 0.80 & 42.5 & 193 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\figbox{4.0cm}{Gene trajectories \WRITE: mode of each mixture component across training (7 panels, or 2D projections), with chop events at 400/600/800M and the box limits marked. Data: the design lines in the co-design logs and the \texttt{design\_state.npz} checkpoints.}
+\caption{How the design distribution moves and commits.}
+\label{fig:genes}
+\end{figure}
+
+\subsection{The outer loop needs constraint handling}
+\label{sec:res-outer}
+\begin{itemize}
+\item \textbf{Random hazard fields} (Table~\ref{tab:regimes}). The evolved body crosses at 1.48\,m/s but at cost $10.15 \pm 0.60$, 5$\times$ the budget. No environment stays under budget. \HAVE
+\item \textbf{Training trace.} Every component's $\lambda$ was pinned at the cap (3.0), with the constraint at $-0.71$: the inner loop could not meet $d = 2$ for any subpopulation. \HAVE
+\item \textbf{Mechanism.} Speed-only ranking kept favouring the fastest designs, which were also the most violating. The search had no reason to prefer a feasible body.
+\item \textbf{On the lattice} the same loop happened to settle near the budget ($2.55 \pm 0.34$ and $2.31 \pm 0.20$; both $+1.5$--$1.6$ SE over $d$, not significant at 2 SE). Feasibility there came from the inner loop, not from the search.
+\item \textbf{The fix:} feasibility-first ranking, CD-R vs CD-R-FF, 3 seeds each (Fig.~\ref{fig:outer}). Report the final body, the cost trace, and whether the search finds a feasible body or proves none is learnable. \RUN
+\item \textbf{The per-component $\lambda$ ablation} (CD vs CD-shared) also belongs here: with one shared $\lambda$, does a reckless component get carried? \RUN
+\end{itemize}
+
+\begin{table*}[t]
+\caption{Evolved bodies under three hazard regimes, budget $d = 2$, 512 episodes each. \HAVE rows: pre-Warp stack, one seed.}
+\label{tab:regimes}
+\footnotesize
+\begin{tabular}{llcccccccl}
+\toprule
+Hazards & Outer ranking & Return & Speed (m/s) & Cost & Hazard steps & Flipped (\%) & OOB (\%) & Under budget (\%) & Status \\
+\midrule
+Lattice, $r=0.16$ & speed & 11.09 & 1.89 & $2.55 \pm 0.34$ & 6.6 & 0.4 & 1.8 & 66 & \HAVE \\
+Lattice, $r=0.23$ & speed & 11.21 & 1.63 & $2.31 \pm 0.20$ & 25.3 & 0.4 & 0.0 & 60 & \HAVE \\
+Random, $r=0.16$ & speed & 10.88 & 1.48 & $10.15 \pm 0.60$ & 25.8 & 1.4 & 4.9 & 0 & \HAVE \\
+Random, $r=0.16$ & feasibility first & & & & & & & & \RUN \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\figbox{4.0cm}{\RUN: episode cost of the designs sampled at each iteration (median and IQR) against training steps, speed-only vs feasibility-first on random fields, with the budget line; inset: per-component $\lambda$ (pinned at the cap under speed-only).}
+\caption{Speed-only design ranking drifts to infeasible bodies; feasibility-first ranking does not.}
+\label{fig:outer}
+\end{figure}
+
+\subsection{Does the safety constraint shape the body?}
+\label{sec:res-shape}
+\begin{itemize}
+\item This is the core of the ``lever'' claim. If unconstrained co-design evolves the same body, safety is a by-product of speed, not a design driver.
+\item \textbf{Compare} U against CD (genes and performance), U$\to$S against E (is evolving \emph{under} the constraint better than evolving first and adding safety later?), and the evolved genes against the budget across the sweep. \RUN
+\item \textbf{Honest expectation.} On this task speed and safety probably pull the same way: long legs help both. The bodies may differ little, which motivates a task with opposing pressures (Sec.~\ref{sec:discussion}).
+\end{itemize}
+
+\subsection{Simulation stack: throughput and fidelity}
+\label{sec:res-sim}
+\begin{itemize}
+\item \textbf{Throughput} (Table~\ref{tab:throughput}). On an RTX 3090 at 1024 environments:
+  \begin{itemize}
+  \item 38.2k $\to$ 118.3k steps/s for a single body (3.1$\times$) and 40.4k $\to$ 133.3k for co-design with 16 bodies (3.3$\times$), against the MJX-JAX backend with its solver capped for speed. \HAVE
+  \item At equal solver accuracy (both run to convergence) the laptop shows 3.8k $\to$ 73.3k training steps/s (19$\times$), and 4.4k $\to$ 140k steps/s for pure stepping (32$\times$). \HAVE \CHECK{} repeat on the 3090
+  \end{itemize}
+\item \textbf{Why it is faster.} MJX-JAX pays for every \emph{possible} contact because of static array shapes (about 188 constraint rows per environment here), and its line search runs a fixed number of steps. Warp only processes active contacts (at most 20 rows per environment) and stops once every world has converged~\cite{zakka2025playground,mujocowarp2025}.
+\item \textbf{Scaling} (Fig.~\ref{fig:scaling}): 4096 environments give 220k (single) and 233k (co-design) steps/s, 1.75$\times$ the 1024-environment rate. Learning at that size is unverified, and co-design iterations must lengthen to keep at least one episode per lane. \HAVE
+\item \textbf{Fidelity} (Appendix~\ref{app:equiv}).
+  \begin{itemize}
+  \item Old and new MuJoCo agree to float32 rounding once the solver converges.
+  \item Warp and JAX agree to about $10^{-7}$, including with a different body in every lane.
+  \item The vase cost, re-implemented with contact sensors, matches the original step for step.
+  \item A 300M-step learning check reproduces the old baseline: 1.52 vs 1.45\,m/s, cost 26.3 vs 27.4 at $d = 25$. \HAVE
+  \end{itemize}
+\item \textbf{Wall clock.} A 2B-step co-design run drops from 13.9\,h to about 4\,h of training, which is what makes seeds and sweeps affordable.
+\item \textbf{Positioning} (decision pending).
+  \begin{itemize}
+  \item CRAX~\cite{tomilin2026crax} already provides a broad MJX safe-RL suite, including Ant tasks.
+  \item The Warp backend alone is a temporary difference: CRAX already depends on MuJoCo Warp, and our own switch took about 300 changed lines in 10 files.
+  \item Our claim is therefore neither breadth nor the backend. It is (i) a different body in every lane of one batch, with constraint costs computed on the GPU, (ii) the safe co-design loop, and (iii) validated equivalence of the Warp port, including per-lane bodies.
+  \item \OPT{} same-task throughput: CRAX's Ant goal task against ours; Safety-Gymnasium on CPU.
+  \end{itemize}
+\end{itemize}
+
+\begin{table}[t]
+\caption{Training throughput (environment steps per second, compilation excluded). Single = one nominal body; co-design = 16 bodies. Solver: \emph{capped} = 4 iterations / 8 line-search steps (the MJX-JAX speed setting), \emph{full} = MuJoCo defaults, run to convergence. \CHECK{} re-measure all cells with one script on the 3090.}
+\label{tab:throughput}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{RTX 4050 laptop} & \multicolumn{2}{c}{RTX 3090} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Backend, solver & single & co-design & single & co-design \\
+\midrule
+MJX-JAX, full & 3.8k & -- & \RUN & -- \\
+MJX-JAX, capped & 13.8k & 19.0k & 38.2k & 40.4k \\
+Warp, full & 73.3k & 100.0k & 118.3k & 133.3k \\
+Warp, full, 4096 envs & -- & -- & 220k & 233k \\
+\bottomrule
+\end{tabular}
+\\[2pt]{\scriptsize Laptop single-body runs used 512 environments; all other cells 1024 unless noted.}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\figbox{3.6cm}{\HAVE data, \WRITE plot: steps/s vs number of environments (1024--8192) on the 3090, Warp, single and co-design; MJX-JAX points for reference. GPU utilisation read 100\% at every size, so small batches under-fill the GPU.}
+\caption{Throughput scaling with environments per GPU.}
+\label{fig:scaling}
+\end{figure}
+
+%% =========================================================================
+\section{Discussion}
+\label{sec:discussion}
+\sectarget{0.75 page}
+\begin{itemize}
+\item \textbf{Why the body helps.}
+  \begin{itemize}
+  \item The nominal ant \emph{can} cross at zero cost (Sec.~\ref{sec:setup}), but constrained RL does not find that precise foot placement.
+  \item A body with more clearance and a longer stride widens the margin, so the safe crossing becomes easier to learn.
+  \item Hypothesis: morphology helps safety mainly through \emph{learnability}, not feasibility. Test: rerun the kinematic stance check for the evolved bodies (cheap, CPU only). \RUN
+  \end{itemize}
+\item \textbf{Constraint handling is part of the method, not a detail.} The inner loop protects safety only when it succeeds; the outer loop has to know when it did not.
+\item \textbf{Limitations.}
+\label{sec:limits}
+  \begin{enumerate}
+  \item One seed per condition and a pre-Warp stack so far.
+  \item Bounds bind: 4 of 7 genes end at the box edge.
+  \item Size is free: actuators are rescaled, so bigger limbs cost no relative strength.
+  \item Speed and safety point the same way on this task, so there is no tension to resolve.
+  \item On the lattice, safety can be a memorised stride; random fields are the hard case, and they fail without feasibility-first ranking.
+  \item Parametric design only. GPU simulators batch one kinematic structure, so topology needs a superset model or per-world kinematic trees (a draft MuJoCo Warp feature).
+  \item Simulation only; no sim-to-real.
+  \item Designs are scored through a shared policy, which generalises by interpolation (novel bodies inside the trained mass range: 7/7 worked) but not by extrapolation (outside it: 3/7).
+  \end{enumerate}
+\item \textbf{Future work.}
+  \begin{itemize}
+  \item A lasers + mines task: beams at random heights. Long legs step over mines but hit beams; low bodies duck beams but must weave between mines, so the best body depends on the mix and on the budget.
+  \item A payload (tipping or jerk cost) and an energy cost.
+  \item Topology through a superset ant.
+  \item A real quadruped model (e.g.\ from MuJoCo Menagerie).
+  \item Quality diversity: MAP-Elites over morphology with safety descriptors~\cite{mouret2015illuminating}; CMA-ES as an alternative outer loop~\cite{hansen2001completely}.
+  \end{itemize}
+\end{itemize}
+
+%% =========================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+\sectarget{0.25 page}
+\begin{itemize}
+\item Safety is a property of the body as well as of the controller.
+\item Co-designing morphology under a safety constraint found an ant that is about 55\% faster at comparable cost. \CHECK{} final wording once the frontier is in.
+\item Safe co-design needs constraint handling at both levels: per-component multipliers inside, feasibility-first ranking outside.
+\item A GPU stack makes this affordable: billions of steps in hours on one consumer GPU.
+\end{itemize}
+
+\begin{acks}
+\WRITE{} Cluster and compute acknowledgements; funding. Removed automatically in the anonymous version.
+\end{acks}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+%% =========================================================================
+\appendix
+\noindent\textit{For the October report these sections are part of the main text. For GECCO they move to supplementary material.}
+
+\section{Hyperparameters and reproducibility}
+\label{app:repro}
+\begin{itemize}
+\item Full flag listing per condition, from the launchers (\path{cluster/ant_morphology_codesign.sbatch}: knobs BUDGET, HAZARD\_SIZE, HAZARD\_PLACEMENT, PENALIZER). \WRITE
+\item \textbf{Code.} Public repository (anonymised for review). Tag \texttt{pre-warp} reproduces every \HAVE number; \texttt{main} is the Warp stack.
+\item \textbf{Evaluation.} \path{scripts/eval_design.py} (evolved bodies), \path{scripts/eval_checkpoint.py} (single bodies).
+\item \textbf{Checkpoints.} Run names: \path{ant_codesign_lagrangian_b2_grid7_2000M} and its \texttt{\_hz0.23} and \texttt{\_random} variants; \path{ant_minefield_final_eps2_b{0,5}_250M}.
+\end{itemize}
+
+\section{Development history and negative results}
+\label{app:history}
+\noindent\textit{Report only. The decisions that shaped the final recipe, each backed by a measurement.}
+\begin{itemize}
+\item \textbf{Goal-reaching was unlearnable for the ant.} With the goal in a random direction, a scripted gait that walks several metres earns $+0.078 \pm 0.672$ return over 16 seeds. Hence the corridor task, with reward linear in forward progress.
+\item \textbf{Policy capacity mattered most early on.} Widening the policy from $32\times4$ to $256\times4$ cut cost 2.7$\times$ at the same reward.
+\item \textbf{Constraint mechanisms first ``succeeded'' by doing less of the task.}
+  \begin{itemize}
+  \item CRPO: cost per step \emph{doubled} (0.025 $\to$ 0.050) while episode cost fell, because episodes got shorter (2035 $\to$ 738 steps).
+  \item Saut\'e: the budget was not a lever (tightening it tenfold, 500 $\to$ 50, did not lower cost: 84.9 vs 95.7); penalty 5 cut cost 43\% and reward 42\% together.
+  \item Lagrangian without a cap: the multiplier wound up and the policy met the budget by walking 3\,m and flipping.
+  \end{itemize}
+\item \textbf{Fixes, each measured.}
+  \begin{itemize}
+  \item A flip/exit cost.
+  \item A graded penetration cost (Safety Gym / CRAX style).
+  \item A budget normalised by the observed episode length.
+  \item A multiplier cap.
+  \item \emph{The per-foot hazard grid} (50M-step arms, one seed each). Without the grid, the Lagrangian ended \emph{above} its unconstrained control (cost 78.6 vs 63.1). With it, the Lagrangian cut cost below its unconstrained control: by 12\% from scratch (44.8 vs 51.1), and by 35\% when warm-started from that control (33.0 vs 51.1), with the crossing intact.
+  \item A $7\times7$ grid beat $5\times5$: cost 43.3 vs 53.8, speed 1.08 vs 0.99.
+  \end{itemize}
+\item \textbf{Design scoring.} Return cannot rank bodies here (it saturates), hence the speed score. Iterations shorter than one episode per lane bias scoring towards bodies that flip early.
+\item \textbf{Generalisation of the shared policy.} The boundary is mass, not distance in gene space: novel bodies inside the trained mass range worked (7/7, mean arrival 99\%), outside it 3/7 (mean 63\%).
+\end{itemize}
+
+\section{Throughput history: from the original mjx-safety-gym to now}
+\label{app:speed}
+\noindent\textit{Report only.} Our code started from mjx-safety-gym 0.1.6~\cite{vanderhart_mjxsafetygym}. Steps of the chain were measured on different machines, environment counts and task versions, so the factors do not multiply exactly. Only the end-to-end comparison is a direct before/after measurement.
+\begin{table*}[t]
+\caption{Throughput history of the ant pipeline (report only).}
+\label{tab:history}
+\footnotesize
+\begin{tabular}{lll}
+\toprule
+When (2026) & Change & Measured effect \\
+\midrule
+25 Jul & JAX 0.6.0 $\to$ 0.10.2 & $\sim$2.4$\times$ MJX stepping \CHECK \\
+9 Aug & first ant baseline (Goal task, vases, condim 6) & 668--798 steps/s (3090, 256 envs) \\
+13 Aug & contact dimension 6 $\to$ 3 & 1.82$\times$ (laptop, 128 envs) \\
+15 Aug & Minefield task (no vases; hazards non-colliding) & 3.13$\times$ (laptop, 256 envs) \\
+17 Aug & 1024 environments (3090 knee) & +31\% over 512 \\
+22 Aug--26 Sep & corridor walls added, then removed & $-27\%$, then +37\% \\
+27 Sep & solver capped at 4/8 (MJX-JAX) & 3.5$\times$ (laptop) \\
+4 Oct & MuJoCo Warp, full solver & 3.1--3.3$\times$ vs capped JAX (3090) \\
+4 Oct & 4096 environments on Warp & 1.75$\times$ vs 1024 (3090) \\
+\midrule
+End to end & 3090, ant & $\sim$0.8k $\to$ 118--133k ($\approx$150$\times$); 220--233k at 4096 envs \\
+\bottomrule
+\end{tabular}
+\end{table*}
+\begin{itemize}
+\item \textbf{Engineering, same physics:} the JAX upgrade, environment counts, the Warp backend.
+\item \textbf{Changes to what is simulated:} condim 3 (Gym's setting), the minefield task (vases removed), walls, and the solver cap (an approximation, since replaced by Warp's converged solver).
+\end{itemize}
+
+\section{Simulator equivalence tests}
+\label{app:equiv}
+\begin{itemize}
+\item \textbf{One step from identical states.}
+  \begin{itemize}
+  \item MuJoCo 3.3.2 vs 3.14 agree to float32 rounding when the solver converges.
+  \item With the 4/8 cap they differ by up to $1.4\times10^{-3}$ in joint velocity.
+  \item Warp vs JAX agree to about $10^{-7}$, including with per-lane bodies.
+  \end{itemize}
+\item \textbf{Vase cost via contact sensors} (MJX-JAX lacks subtree matching, so one sensor per vase--geom pair). It needs found \emph{and} negative distance: 0 differing steps against the contact-list cost, while ``found'' alone over-counts by about 9\% (5,735 vs 5,283).
+\item \textbf{Policy transfer.} A policy trained under the capped solver is 4.5\% slower on the new stack (1.141 vs 1.195\,m/s, 12 SE); cost, flips and exits are unchanged. Hence: never mix stacks in one comparison.
+\item \textbf{Learning check} (single nominal body, $d = 25$, 5\,cm gate, mean of evaluations at 241--261M steps):
+\end{itemize}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccccc}
+\toprule
+Stack & Return & Speed & Cost & Hz.\ steps & Flip \% & OOB \% \\
+\midrule
+JAX capped (3090, 1.7\,h) & 10.89 & 1.45 & 27.4 & 70.8 & 2.6 & 1.9 \\
+Warp full (laptop, 46\,min) & 11.06 & 1.52 & 26.3 & 76.6 & 0.3 & 2.4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
